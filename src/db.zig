@@ -36,6 +36,15 @@ pub const Db = struct {
             \\PRAGMA foreign_keys = ON;
             \\PRAGMA busy_timeout = 5000;
         );
+
+        // journal_mode reports the mode it settled on instead of failing, so a
+        // filesystem without mmap (9p, NFS, CIFS) leaves us in DELETE silently.
+        // Degraded still works for one process; it is concurrency that breaks.
+        var mode = try db.prepare("PRAGMA journal_mode");
+        defer mode.finalize();
+        if (try mode.step() and !std.mem.eql(u8, mode.text(0), "wal")) {
+            log.warn("journal_mode is {s}, not wal: writers will block readers", .{mode.text(0)});
+        }
         return db;
     }
 
@@ -245,4 +254,25 @@ test "deleting a task cascades to its children and approvals" {
     try db.exec("DELETE FROM tasks WHERE id = 1");
     try testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT count(*) FROM tasks"));
     try testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT count(*) FROM approvals"));
+}
+
+test "bind copies text, so a caller's buffer need not outlive the step" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try tmpDb(&tmp, &buf);
+    defer db.close();
+    try db.migrate();
+
+    var scratch: [9]u8 = "tg_offset".*;
+    var ins = try db.prepare("INSERT INTO kv(key, value) VALUES (?, 'x')");
+    defer ins.finalize();
+    try ins.bind(1, scratch[0..]);
+    @memset(&scratch, '!'); // SQLITE_STATIC would now store "!!!!!!!!!"
+    try testing.expect(!try ins.step());
+
+    var q = try db.prepare("SELECT key FROM kv");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("tg_offset", q.text(0));
 }
