@@ -148,8 +148,16 @@ pub const Stmt = struct {
         return c.sqlite3_column_int64(self.ptr, col);
     }
 
+    pub fn float(self: *Stmt, col: c_int) f64 {
+        return c.sqlite3_column_double(self.ptr, col);
+    }
+
+    pub fn isNull(self: *Stmt, col: c_int) bool {
+        return c.sqlite3_column_type(self.ptr, col) == c.SQLITE_NULL;
+    }
+
     /// Returns "" for a NULL column, so it cannot tell NULL from an empty
-    /// string. Add an `isNull` accessor if a caller ever needs to.
+    /// string. Use `isNull` when that distinction matters.
     pub fn text(self: *Stmt, col: c_int) []const u8 {
         const ptr = c.sqlite3_column_text(self.ptr, col) orelse return "";
         const len: usize = @intCast(c.sqlite3_column_bytes(self.ptr, col));

@@ -268,6 +268,7 @@ test {
     _ = @import("agent.zig");
     _ = @import("cli.zig");
     _ = @import("telegram.zig");
+    _ = @import("memory.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {
