@@ -54,6 +54,36 @@ fn runStoreSecret(ctx: *Ctx, args: []const u8) anyerror![]u8 {
 pub const memory = @import("tools/memory.zig");
 const skills = @import("skills.zig");
 const web_tools = @import("tools/web.zig");
+const tasks = @import("tasks.zig");
+
+const ask_params = [_]Param{
+    .{ .name = "tool", .description = "tool to run if approved" },
+    .{ .name = "args", .description = "exact JSON arguments bound to the approval" },
+    .{ .name = "reason", .description = "plain-language explanation for the owner" },
+    .{ .name = "target", .description = "what the action touches", .required = false },
+};
+
+pub const request_permission: Def = .{
+    .name = "request_permission",
+    .description = "Record a pending action. The owner must approve this exact tool and arguments in chat.",
+    .params = &ask_params,
+    .run = runAsk,
+};
+
+const AskArgs = struct {
+    tool: []const u8,
+    args: []const u8,
+    reason: []const u8,
+    target: ?[]const u8 = null,
+};
+
+fn runAsk(ctx: *Ctx, args: []const u8) anyerror![]u8 {
+    const parsed = try std.json.parseFromSlice(AskArgs, ctx.gpa, args, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const id = try tasks.ask(ctx.db, parsed.value.tool, parsed.value.args, parsed.value.target, parsed.value.reason, null, now);
+    return try std.fmt.allocPrint(ctx.gpa, "pending #{d}: {s} — {s}", .{ id, parsed.value.tool, parsed.value.reason });
+}
 
 /// One line per tool. Adding a tool is its file plus a slot here.
 pub const builtins = [_]Def{
@@ -65,6 +95,7 @@ pub const builtins = [_]Def{
     web_tools.fetch_url,
     web_tools.search,
     store_secret,
+    request_permission,
 };
 
 /// Looks up `name`, rejects bad args, runs, and caps the result. Errors become

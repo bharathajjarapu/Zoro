@@ -78,6 +78,10 @@ pub const Db = struct {
             std.fmt.comptimePrint("\nPRAGMA user_version = {d};\nCOMMIT;", .{version}));
     }
 
+    pub fn lastId(self: *Db) i64 {
+        return c.sqlite3_last_insert_rowid(self.ptr);
+    }
+
     /// Compiles `sql`. Caller must `finalize()` the result.
     pub fn prepare(self: *Db, sql: [:0]const u8) !Stmt {
         var ptr: ?*c.sqlite3_stmt = null;

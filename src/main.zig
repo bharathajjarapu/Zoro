@@ -6,6 +6,7 @@ const agent = @import("agent.zig");
 const cli = @import("cli.zig");
 const telegram = @import("telegram.zig");
 const tools = @import("tools.zig");
+const scheduler = @import("scheduler.zig");
 
 const log = std.log.scoped(.zoro);
 
@@ -36,6 +37,7 @@ fn run(init: std.process.Init) !void {
     if (eql(u8, cmd, "chat")) return cmdChat(init);
     if (eql(u8, cmd, "diary")) return cmdDiary(init, &args);
     if (eql(u8, cmd, "memory")) return cmdMemory(init, &args);
+    if (eql(u8, cmd, "tasks")) return cmdTasks(init);
 
     log.err("unknown command: {s}", .{cmd});
     try print(init.io, usage, .{});
@@ -49,6 +51,7 @@ const usage =
     \\  zoro chat       interactive REPL (same agent, same database)
     \\  zoro diary [DATE]  print a day's diary (today if omitted)
     \\  zoro memory QUERY  BM25 search; prints ref, kind, score
+    \\  zoro tasks      list tasks with status, priority, and goal
     \\  zoro --version  print the zoro and SQLite versions
     \\  zoro help       print this
     \\
@@ -103,6 +106,25 @@ fn daemon(init: std.process.Init) !void {
 
     try bot.getMe();
     stop.install();
+
+    var sched_db = try openDb(init.io, cfg.data_dir);
+    defer sched_db.close();
+    var sched_http = agent.StdHttp.init(init.gpa, init.io);
+    defer sched_http.deinit();
+    var sched_agent: agent.Agent = .{
+        .gpa = init.gpa,
+        .io = init.io,
+        .db = &sched_db,
+        .http = sched_http.http(),
+        .api_key = key,
+        .base_url = cfg.base_url orelse agent.default_base_url,
+        .model = model,
+        .tools = &tools.builtins,
+        .fetch = sched_http.getter(),
+    };
+    const sched = try std.Thread.spawn(.{}, scheduler.loop, .{ &sched_agent, &stop.requested });
+    defer sched.join();
+
     log.info("polling", .{});
     try bot.run(&stop.requested);
     log.info("shutting down", .{});
@@ -175,6 +197,16 @@ fn cmdMemory(init: std.process.Init, args: anytype) !void {
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &out_buf);
     try cli.printMemory(&s.db, init.gpa, query, now, &out.interface);
+}
+
+fn cmdTasks(init: std.process.Init) !void {
+    var s: Store = undefined;
+    try s.init(init);
+    defer s.deinit();
+
+    var out_buf: [4096]u8 = undefined;
+    var out = std.Io.File.stdout().writer(init.io, &out_buf);
+    try cli.printTasks(&s.db, init.gpa, &out.interface);
 }
 
 const Terminal = struct {
@@ -340,6 +372,8 @@ test {
     _ = @import("skills.zig");
     _ = @import("web.zig");
     _ = @import("secrets.zig");
+    _ = @import("tasks.zig");
+    _ = @import("scheduler.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {

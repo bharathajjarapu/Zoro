@@ -6,6 +6,7 @@ const skills = @import("skills.zig");
 const tools = @import("tools.zig");
 const web = @import("web.zig");
 const secrets = @import("secrets.zig");
+const tasks = @import("tasks.zig");
 const testing = std.testing;
 
 const log = std.log.scoped(.agent);
@@ -70,6 +71,11 @@ pub const Agent = struct {
     /// Caller owns the returned reply.
     pub fn turn(self: *Agent, input: []const u8) ![]u8 {
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+        // A bare yes/no is only a verdict when something is actually waiting.
+        const verdict = tasks.decide(input);
+        if (verdict != .other and try tasks.pendingCount(self.db) > 0) {
+            return resolveApproval(self, input, now, verdict);
+        }
         try insertMsg(self.db, "user", input, now);
 
         var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
@@ -169,6 +175,50 @@ fn chatUrl(arena: std.mem.Allocator, base: []const u8) ![]const u8 {
         return try arena.dupe(u8, trimmed);
     }
     return try std.fmt.allocPrint(arena, "{s}/chat/completions", .{trimmed});
+}
+
+fn resolveApproval(self: *Agent, input: []const u8, now: i64, verdict: tasks.Decision) ![]u8 {
+    try insertMsg(self.db, "user", input, now);
+    var pending = (try tasks.latestPending(self.db, self.gpa)) orelse
+        return say(self, now, "I have more than one pending action. Which one do you mean?");
+    defer pending.deinit(self.gpa);
+
+    if (verdict == .deny) {
+        try tasks.setApproval(self.db, pending.id, "denied");
+        return sayFmt(self, now, "Cancelled {s}.", .{pending.tool});
+    }
+    if (pending.expires <= now) {
+        try tasks.setApproval(self.db, pending.id, "expired");
+        return sayFmt(self, now, "That approval expired {d} minutes ago. Ask me again if you still want it.", .{@divFloor(now - pending.expires, 60)});
+    }
+    try tasks.authorize(self.db, pending.id, pending.tool, pending.args, now);
+    try tasks.setApproval(self.db, pending.id, "approved");
+
+    var ctx: tools.Ctx = .{
+        .gpa = self.gpa,
+        .io = self.io,
+        .db = self.db,
+        .skills_dir = self.skills_dir,
+        .fetch = self.fetch,
+        .limiter = &self.limiter,
+    };
+    const raw = try tools.call(&ctx, self.tools, pending.tool, pending.args);
+    defer self.gpa.free(raw);
+    return sayFmt(self, now, "{s}: {s}", .{ pending.tool, raw });
+}
+
+fn say(self: *Agent, now: i64, text: []const u8) ![]u8 {
+    const reply = try self.gpa.dupe(u8, text);
+    errdefer self.gpa.free(reply);
+    try insertMsg(self.db, "assistant", reply, now);
+    return reply;
+}
+
+fn sayFmt(self: *Agent, now: i64, comptime fmt: []const u8, args: anytype) ![]u8 {
+    const reply = try std.fmt.allocPrint(self.gpa, fmt, args);
+    errdefer self.gpa.free(reply);
+    try insertMsg(self.db, "assistant", reply, now);
+    return reply;
 }
 
 fn insertMsg(db: *Db, role: []const u8, content: []const u8, created: i64) !void {
@@ -972,4 +1022,150 @@ test "turn lists secret names but never their values" {
     const sent = fake.last_body orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, sent, "weather_api_key") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "sk-secret-value") == null);
+}
+
+fn pingRun(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
+    return try std.fmt.allocPrint(ctx.gpa, "pong {s}", .{args});
+}
+
+const ping_tool: tools.Def = .{
+    .name = "ping",
+    .description = "test ping",
+    .params = &.{},
+    .run = pingRun,
+};
+
+test "yes runs the bound pending action and skips the model" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+
+    var fake: FakeHttp = .{
+        .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"should not run\"}}]}"},
+        .gpa = testing.allocator,
+    };
+    defer fake.deinit();
+
+    var db = try openTmpDb(&tmp, &buf);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    _ = try tasks.ask(&db, "ping", "{\"n\":\"1\"}", null, "probe", null, now);
+
+    var a: Agent = .{
+        .gpa = testing.allocator,
+        .io = io,
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+        .tools = &.{ping_tool},
+    };
+    const reply = try a.turn("yes");
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "pong") != null);
+    try testing.expectEqual(@as(usize, 0), fake.i);
+}
+
+test "yes on an expired approval is refused and reported" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+
+    var fake: FakeHttp = .{
+        .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"no\"}}]}"},
+        .gpa = testing.allocator,
+    };
+    defer fake.deinit();
+
+    var db = try openTmpDb(&tmp, &buf);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    _ = try tasks.ask(&db, "ping", "{}", null, "old", null, 0);
+
+    var a: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+        .tools = &.{ping_tool},
+    };
+    const reply = try a.turn("yes");
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "expired") != null);
+    try testing.expectEqual(@as(usize, 0), fake.i);
+}
+
+test "yes with two pending actions asks which" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+
+    var fake: FakeHttp = .{
+        .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"no\"}}]}"},
+        .gpa = testing.allocator,
+    };
+    defer fake.deinit();
+
+    var db = try openTmpDb(&tmp, &buf);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const now = std.Io.Timestamp.now(threaded.io(), .real).toSeconds();
+    _ = try tasks.ask(&db, "ping", "{\"a\":1}", null, "one", null, now);
+    _ = try tasks.ask(&db, "ping", "{\"a\":2}", null, "two", null, now);
+
+    var a: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+        .tools = &.{ping_tool},
+    };
+    const reply = try a.turn("yes");
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "more than one") != null);
+    try testing.expectEqual(@as(usize, 0), fake.i);
+}
+
+test "a bare yes with nothing pending is an ordinary message" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+
+    var fake: FakeHttp = .{
+        .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"sure thing\"}}]}"},
+        .gpa = testing.allocator,
+    };
+    defer fake.deinit();
+
+    var db = try openTmpDb(&tmp, &buf);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var a: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+        .tools = &.{ping_tool},
+    };
+    const reply = try a.turn("yes");
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("sure thing", reply);
+    try testing.expectEqual(@as(usize, 1), fake.i);
 }

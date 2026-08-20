@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent = @import("agent.zig");
 const memory = @import("memory.zig");
+const tasks = @import("tasks.zig");
 const Db = @import("db.zig").Db;
 const Agent = agent.Agent;
 const testing = std.testing;
@@ -97,6 +98,15 @@ pub fn printMemory(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64,
         try out.print("{s}\t{s}\t{d:.4}\n", .{ h.ref, h.kind, h.score });
     }
     try out.flush();
+}
+
+/// Prints tasks with status, priority, and success criterion. Children are indented.
+pub fn printTasks(db: *Db, gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
+    const items = try tasks.list(db, gpa);
+    defer tasks.freeTasks(gpa, items);
+    const text = try tasks.formatList(gpa, items);
+    defer gpa.free(text);
+    try writeReply(out, text);
 }
 
 fn resolveDay(buf: *[10]u8, date: ?[]const u8, now: i64) ![]const u8 {
@@ -235,6 +245,24 @@ test "memory prints ref, kind, and score per hit" {
     try testing.expect(std.mem.indexOf(u8, out.written(), "pet") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "fact") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), ".") != null); // score
+}
+
+test "tasks lists parent and child with status, priority, and goal" {
+    var h: Harness = undefined;
+    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
+    defer h.deinit();
+
+    const parent = try tasks.create(h.agent.db, "research", "notes written", 0, null, 2);
+    _ = try tasks.create(h.agent.db, "fetch sources", "three urls saved", 0, parent, 0);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try printTasks(h.agent.db, testing.allocator, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "research") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "queued") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "prio=2") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "notes written") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "  #") != null);
 }
 
 // ── test helpers ──────────────────────────────────────────────────────────
