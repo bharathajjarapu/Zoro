@@ -4,6 +4,7 @@ const config = @import("config.zig");
 const Db = @import("db.zig").Db;
 const agent = @import("agent.zig");
 const cli = @import("cli.zig");
+const telegram = @import("telegram.zig");
 
 const log = std.log.scoped(.zoro);
 
@@ -16,7 +17,8 @@ const version = "0.0.0";
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
         // Already reported in the owner's terms; a stack trace would only bury it.
-        error.MissingConfig, error.ChatHttp => std.process.exit(1),
+        error.MissingConfig, error.ChatHttp, error.TelegramApiError, error.TelegramHttp, error.InvalidTelegramToken => std.process.exit(1),
+        error.AlreadyRunning => std.process.exit(2),
         else => return err,
     };
 }
@@ -47,26 +49,55 @@ const usage =
     \\
 ;
 
-/// Startup and shutdown for the daemon. The Telegram poller lands here next.
+/// Startup and shutdown for the daemon.
 fn daemon(init: std.process.Init) !void {
     var cfg = try config.load(init.gpa, init.io, ".env");
     defer cfg.deinit(init.gpa);
     cfg.overlay(init.environ_map);
 
-    if (cfg.telegram_token == null) return config.missing("ZORO_TELEGRAM_TOKEN");
-    if (cfg.owner_id == null) return config.missing("ZORO_OWNER_ID");
+    const token = cfg.telegram_token orelse return config.missing("ZORO_TELEGRAM_TOKEN");
+    const owner_id = cfg.owner_id orelse return config.missing("ZORO_OWNER_ID");
+    const chat_id = cfg.chat_id orelse return config.missing("ZORO_CHAT_ID");
+    const key = cfg.api_key orelse return config.missing("ZORO_API_KEY");
+    const model = cfg.model orelse return config.missing("ZORO_MODEL");
 
     var db = try openDb(init.io, cfg.data_dir);
     defer db.close();
     try db.migrate();
 
+    var lock = try telegram.tryLock(init.io, cfg.data_dir) orelse {
+        log.err("telegram already running on this machine", .{});
+        return error.AlreadyRunning;
+    };
+    defer lock.close(init.io);
+
+    var http = agent.StdHttp.init(init.gpa, init.io);
+    defer http.deinit();
+
+    var a: agent.Agent = .{
+        .gpa = init.gpa,
+        .io = init.io,
+        .db = &db,
+        .http = http.http(),
+        .api_key = key,
+        .base_url = cfg.base_url orelse agent.default_base_url,
+        .model = model,
+    };
+    var bot: telegram.Bot = .{
+        .gpa = init.gpa,
+        .io = init.io,
+        .http = http.http(),
+        .db = &db,
+        .agent = &a,
+        .token = token,
+        .owner_id = owner_id,
+        .chat_id = chat_id,
+    };
+
+    try bot.getMe();
     stop.install();
-    log.info("started; waiting for a shutdown signal", .{});
-
-    // ponytail: a 100 ms tick is enough to notice the flag. Ticket 06 replaces
-    // this with the getUpdates long poll, which wakes on its own cadence.
-    while (!stop.requested()) try std.Io.sleep(init.io, .fromMilliseconds(100), .awake);
-
+    log.info("polling", .{});
+    try bot.run(&stop.requested);
     log.info("shutting down", .{});
 }
 
@@ -236,6 +267,7 @@ test {
     _ = @import("config.zig");
     _ = @import("agent.zig");
     _ = @import("cli.zig");
+    _ = @import("telegram.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {

@@ -33,6 +33,7 @@ pub const Config = struct {
 
     telegram_token: ?Secret = null,
     owner_id: ?i64 = null,
+    chat_id: ?i64 = null,
     api_key: ?Secret = null,
     /// OpenAI-compatible base, no trailing slash. Default applied by callers.
     base_url: ?[]const u8 = null,
@@ -48,6 +49,11 @@ pub const Config = struct {
             self.telegram_token = .init(val);
         } else if (eql(u8, key, "ZORO_OWNER_ID")) {
             self.owner_id = std.fmt.parseInt(i64, val, 10) catch blk: {
+                log.warn("{s} is not a number", .{key});
+                break :blk null;
+            };
+        } else if (eql(u8, key, "ZORO_CHAT_ID")) {
+            self.chat_id = std.fmt.parseInt(i64, val, 10) catch blk: {
                 log.warn("{s} is not a number", .{key});
                 break :blk null;
             };
@@ -135,6 +141,11 @@ test "parse reads keys, skipping comments and blanks" {
     try testing.expectEqualStrings("sk-test", cfg.api_key.?.reveal());
     try testing.expectEqualStrings("https://api.example/v1", cfg.base_url.?);
     try testing.expectEqualStrings("gpt-5", cfg.model.?);
+}
+
+test "parse reads ZORO_CHAT_ID" {
+    const cfg = parse("ZORO_CHAT_ID=99\n");
+    try testing.expectEqual(@as(?i64, 99), cfg.chat_id);
 }
 
 test "a secret prints redacted, never its value" {
