@@ -1,6 +1,7 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const Stmt = @import("db.zig").Stmt;
+const secrets = @import("secrets.zig");
 const testing = std.testing;
 
 pub const Source = enum {
@@ -240,6 +241,160 @@ pub fn putAlias(db: *Db, word: []const u8, meaning: []const u8) !void {
     _ = try ins.step();
 }
 
+pub const Extracted = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+const Fail = enum { none, summarize, facts, write, commit, delete };
+
+/// Compacts one day's messages into the diary file and index, then deletes
+/// the raw rows. `facts` are durable extracts (empty is fine). Order is
+/// load-bearing: summarize → facts → write+fsync → commit → delete.
+pub fn compact(
+    db: *Db,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    day: []const u8,
+    now: i64,
+    facts: []const Extracted,
+) !void {
+    return compactAt(db, gpa, io, dir, day, now, facts, .none);
+}
+
+fn compactAt(
+    db: *Db,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    day: []const u8,
+    now: i64,
+    facts: []const Extracted,
+    fail: Fail,
+) !void {
+    const start = try parseDay(day);
+    if (fail == .summarize) return error.Injected;
+
+    const raw = try summarizeDay(db, gpa, start);
+    defer gpa.free(raw);
+    if (raw.len == 0) return;
+    const summary = try secrets.redact(db, gpa, raw);
+    defer gpa.free(summary);
+
+    if (fail == .facts) return error.Injected;
+    for (facts) |f| try put(db, f.key, f.value, .inferred, now, null);
+
+    if (fail == .write) return error.Injected;
+    try writeDiaryFile(io, dir, day, summary);
+
+    if (fail == .commit) return error.Injected;
+    try indexDiary(db, day, summary, now);
+
+    if (fail == .delete) return error.Injected;
+    try deleteDay(db, start);
+}
+
+/// Caller owns the bytes. Null when the file is missing.
+pub fn readDiary(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, day: []const u8) !?[]u8 {
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer d.close(io);
+    var name: [16]u8 = undefined;
+    const file_name = try diaryName(&name, day);
+    return d.readFileAlloc(io, file_name, gpa, .limited(1 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
+/// UTC calendar day for `ts`. `buf` must be at least 10 bytes.
+pub fn formatDay(buf: []u8, ts: i64) []const u8 {
+    const secs: u64 = @intCast(@max(ts, 0));
+    const yd = std.time.epoch.EpochSeconds{ .secs = secs };
+    const year_day = yd.getEpochDay().calculateYearDay();
+    const md = year_day.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        year_day.year,
+        md.month.numeric(),
+        md.day_index + 1,
+    }) catch unreachable;
+}
+
+pub fn parseDay(s: []const u8) !i64 {
+    if (s.len != 10 or s[4] != '-' or s[7] != '-') return error.BadDay;
+    const y = try std.fmt.parseInt(u16, s[0..4], 10);
+    const m = try std.fmt.parseInt(u4, s[5..7], 10);
+    const d = try std.fmt.parseInt(u8, s[8..10], 10);
+    if (m < 1 or m > 12 or d < 1 or y < 1970) return error.BadDay;
+    const month: std.time.epoch.Month = @enumFromInt(m);
+    if (d > std.time.epoch.getDaysInMonth(y, month)) return error.BadDay;
+
+    var days: i64 = 0;
+    var year: u16 = 1970;
+    while (year < y) : (year += 1) {
+        days += std.time.epoch.getDaysInYear(year);
+    }
+    var i: u4 = 1;
+    while (i < m) : (i += 1) {
+        days += std.time.epoch.getDaysInMonth(y, @enumFromInt(i));
+    }
+    days += d - 1;
+    return days * 86_400;
+}
+
+fn summarizeDay(db: *Db, gpa: std.mem.Allocator, start: i64) ![]u8 {
+    var q = try db.prepare(
+        \\SELECT role, content FROM messages
+        \\WHERE created >= ? AND created < ?
+        \\ORDER BY id
+    );
+    defer q.finalize();
+    try q.bind(1, start);
+    try q.bind(2, start + 86_400);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    var w = &out.writer;
+    var any = false;
+    while (try q.step()) {
+        if (!any) {
+            var buf: [10]u8 = undefined;
+            try w.print("# {s}\n\n", .{formatDay(&buf, start)});
+            any = true;
+        }
+        try w.print("**{s}:** {s}\n\n", .{ q.text(0), q.text(1) });
+    }
+    if (!any) return try gpa.dupe(u8, "");
+    return try out.toOwnedSlice();
+}
+
+fn writeDiaryFile(io: std.Io, dir: []const u8, day: []const u8, summary: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    var d = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer d.close(io);
+    var name: [16]u8 = undefined;
+    const file_name = try diaryName(&name, day);
+    var f = try d.createFile(io, file_name, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, summary);
+    try f.sync(io);
+}
+
+fn diaryName(buf: []u8, day: []const u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}.md", .{day});
+}
+
+fn deleteDay(db: *Db, start: i64) !void {
+    var q = try db.prepare("DELETE FROM messages WHERE created >= ? AND created < ?");
+    defer q.finalize();
+    try q.bind(1, start);
+    try q.bind(2, start + 86_400);
+    _ = try q.step();
+}
+
 /// Writes a diary row and its FTS chunk in one transaction. Ticket 10 owns
 /// the file + fsync; this is the machine index.
 pub fn indexDiary(db: *Db, day: []const u8, summary: []const u8, now: i64) !void {
@@ -321,6 +476,22 @@ fn isOperator(tok: []const u8) bool {
 
 fn tmpPath(tmp: *testing.TmpDir, buf: []u8) ![:0]u8 {
     return std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
+}
+
+fn insertMsg(db: *Db, role: []const u8, content: []const u8, created: i64) !void {
+    var q = try db.prepare("INSERT INTO messages(role, content, created) VALUES (?, ?, ?)");
+    defer q.finalize();
+    try q.bind(1, role);
+    try q.bind(2, content);
+    try q.bind(3, created);
+    _ = try q.step();
+}
+
+fn countMsgs(db: *Db) !i64 {
+    var q = try db.prepare("SELECT COUNT(*) FROM messages");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    return q.int(0);
 }
 
 test "a fact survives closing and reopening the database" {
@@ -530,4 +701,135 @@ test "recent facts rank above older facts with the same text" {
     try testing.expectEqual(@as(usize, 2), hits.len);
     try testing.expectEqualStrings("new", hits[0].ref);
     try testing.expect(hits[0].score < hits[1].score);
+}
+
+test "compaction writes a diary file and deletes that day's messages" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try tmpPath(&tmp, &buf));
+    defer db.close();
+    try db.migrate();
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const day = "2026-08-20";
+    const start = try parseDay(day);
+    try insertMsg(&db, "user", "walked the dog at sunrise", start + 10);
+    try insertMsg(&db, "assistant", "nice, that's a good start", start + 20);
+    try insertMsg(&db, "user", "tomorrow's note", start + 86_400);
+
+    const diary_dir = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/diary", .{tmp.sub_path});
+    const facts = [_]Extracted{.{ .key = "pet_walk", .value = "walks the dog at sunrise" }};
+    try compact(&db, testing.allocator, io, diary_dir, day, start + 30, &facts);
+
+    const text = try readDiary(testing.allocator, io, diary_dir, day) orelse return error.MissingDiary;
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "walked the dog at sunrise") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "tomorrow's note") == null);
+
+    try testing.expectEqual(@as(i64, 1), try countMsgs(&db));
+    var pet = try get(&db, testing.allocator, "pet_walk", start) orelse return error.MissingFact;
+    defer pet.deinit(testing.allocator);
+    try testing.expectEqualStrings("walks the dog at sunrise", pet.value);
+
+    const hits = try search(&db, testing.allocator, "sunrise", start, 8);
+    defer freeHits(testing.allocator, hits);
+    try testing.expect(hits.len >= 1);
+}
+
+test "a failure at each compaction step leaves raw messages intact" {
+    const steps = [_]Fail{ .summarize, .facts, .write, .commit, .delete };
+    for (steps) |step| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buf: [128]u8 = undefined;
+        var db = try Db.open(try tmpPath(&tmp, &buf));
+        defer db.close();
+        try db.migrate();
+
+        var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        const day = "2026-08-20";
+        const start = try parseDay(day);
+        try insertMsg(&db, "user", "keep this", start + 1);
+
+        const diary_dir = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/diary", .{tmp.sub_path});
+        const facts = [_]Extracted{.{ .key = "k", .value = "v" }};
+        try testing.expectError(error.Injected, compactAt(
+            &db,
+            testing.allocator,
+            io,
+            diary_dir,
+            day,
+            start,
+            &facts,
+            step,
+        ));
+        try testing.expectEqual(@as(i64, 1), try countMsgs(&db));
+    }
+}
+
+test "compaction can be retried after a failed commit" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try tmpPath(&tmp, &buf));
+    defer db.close();
+    try db.migrate();
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const day = "2026-08-20";
+    const start = try parseDay(day);
+    try insertMsg(&db, "user", "retried day", start + 1);
+    const diary_dir = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/diary", .{tmp.sub_path});
+
+    try testing.expectError(error.Injected, compactAt(
+        &db,
+        testing.allocator,
+        io,
+        diary_dir,
+        day,
+        start,
+        &.{},
+        .commit,
+    ));
+    try compact(&db, testing.allocator, io, diary_dir, day, start, &.{});
+    try testing.expectEqual(@as(i64, 0), try countMsgs(&db));
+    const text = try readDiary(testing.allocator, io, diary_dir, day) orelse return error.MissingDiary;
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "retried day") != null);
+}
+
+test "compaction redacts secret values from the diary" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try tmpPath(&tmp, &buf));
+    defer db.close();
+    try db.migrate();
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const day = "2026-08-20";
+    const start = try parseDay(day);
+    try secrets.put(&db, "weather_api_key", "sk-secret-value", "api.weather.com", start);
+    try insertMsg(&db, "user", "the key is sk-secret-value", start + 10);
+
+    const diary_dir = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/diary", .{tmp.sub_path});
+    try compact(&db, testing.allocator, io, diary_dir, day, start + 30, &.{});
+
+    const text = try readDiary(testing.allocator, io, diary_dir, day) orelse return error.MissingDiary;
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "sk-secret-value") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "[secret:weather_api_key]") != null);
 }

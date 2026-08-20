@@ -1,5 +1,7 @@
 const std = @import("std");
 const agent = @import("agent.zig");
+const memory = @import("memory.zig");
+const Db = @import("db.zig").Db;
 const Agent = agent.Agent;
 const testing = std.testing;
 
@@ -56,6 +58,54 @@ fn stripCr(line: []const u8) []const u8 {
 
 fn isQuit(s: []const u8) bool {
     return std.mem.eql(u8, s, ":q") or std.mem.eql(u8, s, ":quit");
+}
+
+/// Prints a day's diary. `date` is YYYY-MM-DD, `today`, `yesterday`, or null (today).
+pub fn printDiary(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    date: ?[]const u8,
+    now: i64,
+    out: *std.Io.Writer,
+) !void {
+    var buf: [10]u8 = undefined;
+    const day = resolveDay(&buf, date, now) catch {
+        try out.print("bad date: {s}\n", .{date.?});
+        try out.flush();
+        return;
+    };
+    const text = try memory.readDiary(gpa, io, dir, day) orelse {
+        try out.print("no diary for {s}\n", .{day});
+        try out.flush();
+        return;
+    };
+    defer gpa.free(text);
+    try writeReply(out, text);
+}
+
+/// Prints BM25 hits as `ref  kind  score` per line.
+pub fn printMemory(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64, out: *std.Io.Writer) !void {
+    const hits = try memory.search(db, gpa, query, now, 16);
+    defer memory.freeHits(gpa, hits);
+    if (hits.len == 0) {
+        try out.writeAll("no hits\n");
+        try out.flush();
+        return;
+    }
+    for (hits) |h| {
+        try out.print("{s}\t{s}\t{d:.4}\n", .{ h.ref, h.kind, h.score });
+    }
+    try out.flush();
+}
+
+fn resolveDay(buf: *[10]u8, date: ?[]const u8, now: i64) ![]const u8 {
+    const arg = date orelse return memory.formatDay(buf, now);
+    if (std.mem.eql(u8, arg, "today")) return memory.formatDay(buf, now);
+    if (std.mem.eql(u8, arg, "yesterday")) return memory.formatDay(buf, now - 86_400);
+    _ = memory.parseDay(arg) catch return error.BadDay;
+    if (arg.len != 10) return error.BadDay;
+    return arg;
 }
 
 test "run prints the stubbed reply and exits" {
@@ -126,9 +176,68 @@ const SliceIter = struct {
     }
 };
 
-// ── test helpers ──────────────────────────────────────────────────────────
+test "diary prints a day's file and reports a missing day clearly" {
+    var h: Harness = undefined;
+    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
+    defer h.deinit();
 
-const Db = @import("db.zig").Db;
+    const diary_dir = try std.fmt.bufPrint(&h.path_buf, ".zig-cache/tmp/{s}/diary", .{h.tmp.sub_path});
+    try std.Io.Dir.cwd().createDirPath(h.agent.io, diary_dir);
+    var d = try std.Io.Dir.cwd().openDir(h.agent.io, diary_dir, .{});
+    defer d.close(h.agent.io);
+    try d.writeFile(h.agent.io, .{ .sub_path = "2026-08-20.md", .data = "# 2026-08-20\n\nwalked the dog\n" });
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try printDiary(testing.allocator, h.agent.io, diary_dir, "2026-08-20", 0, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "walked the dog") != null);
+
+    var missing: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer missing.deinit();
+    try printDiary(testing.allocator, h.agent.io, diary_dir, "2026-08-21", 0, &missing.writer);
+    try testing.expectEqualStrings("no diary for 2026-08-21\n", missing.written());
+}
+
+test "diary with no date argument defaults to today" {
+    var h: Harness = undefined;
+    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
+    defer h.deinit();
+
+    const now: i64 = 1_755_648_000; // 2026-08-20 00:00 UTC
+    var day: [10]u8 = undefined;
+    const today = memory.formatDay(&day, now);
+    const diary_dir = try std.fmt.bufPrint(&h.path_buf, ".zig-cache/tmp/{s}/diary", .{h.tmp.sub_path});
+    try std.Io.Dir.cwd().createDirPath(h.agent.io, diary_dir);
+    var d = try std.Io.Dir.cwd().openDir(h.agent.io, diary_dir, .{});
+    defer d.close(h.agent.io);
+    var name: [16]u8 = undefined;
+    try d.writeFile(h.agent.io, .{
+        .sub_path = try std.fmt.bufPrint(&name, "{s}.md", .{today}),
+        .data = "today's log\n",
+    });
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try printDiary(testing.allocator, h.agent.io, diary_dir, null, now, &out.writer);
+    try testing.expectEqualStrings("today's log\n", out.written());
+}
+
+test "memory prints ref, kind, and score per hit" {
+    var h: Harness = undefined;
+    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
+    defer h.deinit();
+
+    try memory.put(h.agent.db, "pet", "a black cat named mittens", .owner, 1000, null);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try printMemory(h.agent.db, testing.allocator, "mittens", 1000, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "pet") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "fact") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), ".") != null); // score
+}
+
+// ── test helpers ──────────────────────────────────────────────────────────
 
 const FakeHttp = struct {
     bodies: []const []const u8,

@@ -2,12 +2,16 @@ const std = @import("std");
 const config = @import("config.zig");
 const Db = @import("db.zig").Db;
 const memory = @import("memory.zig");
+const skills = @import("skills.zig");
+const tools = @import("tools.zig");
+const web = @import("web.zig");
+const secrets = @import("secrets.zig");
 const testing = std.testing;
 
 const log = std.log.scoped(.agent);
 
 pub const max_rounds: usize = 32;
-pub const max_tool_result: usize = 64 * 1024;
+pub const max_tool_result: usize = tools.max_result;
 const max_history: usize = 40;
 const max_memories: usize = 8;
 const max_http_body: usize = 2 * 1024 * 1024;
@@ -46,14 +50,9 @@ pub const Http = struct {
     }
 };
 
-/// A tool the loop can call. Ticket 12 replaces this with a registry; until
-/// then the agent accepts a slice passed in at construction.
-pub const Tool = struct {
-    name: []const u8,
-    description: []const u8,
-    /// Caller owns the returned bytes.
-    run: *const fn (gpa: std.mem.Allocator, args: []const u8) anyerror![]u8,
-};
+/// A tool the loop can call. Defined in `tools.zig`; this alias keeps call
+/// sites in this file short.
+pub const Tool = tools.Def;
 
 pub const Agent = struct {
     gpa: std.mem.Allocator,
@@ -64,6 +63,9 @@ pub const Agent = struct {
     base_url: []const u8,
     model: []const u8,
     tools: []const Tool = &.{},
+    skills_dir: []const u8 = "skills",
+    fetch: ?web.Get = null,
+    limiter: web.Limiter = .{},
 
     /// Caller owns the returned reply.
     pub fn turn(self: *Agent, input: []const u8) ![]u8 {
@@ -75,7 +77,7 @@ pub const Agent = struct {
         const arena = arena_inst.allocator();
 
         var messages: std.ArrayList(Msg) = .empty;
-        try messages.append(arena, .{ .role = "system", .content = try withMemory(arena, self.db, input, now) });
+        try messages.append(arena, .{ .role = "system", .content = try withContext(arena, self, input, now) });
         try loadHistory(self.db, arena, &messages);
         // loadHistory already includes the user row we just wrote.
 
@@ -124,10 +126,17 @@ pub const Agent = struct {
             });
 
             for (calls) |call| {
-                const raw = try runTool(self.gpa, self.tools, call);
+                var ctx: tools.Ctx = .{
+                    .gpa = self.gpa,
+                    .io = self.io,
+                    .db = self.db,
+                    .skills_dir = self.skills_dir,
+                    .fetch = self.fetch,
+                    .limiter = &self.limiter,
+                };
+                const raw = try tools.call(&ctx, self.tools, call.name, call.arguments);
                 defer self.gpa.free(raw);
-                const capped = truncate(raw, max_tool_result);
-                const owned = try arena.dupe(u8, capped);
+                const owned = try arena.dupe(u8, raw);
                 // Tool rows stay in-memory for this turn. Persisting them without
                 // tool_call metadata would break history reload; diary ticket owns that.
                 try messages.append(arena, .{
@@ -173,19 +182,36 @@ fn insertMsg(db: *Db, role: []const u8, content: []const u8, created: i64) !void
 
 /// Top-N BM25 hits for this message, compacted onto the system prompt.
 /// Empty search → the static prompt unchanged.
-fn withMemory(arena: std.mem.Allocator, db: *Db, query: []const u8, now: i64) ![]const u8 {
-    const hits = try memory.searchAny(db, arena, query, now, max_memories);
-    if (hits.len == 0) return system_prompt;
+fn withContext(arena: std.mem.Allocator, self: *Agent, query: []const u8, now: i64) ![]const u8 {
+    const hits = try memory.searchAny(self.db, arena, query, now, max_memories);
+    const skill_index = skills.list(arena, self.io, self.skills_dir) catch &.{};
+    const secret_names = secrets.names(self.db, arena) catch &.{};
+
+    if (hits.len == 0 and skill_index.len == 0 and secret_names.len == 0) return system_prompt;
 
     var buf: std.Io.Writer.Allocating = .init(arena);
     var w = &buf.writer;
     try w.writeAll(system_prompt);
-    try w.writeAll("\n\n## memory\n");
-    for (hits) |h| {
-        try w.writeAll(h.ref);
-        try w.writeAll(": ");
-        try w.writeAll(h.text);
-        try w.writeByte('\n');
+    if (hits.len != 0) {
+        try w.writeAll("\n\n## memory\n");
+        for (hits) |h| {
+            try w.writeAll(h.ref);
+            try w.writeAll(": ");
+            try w.writeAll(h.text);
+            try w.writeByte('\n');
+        }
+    }
+    if (skill_index.len != 0) {
+        try w.writeAll("\n\n## skills\n");
+        for (skill_index) |s| {
+            try w.print("- {s}: {s}\n", .{ s.name, s.description });
+        }
+    }
+    if (secret_names.len != 0) {
+        try w.writeAll("\n\n## secrets\n");
+        for (secret_names) |n| {
+            try w.print("- {s}\n", .{n});
+        }
     }
     return try buf.toOwnedSlice();
 }
@@ -212,18 +238,6 @@ fn loadHistory(db: *Db, arena: std.mem.Allocator, out: *std.ArrayList(Msg)) !voi
     }
 }
 
-fn runTool(gpa: std.mem.Allocator, tools: []const Tool, call: ToolCall) ![]u8 {
-    for (tools) |t| {
-        if (std.mem.eql(u8, t.name, call.name)) return t.run(gpa, call.arguments);
-    }
-    return try std.fmt.allocPrint(gpa, "unknown tool: {s}", .{call.name});
-}
-
-fn truncate(s: []const u8, limit: usize) []const u8 {
-    if (s.len <= limit) return s;
-    return s[0..limit];
-}
-
 fn dupeCalls(arena: std.mem.Allocator, calls: []const ToolCall) ![]ToolCall {
     const out = try arena.alloc(ToolCall, calls.len);
     for (calls, out) |c, *o| {
@@ -236,7 +250,7 @@ fn dupeCalls(arena: std.mem.Allocator, calls: []const ToolCall) ![]ToolCall {
     return out;
 }
 
-fn buildRequest(arena: std.mem.Allocator, model: []const u8, messages: []const Msg, tools: []const Tool) ![]u8 {
+fn buildRequest(arena: std.mem.Allocator, model: []const u8, messages: []const Msg, tool_list: []const Tool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     var w = &out.writer;
 
@@ -271,15 +285,17 @@ fn buildRequest(arena: std.mem.Allocator, model: []const u8, messages: []const M
     }
     try w.writeByte(']');
 
-    if (tools.len != 0) {
+    if (tool_list.len != 0) {
         try w.writeAll(",\"tools\":[");
-        for (tools, 0..) |t, i| {
+        for (tool_list, 0..) |t, i| {
             if (i != 0) try w.writeByte(',');
             try w.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
             try writeJsonString(w, t.name);
             try w.writeAll(",\"description\":");
             try writeJsonString(w, t.description);
-            try w.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}");
+            try w.writeAll(",\"parameters\":");
+            try tools.writeSchema(w, t);
+            try w.writeAll("}}");
         }
         try w.writeAll("],\"tool_choice\":\"auto\"");
     }
@@ -383,6 +399,10 @@ pub const StdHttp = struct {
 
     pub fn http(self: *StdHttp) Http {
         return .{ .ptr = self, .post_fn = post };
+    }
+
+    pub fn getter(self: *StdHttp) web.Get {
+        return web.fromClient(&self.client);
     }
 
     fn post(ptr: *anyopaque, gpa: std.mem.Allocator, req: Http.Request) anyerror!Http.Response {
@@ -584,13 +604,13 @@ test "turn persists user and assistant messages" {
     try testing.expect(!try q.step());
 }
 
-fn echoTool(gpa: std.mem.Allocator, args: []const u8) anyerror![]u8 {
-    return try gpa.dupe(u8, args);
+fn echoTool(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
+    return try ctx.gpa.dupe(u8, args);
 }
 
-fn bigTool(gpa: std.mem.Allocator, _: []const u8) anyerror![]u8 {
+fn bigTool(ctx: *tools.Ctx, _: []const u8) anyerror![]u8 {
     const n = max_tool_result + 100;
-    const out = try gpa.alloc(u8, n);
+    const out = try ctx.gpa.alloc(u8, n);
     @memset(out, 'x');
     return out;
 }
@@ -618,7 +638,7 @@ test "tool loop stops at 32 rounds and reports the blocker" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
-    const tools = [_]Tool{.{ .name = "echo", .description = "echo", .run = echoTool }};
+    const tools_echo = [_]Tool{.{ .name = "echo", .description = "echo", .params = &.{}, .run = echoTool }};
     var agent: Agent = .{
         .gpa = testing.allocator,
         .io = threaded.io(),
@@ -627,7 +647,7 @@ test "tool loop stops at 32 rounds and reports the blocker" {
         .api_key = .init("k"),
         .base_url = default_base_url,
         .model = "m",
-        .tools = &tools,
+        .tools = &tools_echo,
     };
 
     const reply = try agent.turn("loop");
@@ -659,7 +679,7 @@ test "tool results truncate at 64 KiB" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
-    const tools = [_]Tool{.{ .name = "big", .description = "big", .run = bigTool }};
+    const tools_big = [_]Tool{.{ .name = "big", .description = "big", .params = &.{}, .run = bigTool }};
     var agent: Agent = .{
         .gpa = testing.allocator,
         .io = threaded.io(),
@@ -668,7 +688,7 @@ test "tool results truncate at 64 KiB" {
         .api_key = .init("k"),
         .base_url = default_base_url,
         .model = "m",
-        .tools = &tools,
+        .tools = &tools_big,
     };
 
     const reply = try agent.turn("big");
@@ -676,14 +696,7 @@ test "tool results truncate at 64 KiB" {
     try testing.expectEqualStrings("done", reply);
 
     const sent = fake.last_body orelse return error.TestUnexpectedResult;
-    const marker = "\"role\":\"tool\",\"content\":\"";
-    const start = std.mem.indexOf(u8, sent, marker) orelse return error.TestUnexpectedResult;
-    var n: usize = 0;
-    for (sent[start + marker.len ..]) |c| {
-        if (c != 'x') break;
-        n += 1;
-    }
-    try testing.expectEqual(max_tool_result, n);
+    try testing.expect(std.mem.indexOf(u8, sent, "[truncated]") != null);
 }
 
 test "agent module stays free of channel imports" {
@@ -876,4 +889,87 @@ test "turn keeps injected memory and history bounded as history grows" {
     try testing.expect(n > 0);
     try testing.expect(n <= max_memories);
     try testing.expect(n < 20);
+}
+
+test "turn injects the skill index without the skill body" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+
+    var fake: FakeHttp = .{
+        .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
+        .gpa = testing.allocator,
+    };
+    defer fake.deinit();
+
+    var db = try openTmpDb(&tmp, &buf);
+    defer db.close();
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/skills", .{tmp.sub_path});
+    _ = try skills.save(testing.allocator, io, dir,
+        \\---
+        \\name: weather
+        \\description: Look up the forecast
+        \\---
+        \\
+        \\SECRET_BODY_SHOULD_STAY_OFF_THE_PROMPT
+    );
+
+    var agent: Agent = .{
+        .gpa = testing.allocator,
+        .io = io,
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+        .skills_dir = dir,
+    };
+
+    const reply = try agent.turn("hi");
+    defer testing.allocator.free(reply);
+    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, sent, "weather") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "Look up the forecast") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "SECRET_BODY_SHOULD_STAY_OFF_THE_PROMPT") == null);
+}
+
+test "turn lists secret names but never their values" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+
+    var fake: FakeHttp = .{
+        .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
+        .gpa = testing.allocator,
+    };
+    defer fake.deinit();
+
+    var db = try openTmpDb(&tmp, &buf);
+    defer db.close();
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    try secrets.put(&db, "weather_api_key", "sk-secret-value", "api.weather.com", 1000);
+
+    var agent: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+    };
+
+    const reply = try agent.turn("hi");
+    defer testing.allocator.free(reply);
+    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, sent, "weather_api_key") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "sk-secret-value") == null);
 }

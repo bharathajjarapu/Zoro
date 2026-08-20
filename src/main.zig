@@ -5,6 +5,7 @@ const Db = @import("db.zig").Db;
 const agent = @import("agent.zig");
 const cli = @import("cli.zig");
 const telegram = @import("telegram.zig");
+const tools = @import("tools.zig");
 
 const log = std.log.scoped(.zoro);
 
@@ -33,6 +34,8 @@ fn run(init: std.process.Init) !void {
     if (eql(u8, cmd, "help") or eql(u8, cmd, "--help")) return print(init.io, usage, .{});
     if (eql(u8, cmd, "run")) return cmdRun(init, &args);
     if (eql(u8, cmd, "chat")) return cmdChat(init);
+    if (eql(u8, cmd, "diary")) return cmdDiary(init, &args);
+    if (eql(u8, cmd, "memory")) return cmdMemory(init, &args);
 
     log.err("unknown command: {s}", .{cmd});
     try print(init.io, usage, .{});
@@ -44,6 +47,8 @@ const usage =
     \\  zoro            run the Telegram daemon
     \\  zoro run PROMPT one-shot turn, print the reply, exit
     \\  zoro chat       interactive REPL (same agent, same database)
+    \\  zoro diary [DATE]  print a day's diary (today if omitted)
+    \\  zoro memory QUERY  BM25 search; prints ref, kind, score
     \\  zoro --version  print the zoro and SQLite versions
     \\  zoro help       print this
     \\
@@ -82,6 +87,8 @@ fn daemon(init: std.process.Init) !void {
         .api_key = key,
         .base_url = cfg.base_url orelse agent.default_base_url,
         .model = model,
+        .tools = &tools.builtins,
+        .fetch = http.getter(),
     };
     var bot: telegram.Bot = .{
         .gpa = init.gpa,
@@ -135,6 +142,41 @@ fn cmdChat(init: std.process.Init) !void {
     try cli.chat(&t.agent, &in.interface, &out.interface, &err_out.interface);
 }
 
+/// Inspection only: WAL lets this run while the daemon holds the poller lock.
+fn cmdDiary(init: std.process.Init, args: anytype) !void {
+    var s: Store = undefined;
+    try s.init(init);
+    defer s.deinit();
+
+    const date = args.next();
+    const now = std.Io.Timestamp.now(init.io, .real).toSeconds();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/diary", .{s.cfg.data_dir});
+    var out_buf: [4096]u8 = undefined;
+    var out = std.Io.File.stdout().writer(init.io, &out_buf);
+    try cli.printDiary(init.gpa, init.io, dir, date, now, &out.interface);
+}
+
+fn cmdMemory(init: std.process.Init, args: anytype) !void {
+    var buf: [cli.max_prompt]u8 = undefined;
+    const query = cli.takePrompt(&buf, args) catch {
+        log.err("query longer than {d} bytes", .{cli.max_prompt});
+        std.process.exit(2);
+    } orelse {
+        try print(init.io, usage, .{});
+        std.process.exit(2);
+    };
+
+    var s: Store = undefined;
+    try s.init(init);
+    defer s.deinit();
+
+    const now = std.Io.Timestamp.now(init.io, .real).toSeconds();
+    var out_buf: [4096]u8 = undefined;
+    var out = std.Io.File.stdout().writer(init.io, &out_buf);
+    try cli.printMemory(&s.db, init.gpa, query, now, &out.interface);
+}
+
 const Terminal = struct {
     gpa: std.mem.Allocator,
     cfg: config.Config,
@@ -166,11 +208,36 @@ const Terminal = struct {
             .api_key = key,
             .base_url = self.cfg.base_url orelse agent.default_base_url,
             .model = model,
+            .tools = &tools.builtins,
+            .fetch = self.http.getter(),
         };
     }
 
     fn deinit(self: *Terminal) void {
         self.http.deinit();
+        self.db.close();
+        self.cfg.deinit(self.gpa);
+        self.* = undefined;
+    }
+};
+
+/// Database without an LLM — diary/memory inspection.
+const Store = struct {
+    gpa: std.mem.Allocator,
+    cfg: config.Config,
+    db: Db,
+
+    fn init(self: *Store, p: std.process.Init) !void {
+        self.gpa = p.gpa;
+        self.cfg = try config.load(p.gpa, p.io, ".env");
+        errdefer self.cfg.deinit(self.gpa);
+        self.cfg.overlay(p.environ_map);
+        self.db = try openDb(p.io, self.cfg.data_dir);
+        errdefer self.db.close();
+        try self.db.migrate();
+    }
+
+    fn deinit(self: *Store) void {
         self.db.close();
         self.cfg.deinit(self.gpa);
         self.* = undefined;
@@ -269,6 +336,10 @@ test {
     _ = @import("cli.zig");
     _ = @import("telegram.zig");
     _ = @import("memory.zig");
+    _ = @import("tools.zig");
+    _ = @import("skills.zig");
+    _ = @import("web.zig");
+    _ = @import("secrets.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {
