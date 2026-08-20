@@ -1,0 +1,10 @@
+.git
+.zig-cache
+zig-out
+temp
+.scratch
+docs
+.agents
+.claude
+*.md
+.env

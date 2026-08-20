@@ -43,6 +43,7 @@ pub const Config = struct {
     data_dir: []const u8 = "data",
     /// The only directory the agent may read files from or attach.
     workspace: []const u8 = "workspace",
+    skills_dir: []const u8 = "skills",
 
     /// Assigns one key. Later calls win, which is what gives the environment
     /// precedence over the file.
@@ -73,6 +74,8 @@ pub const Config = struct {
             self.data_dir = val;
         } else if (eql(u8, key, "ZORO_WORKSPACE")) {
             self.workspace = val;
+        } else if (eql(u8, key, "ZORO_SKILLS_DIR")) {
+            self.skills_dir = val;
         } else if (std.mem.startsWith(u8, key, "ZORO_")) {
             // A typo would otherwise be silent. The key is safe to log; the
             // value never is.
