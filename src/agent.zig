@@ -55,6 +55,35 @@ pub const Http = struct {
 /// sites in this file short.
 pub const Tool = tools.Def;
 
+/// Shared cancellation for delegated work. `worker.zig` owns the threads; the
+/// agent only raises the flag and reads the count, which is why this file
+/// still knows nothing about workers.
+pub const Workers = struct {
+    stop: std.atomic.Value(bool) = .init(false),
+    live: std.atomic.Value(usize) = .init(0),
+    /// One task's flag chains to the pool's, so "stop" halts everything while a
+    /// single task can still be called off on its own.
+    parent: ?*const Workers = null,
+
+    pub fn cancelled(self: *const Workers) bool {
+        if (self.stop.load(.acquire)) return true;
+        return if (self.parent) |p| p.cancelled() else false;
+    }
+
+    pub fn count(self: *const Workers) usize {
+        return self.live.load(.acquire);
+    }
+};
+
+/// What one run of the loop is allowed to spend. The owner's turn takes the
+/// defaults; a subagent is handed a smaller one.
+pub const Budget = struct {
+    tools: []const Tool,
+    rounds: usize = max_rounds,
+    system: []const u8 = system_prompt,
+    cancel: ?*const Workers = null,
+};
+
 pub const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -65,8 +94,12 @@ pub const Agent = struct {
     model: []const u8,
     tools: []const Tool = &.{},
     skills_dir: []const u8 = "skills",
+    workspace: []const u8 = "workspace",
     fetch: ?web.Get = null,
     limiter: web.Limiter = .{},
+    /// Set once delegation is wired up; null means nothing runs in the background.
+    workers: ?*Workers = null,
+    pool: ?*anyopaque = null,
 
     /// Caller owns the returned reply.
     pub fn turn(self: *Agent, input: []const u8) ![]u8 {
@@ -75,6 +108,13 @@ pub const Agent = struct {
         const verdict = tasks.decide(input);
         if (verdict != .other and try tasks.pendingCount(self.db) > 0) {
             return resolveApproval(self, input, now, verdict);
+        }
+        if (verdict == .deny and isStop(input)) {
+            if (self.workers) |w| if (w.count() > 0) {
+                try insertMsg(self.db, "user", input, now);
+                w.stop.store(true, .release);
+                return sayFmt(self, now, "Stopping {d} background task(s).", .{w.count()});
+            };
         }
         try insertMsg(self.db, "user", input, now);
 
@@ -87,74 +127,102 @@ pub const Agent = struct {
         try loadHistory(self.db, arena, &messages);
         // loadHistory already includes the user row we just wrote.
 
-        const endpoint = try chatUrl(arena, self.base_url);
-        const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{self.api_key.reveal()});
+        const reply = try drive(self, arena, &messages, .{ .tools = self.tools });
+        errdefer self.gpa.free(reply);
+        try insertMsg(self.db, "assistant", reply, now);
+        return reply;
+    }
 
-        var round: usize = 0;
-        while (true) {
-            // Cap before the next model call so we never spend a 33rd completion.
-            if (round >= max_rounds) {
-                const blocker = "I hit the tool-round limit (32) and stopped. Tell me how to continue.";
-                const reply = try self.gpa.dupe(u8, blocker);
-                errdefer self.gpa.free(reply);
-                try insertMsg(self.db, "assistant", reply, now);
-                return reply;
-            }
+    /// One turn with no history: the system prompt and `input`, nothing else,
+    /// and not a byte written to `messages`. That absence is exactly what
+    /// "fresh context" means for a subagent. Caller owns the reply.
+    pub fn isolated(self: *Agent, input: []const u8, b: Budget) ![]u8 {
+        var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_inst.deinit();
+        const arena = arena_inst.allocator();
 
-            const body = try buildRequest(arena, self.model, messages.items, self.tools);
-            var res = try self.http.post(self.gpa, .{
-                .url = endpoint,
-                .auth = auth,
-                .body = body,
-            });
-            defer res.deinit(self.gpa);
-
-            if (res.status != 200) {
-                log.err("chat HTTP {d}", .{res.status});
-                return error.ChatHttp;
-            }
-
-            var parsed = try parseAssistant(self.gpa, res.body);
-            defer parsed.deinit(self.gpa);
-
-            if (parsed.tool_calls.len == 0) {
-                const reply = try self.gpa.dupe(u8, parsed.content orelse "");
-                errdefer self.gpa.free(reply);
-                try insertMsg(self.db, "assistant", reply, now);
-                return reply;
-            }
-
-            const calls = try dupeCalls(arena, parsed.tool_calls);
-            try messages.append(arena, .{
-                .role = "assistant",
-                .content = try arena.dupe(u8, parsed.content orelse ""),
-                .tool_calls = calls,
-            });
-
-            for (calls) |call| {
-                var ctx: tools.Ctx = .{
-                    .gpa = self.gpa,
-                    .io = self.io,
-                    .db = self.db,
-                    .skills_dir = self.skills_dir,
-                    .fetch = self.fetch,
-                    .limiter = &self.limiter,
-                };
-                const raw = try tools.call(&ctx, self.tools, call.name, call.arguments);
-                defer self.gpa.free(raw);
-                const owned = try arena.dupe(u8, raw);
-                // Tool rows stay in-memory for this turn. Persisting them without
-                // tool_call metadata would break history reload; diary ticket owns that.
-                try messages.append(arena, .{
-                    .role = "tool",
-                    .content = owned,
-                    .tool_call_id = try arena.dupe(u8, call.id),
-                });
-            }
-            round += 1;
-        }
+        var messages: std.ArrayList(Msg) = .empty;
+        try messages.append(arena, .{ .role = "system", .content = b.system });
+        try messages.append(arena, .{ .role = "user", .content = input });
+        return drive(self, arena, &messages, b);
     }
 };
+
+/// The model/tool loop, shared by the owner's turn and by every subagent.
+/// Persisting the conversation is the caller's job, which is what keeps a
+/// subagent out of the transcript.
+fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), b: Budget) ![]u8 {
+    const endpoint = try chatUrl(arena, self.base_url);
+    const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{self.api_key.reveal()});
+
+    var round: usize = 0;
+    while (true) {
+        if (b.cancel) |w| if (w.cancelled()) return error.Cancelled;
+        // Cap before the next model call so we never spend one round too many.
+        if (round >= b.rounds) {
+            return std.fmt.allocPrint(
+                self.gpa,
+                "I hit the tool-round limit ({d}) and stopped. Tell me how to continue.",
+                .{b.rounds},
+            );
+        }
+
+        const body = try buildRequest(arena, self.model, messages.items, b.tools);
+        var res = try self.http.post(self.gpa, .{
+            .url = endpoint,
+            .auth = auth,
+            .body = body,
+        });
+        defer res.deinit(self.gpa);
+
+        if (res.status != 200) {
+            log.err("chat HTTP {d}", .{res.status});
+            return error.ChatHttp;
+        }
+
+        var parsed = try parseAssistant(self.gpa, res.body);
+        defer parsed.deinit(self.gpa);
+
+        if (parsed.tool_calls.len == 0) return self.gpa.dupe(u8, parsed.content orelse "");
+
+        const calls = try dupeCalls(arena, parsed.tool_calls);
+        try messages.append(arena, .{
+            .role = "assistant",
+            .content = try arena.dupe(u8, parsed.content orelse ""),
+            .tool_calls = calls,
+        });
+
+        for (calls) |call| {
+            var ctx: tools.Ctx = .{
+                .gpa = self.gpa,
+                .io = self.io,
+                .db = self.db,
+                .skills_dir = self.skills_dir,
+                .workspace = self.workspace,
+                .fetch = self.fetch,
+                .limiter = &self.limiter,
+                .pool = self.pool,
+            };
+            const raw = try tools.call(&ctx, b.tools, call.name, call.arguments);
+            defer self.gpa.free(raw);
+            const owned = try arena.dupe(u8, raw);
+            // Tool rows stay in-memory for this turn. Persisting them without
+            // tool_call metadata would break history reload; diary ticket owns that.
+            try messages.append(arena, .{
+                .role = "tool",
+                .content = owned,
+                .tool_call_id = try arena.dupe(u8, call.id),
+            });
+        }
+        round += 1;
+    }
+}
+
+/// Only the bare word cancels background work; "cancel" and "no" stay verdicts
+/// on a pending approval.
+fn isStop(input: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, input, &std.ascii.whitespace), "stop");
+}
 
 const Msg = struct {
     role: []const u8,
@@ -199,8 +267,10 @@ fn resolveApproval(self: *Agent, input: []const u8, now: i64, verdict: tasks.Dec
         .io = self.io,
         .db = self.db,
         .skills_dir = self.skills_dir,
+        .workspace = self.workspace,
         .fetch = self.fetch,
         .limiter = &self.limiter,
+        .pool = self.pool,
     };
     const raw = try tools.callApproved(&ctx, self.tools, pending.tool, pending.args);
     defer self.gpa.free(raw);

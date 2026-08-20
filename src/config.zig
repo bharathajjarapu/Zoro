@@ -39,6 +39,8 @@ pub const Config = struct {
     base_url: ?[]const u8 = null,
     model: ?[]const u8 = null,
     data_dir: []const u8 = "data",
+    /// The only directory the agent may read files from or attach.
+    workspace: []const u8 = "workspace",
 
     /// Assigns one key. Later calls win, which is what gives the environment
     /// precedence over the file.
@@ -65,6 +67,8 @@ pub const Config = struct {
             self.model = val;
         } else if (eql(u8, key, "ZORO_DATA_DIR")) {
             self.data_dir = val;
+        } else if (eql(u8, key, "ZORO_WORKSPACE")) {
+            self.workspace = val;
         } else if (std.mem.startsWith(u8, key, "ZORO_")) {
             // A typo would otherwise be silent. The key is safe to log; the
             // value never is.

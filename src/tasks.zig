@@ -297,6 +297,9 @@ pub fn formatList(gpa: std.mem.Allocator, items: []const Task) ![]u8 {
         if (t.parent) |p| {
             try buf.writer.print("{s}  parent=#{d}\n", .{ indent, p });
         }
+        if (t.result) |r| {
+            try buf.writer.print("{s}  result: {s}\n", .{ indent, r });
+        }
     }
     return buf.toOwnedSlice();
 }

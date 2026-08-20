@@ -20,6 +20,9 @@ pub const Ctx = struct {
     workspace: []const u8 = "workspace",
     fetch: ?web.Get = null,
     limiter: ?*web.Limiter = null,
+    /// A `*worker.Pool`, kept opaque so this file and `agent.zig` stay free of
+    /// worker types. `worker.zig` casts it back.
+    pool: ?*anyopaque = null,
 };
 
 pub const Def = struct {
@@ -86,6 +89,7 @@ const web_tools = @import("tools/web.zig");
 const tasks = @import("tasks.zig");
 const outbox = @import("outbox.zig");
 const routine = @import("tools/routine.zig");
+const worker = @import("worker.zig");
 
 const ask_params = [_]Param{
     .{ .name = "tool", .description = "tool to run if approved" },
@@ -130,6 +134,9 @@ pub const builtins = [_]Def{
     request_permission,
     outbox.notify_owner,
     outbox.attach_file,
+    worker.delegate,
+    worker.check_tasks,
+    worker.cancel_task,
 };
 
 /// Actions that exist only at the far end of an approval. They are never in

@@ -7,6 +7,7 @@ const cli = @import("cli.zig");
 const telegram = @import("telegram.zig");
 const tools = @import("tools.zig");
 const scheduler = @import("scheduler.zig");
+const worker = @import("worker.zig");
 
 const log = std.log.scoped(.zoro);
 
@@ -84,6 +85,10 @@ fn daemon(init: std.process.Init) !void {
     var http = agent.StdHttp.init(init.gpa, init.io);
     defer http.deinit();
 
+    var crew: Crew = undefined;
+    try crew.init(init, cfg, &db);
+    defer crew.deinit();
+
     var a: agent.Agent = .{
         .gpa = init.gpa,
         .io = init.io,
@@ -93,7 +98,10 @@ fn daemon(init: std.process.Init) !void {
         .base_url = cfg.base_url orelse agent.default_base_url,
         .model = model,
         .tools = &tools.builtins,
+        .workspace = cfg.workspace,
         .fetch = http.getter(),
+        .workers = &crew.pool.state,
+        .pool = &crew.pool,
     };
     var bot: telegram.Bot = .{
         .gpa = init.gpa,
@@ -122,6 +130,7 @@ fn daemon(init: std.process.Init) !void {
         .base_url = cfg.base_url orelse agent.default_base_url,
         .model = model,
         .tools = &tools.builtins,
+        .workspace = cfg.workspace,
         .fetch = sched_http.getter(),
     };
     const sched = try std.Thread.spawn(.{}, scheduler.loop, .{ &sched_agent, &stop.requested });
@@ -221,11 +230,61 @@ fn cmdRoutines(init: std.process.Init) !void {
     try cli.printRoutines(&s.db, &out.interface);
 }
 
+/// Three worker slots, each with its own database connection and HTTP client:
+/// SQLite is opened NOMUTEX and `std.http.Client` is not shared across threads
+/// either, so a worker owns both or neither.
+const Crew = struct {
+    dbs: [worker.max_live]Db = undefined,
+    https: [worker.max_live]agent.StdHttp = undefined,
+    open: usize = 0,
+    pool: worker.Pool = undefined,
+
+    fn init(self: *Crew, p: std.process.Init, cfg: config.Config, db: *Db) !void {
+        self.open = 0;
+        errdefer self.closeOpen();
+
+        var protos: [worker.max_live]agent.Agent = undefined;
+        for (&self.dbs, &self.https, &protos) |*wdb, *http, *proto| {
+            wdb.* = try openDb(p.io, cfg.data_dir);
+            self.open += 1;
+            http.* = agent.StdHttp.init(p.gpa, p.io);
+            proto.* = .{
+                .gpa = p.gpa,
+                .io = p.io,
+                .db = wdb,
+                .http = http.http(),
+                .api_key = cfg.api_key.?,
+                .base_url = cfg.base_url orelse agent.default_base_url,
+                .model = cfg.model.?,
+                .tools = &tools.builtins,
+                .workspace = cfg.workspace,
+                .fetch = http.getter(),
+            };
+        }
+        self.pool = worker.Pool.init(p.gpa, db, protos);
+        self.pool.arm();
+    }
+
+    fn deinit(self: *Crew) void {
+        self.pool.deinit();
+        self.closeOpen();
+    }
+
+    fn closeOpen(self: *Crew) void {
+        for (self.dbs[0..self.open], self.https[0..self.open]) |*wdb, *http| {
+            http.deinit();
+            wdb.close();
+        }
+        self.open = 0;
+    }
+};
+
 const Terminal = struct {
     gpa: std.mem.Allocator,
     cfg: config.Config,
     db: Db,
     http: agent.StdHttp,
+    crew: Crew,
     agent: agent.Agent,
 
     fn init(self: *Terminal, p: std.process.Init) !void {
@@ -244,6 +303,9 @@ const Terminal = struct {
         self.http = agent.StdHttp.init(p.gpa, p.io);
         errdefer self.http.deinit();
 
+        try self.crew.init(p, self.cfg, &self.db);
+        errdefer self.crew.deinit();
+
         self.agent = .{
             .gpa = p.gpa,
             .io = p.io,
@@ -253,11 +315,15 @@ const Terminal = struct {
             .base_url = self.cfg.base_url orelse agent.default_base_url,
             .model = model,
             .tools = &tools.builtins,
+            .workspace = self.cfg.workspace,
             .fetch = self.http.getter(),
+            .workers = &self.crew.pool.state,
+            .pool = &self.crew.pool,
         };
     }
 
     fn deinit(self: *Terminal) void {
+        self.crew.deinit();
         self.http.deinit();
         self.db.close();
         self.cfg.deinit(self.gpa);
@@ -387,6 +453,7 @@ test {
     _ = @import("tasks.zig");
     _ = @import("scheduler.zig");
     _ = @import("outbox.zig");
+    _ = @import("worker.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {
