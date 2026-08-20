@@ -7,6 +7,16 @@ const Db = @import("db.zig").Db;
 const log = std.log.scoped(.telegram);
 
 pub const max_text = 64 * 1024;
+/// Conservative under Telegram's 4096-character cap so a chunk always fits.
+const max_message = 3900;
+
+fn utf8ChunkEnd(text: []const u8, max_bytes: usize) usize {
+    if (max_bytes == 0) return 0;
+    if (text.len <= max_bytes) return text.len;
+    var end = max_bytes;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) : (end -= 1) {}
+    return end;
+}
 
 pub const Batch = struct {
     items: []Update = &.{},
@@ -134,6 +144,14 @@ test "parseUpdates skips bots and non-text but still advances the offset" {
     try testing.expectEqual(@as(i64, 4), batch.next_offset.?);
 }
 
+test "utf8ChunkEnd does not split a multi-byte character" {
+    const text = "ab€cd";
+    try testing.expectEqual(@as(usize, 2), utf8ChunkEnd(text, 4));
+    try testing.expectEqual(text.len, utf8ChunkEnd(text, 32));
+    try testing.expectEqual(@as(usize, 0), utf8ChunkEnd("€", 1));
+    try testing.expectEqual(@as(usize, 0), utf8ChunkEnd("€", 0));
+}
+
 test "parseUpdates skips text over 64 KiB and still advances the offset" {
     const oversized = "a" ** (64 * 1024 + 1);
     const body = try std.fmt.allocPrint(
@@ -246,8 +264,10 @@ pub const Bot = struct {
             // Persist first so a crash during turn cannot replay.
             try saveOffset(self.db, u.update_id + 1);
             if (!admit(u, self.owner_id, self.chat_id)) continue;
+            self.typing() catch |err| log.warn("{t}", .{err});
             const reply = try self.agent.turn(u.text);
-            self.gpa.free(reply); // ticket 07 sends this
+            defer self.gpa.free(reply);
+            try self.send(reply);
         }
         if (batch.next_offset) |n| try saveOffset(self.db, n);
     }
@@ -261,17 +281,51 @@ pub const Bot = struct {
         }
     }
 
+    fn typing(self: *Bot) !void {
+        const req = try buildChatAction(self.gpa, self.chat_id);
+        defer self.gpa.free(req);
+        const body = try self.call("sendChatAction", req);
+        defer self.gpa.free(body);
+        try ensureOk(self.gpa, body);
+    }
+
+    fn send(self: *Bot, text: []const u8) !void {
+        var remaining = text;
+        while (remaining.len > 0) {
+            const end = utf8ChunkEnd(remaining, max_message);
+            if (end == 0) return error.InvalidTelegramText;
+            const req = try buildSendMessage(self.gpa, self.chat_id, remaining[0..end]);
+            defer self.gpa.free(req);
+            const body = try self.call("sendMessage", req);
+            defer self.gpa.free(body);
+            try ensureOk(self.gpa, body);
+            remaining = remaining[end..];
+        }
+    }
+
     fn call(self: *Bot, method: []const u8, body: []const u8) ![]u8 {
         const url = try endpoint(self.gpa, self.token.reveal(), method);
         defer self.gpa.free(url);
-        var res = try self.http.post(self.gpa, .{
-            .url = url,
-            .auth = "",
-            .body = body,
-        });
-        errdefer res.deinit(self.gpa);
-        if (res.status != 200) return error.TelegramHttp;
-        return res.body;
+        var tries: u8 = 0;
+        while (true) {
+            var res = try self.http.post(self.gpa, .{
+                .url = url,
+                .auth = "",
+                .body = body,
+            });
+            if (res.status == 429) {
+                // ponytail: cap at 60s; honour the header fully if a flood wait exceeds that
+                const wait = @min(retryAfter(self.gpa, res.body) orelse 1, 60);
+                res.deinit(self.gpa);
+                tries += 1;
+                if (tries > 3) return error.TelegramHttp;
+                std.Io.sleep(self.io, .fromSeconds(wait), .awake) catch return error.TelegramHttp;
+                continue;
+            }
+            errdefer res.deinit(self.gpa);
+            if (res.status != 200) return error.TelegramHttp;
+            return res.body;
+        }
     }
 };
 
@@ -307,22 +361,65 @@ fn ensureOk(gpa: std.mem.Allocator, body: []const u8) !void {
     if (!parsed.value.ok) return error.TelegramApiError;
 }
 
+const RetryBody = struct {
+    parameters: ?struct { retry_after: ?i64 = null } = null,
+};
+
+fn retryAfter(gpa: std.mem.Allocator, body: []const u8) ?u32 {
+    const parsed = std.json.parseFromSlice(RetryBody, gpa, body, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    const n = (parsed.value.parameters orelse return null).retry_after orelse return null;
+    return if (n >= 0) std.math.cast(u32, n) else null;
+}
+
+test "retryAfter reads parameters.retry_after" {
+    try testing.expectEqual(@as(?u32, 12), retryAfter(
+        testing.allocator,
+        "{\"ok\":false,\"error_code\":429,\"parameters\":{\"retry_after\":12}}",
+    ));
+    try testing.expectEqual(@as(?u32, null), retryAfter(testing.allocator, "{\"ok\":false}"));
+}
+
 const GetUpdatesRequest = struct {
     offset: ?i64 = null,
     timeout: u32,
     allowed_updates: []const []const u8,
 };
 
-fn buildGetUpdates(gpa: std.mem.Allocator, offset: ?i64) ![]u8 {
-    const allowed = [_][]const u8{"message"};
+const ChatActionRequest = struct {
+    chat_id: i64,
+    action: []const u8,
+};
+
+const SendMessageRequest = struct {
+    chat_id: i64,
+    text: []const u8,
+};
+
+fn jsonBody(gpa: std.mem.Allocator, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    try out.writer.print("{f}", .{std.json.fmt(GetUpdatesRequest{
+    try out.writer.print("{f}", .{std.json.fmt(value, .{ .emit_null_optional_fields = false })});
+    return out.toOwnedSlice();
+}
+
+fn buildChatAction(gpa: std.mem.Allocator, chat_id: i64) ![]u8 {
+    return jsonBody(gpa, ChatActionRequest{ .chat_id = chat_id, .action = "typing" });
+}
+
+fn buildSendMessage(gpa: std.mem.Allocator, chat_id: i64, text: []const u8) ![]u8 {
+    return jsonBody(gpa, SendMessageRequest{ .chat_id = chat_id, .text = text });
+}
+
+fn buildGetUpdates(gpa: std.mem.Allocator, offset: ?i64) ![]u8 {
+    const allowed = [_][]const u8{"message"};
+    return jsonBody(gpa, GetUpdatesRequest{
         .offset = offset,
         .timeout = poll_timeout,
         .allowed_updates = &allowed,
-    }, .{ .emit_null_optional_fields = false })});
-    return out.toOwnedSlice();
+    });
 }
 
 fn tmpDb(tmp: *testing.TmpDir, buf: []u8) !Db {
@@ -367,6 +464,8 @@ const FakeHttp = struct {
     status: u16 = 200,
     last_url: ?[]u8 = null,
     last_body: ?[]u8 = null,
+    urls: std.ArrayList([]u8) = .empty,
+    statuses: []const u16 = &.{},
 
     fn http(self: *FakeHttp) agent.Http {
         return .{ .ptr = self, .post_fn = post };
@@ -374,17 +473,21 @@ const FakeHttp = struct {
 
     fn post(ptr: *anyopaque, gpa: std.mem.Allocator, req: agent.Http.Request) anyerror!agent.Http.Response {
         const self: *FakeHttp = @ptrCast(@alignCast(ptr));
+        try self.urls.append(self.gpa, try self.gpa.dupe(u8, req.url));
         if (self.last_url) |u| self.gpa.free(u);
         self.last_url = try self.gpa.dupe(u8, req.url);
         if (self.last_body) |b| self.gpa.free(b);
         self.last_body = try self.gpa.dupe(u8, req.body);
         if (self.i >= self.bodies.len) return error.TooManyCalls;
+        const st: u16 = if (self.i < self.statuses.len) self.statuses[self.i] else self.status;
         const body = try gpa.dupe(u8, self.bodies[self.i]);
         self.i += 1;
-        return .{ .status = self.status, .body = body };
+        return .{ .status = st, .body = body };
     }
 
     fn deinit(self: *FakeHttp) void {
+        for (self.urls.items) |u| self.gpa.free(u);
+        self.urls.deinit(self.gpa);
         if (self.last_url) |u| self.gpa.free(u);
         if (self.last_body) |b| self.gpa.free(b);
         self.* = undefined;
@@ -465,10 +568,113 @@ test "getMe rejects HTTP non-200" {
     try testing.expectError(error.TelegramHttp, h.bot.getMe());
 }
 
+test "pollOnce sends the reply via sendMessage" {
+    var h: Harness = undefined;
+    try h.init(
+        &.{
+            "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
+            "{\"ok\":true}",
+            "{\"ok\":true}",
+        },
+        &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
+    );
+    defer h.deinit();
+
+    try h.bot.pollOnce();
+    try testing.expect(std.mem.indexOf(u8, h.tg.last_url.?, "sendMessage") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "\"chat_id\":42") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "\"text\":\"hi\"") != null);
+}
+
+test "pollOnce sends a typing indicator before the turn" {
+    var h: Harness = undefined;
+    try h.init(
+        &.{
+            "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
+            "{\"ok\":true}",
+            "{\"ok\":true}",
+        },
+        &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
+    );
+    defer h.deinit();
+
+    try h.bot.pollOnce();
+    try testing.expectEqual(@as(usize, 3), h.tg.urls.items.len);
+    try testing.expect(std.mem.endsWith(u8, h.tg.urls.items[1], "sendChatAction"));
+    try testing.expect(std.mem.endsWith(u8, h.tg.urls.items[2], "sendMessage"));
+}
+
+test "a 429 is retried after retry-after rather than failing immediately" {
+    var h: Harness = undefined;
+    try h.init(
+        &.{
+            "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
+            "{\"ok\":true}",
+            "{\"ok\":false,\"error_code\":429,\"parameters\":{\"retry_after\":0}}",
+            "{\"ok\":true}",
+        },
+        &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
+    );
+    defer h.deinit();
+    h.tg.statuses = &.{ 200, 200, 429, 200 };
+
+    try h.bot.pollOnce();
+    try testing.expectEqual(@as(usize, 4), h.tg.i);
+    try testing.expect(std.mem.endsWith(u8, h.tg.urls.items[2], "sendMessage"));
+    try testing.expect(std.mem.endsWith(u8, h.tg.urls.items[3], "sendMessage"));
+    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "\"text\":\"hi\"") != null);
+}
+
+test "send failure is returned rather than swallowed" {
+    var h: Harness = undefined;
+    try h.init(
+        &.{
+            "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
+            "{\"ok\":true}",
+            "{\"ok\":false,\"description\":\"Bad Request\"}",
+        },
+        &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
+    );
+    defer h.deinit();
+    try testing.expectError(error.TelegramApiError, h.bot.pollOnce());
+}
+
+test "pollOnce splits a long reply into UTF-8-safe chunks" {
+    const extra = 17;
+    const reply = try testing.allocator.alloc(u8, max_message + extra);
+    defer testing.allocator.free(reply);
+    @memset(reply, 'a');
+    const llm = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"choices\":[{{\"message\":{{\"content\":\"{s}\"}}}}]}}",
+        .{reply},
+    );
+    defer testing.allocator.free(llm);
+
+    var h: Harness = undefined;
+    try h.init(
+        &.{
+            "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
+            "{\"ok\":true}",
+            "{\"ok\":true}",
+            "{\"ok\":true}",
+        },
+        &.{llm},
+    );
+    defer h.deinit();
+
+    try h.bot.pollOnce();
+    try testing.expectEqual(@as(usize, 4), h.tg.i);
+    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "sendMessage") == null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.last_url.?, "sendMessage") != null);
+    const want = "a" ** extra;
+    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, want) != null);
+}
+
 test "pollOnce serves the owner and persists the offset" {
     var h: Harness = undefined;
     try h.init(
-        &.{"{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}"},
+        &.{ "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}", "{\"ok\":true}", "{\"ok\":true}" },
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     );
     defer h.deinit();
@@ -514,7 +720,7 @@ test "pollOnce advances offset past a batch with nothing to serve" {
 test "pollOnce advances offset past skipped updates after a served message" {
     var h: Harness = undefined;
     try h.init(
-        &.{"{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}},{\"update_id\":11,\"callback_query\":{\"id\":\"x\"}}]}"},
+        &.{ "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}},{\"update_id\":11,\"callback_query\":{\"id\":\"x\"}}]}", "{\"ok\":true}", "{\"ok\":true}" },
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     );
     defer h.deinit();
@@ -527,6 +733,8 @@ test "a later pollOnce sends the persisted offset" {
     try h.init(
         &.{
             "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
+            "{\"ok\":true}",
+            "{\"ok\":true}",
             "{\"ok\":true,\"result\":[]}",
         },
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
