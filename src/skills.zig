@@ -13,6 +13,27 @@ pub const Skill = struct {
     body: []const u8,
 };
 
+/// What a routine may do when the scheduler fires it. Unrecognised text falls
+/// back to the most restrictive tier, so a typo can never widen authority.
+pub const Authority = enum {
+    notify,
+    safe,
+    critical,
+
+    pub fn of(text: ?[]const u8) Authority {
+        const t = text orelse return .notify;
+        inline for (std.meta.fields(Authority)) |f| {
+            if (std.ascii.eqlIgnoreCase(t, f.name)) return @field(Authority, f.name);
+        }
+        return .notify;
+    }
+
+    /// `notify` reads, analyses and messages the owner. It never mutates.
+    pub fn readOnly(self: Authority) bool {
+        return self == .notify;
+    }
+};
+
 pub const Entry = struct {
     name: []u8,
     description: []u8,
@@ -155,6 +176,7 @@ pub const save_skill: tools.Def = .{
     .name = "save_skill",
     .description = "Write a SKILL.md. Content must include name and description frontmatter.",
     .params = &content_param,
+    .mutates = true,
     .run = runSave,
 };
 
@@ -232,4 +254,14 @@ test "save then load round-trips, and the index is name plus description only" {
 
 test "save rejects a path-like name" {
     try testing.expectError(error.BadName, parse("---\nname: ../etc\ndescription: x\n---\nbody"));
+}
+
+test "authority falls back to notify for missing and unknown tiers" {
+    try testing.expectEqual(Authority.notify, Authority.of(null));
+    try testing.expectEqual(Authority.notify, Authority.of("nonsense"));
+    try testing.expectEqual(Authority.notify, Authority.of("NOTIFY"));
+    try testing.expectEqual(Authority.safe, Authority.of("safe"));
+    try testing.expectEqual(Authority.critical, Authority.of("critical"));
+    try testing.expect(Authority.of("notify").readOnly());
+    try testing.expect(!Authority.of("safe").readOnly());
 }

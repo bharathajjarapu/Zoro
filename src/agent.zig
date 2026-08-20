@@ -202,7 +202,7 @@ fn resolveApproval(self: *Agent, input: []const u8, now: i64, verdict: tasks.Dec
         .fetch = self.fetch,
         .limiter = &self.limiter,
     };
-    const raw = try tools.call(&ctx, self.tools, pending.tool, pending.args);
+    const raw = try tools.callApproved(&ctx, self.tools, pending.tool, pending.args);
     defer self.gpa.free(raw);
     return sayFmt(self, now, "{s}: {s}", .{ pending.tool, raw });
 }
@@ -236,8 +236,9 @@ fn withContext(arena: std.mem.Allocator, self: *Agent, query: []const u8, now: i
     const hits = try memory.searchAny(self.db, arena, query, now, max_memories);
     const skill_index = skills.list(arena, self.io, self.skills_dir) catch &.{};
     const secret_names = secrets.names(self.db, arena) catch &.{};
+    const pending = tasks.pendingLines(self.db, arena) catch "";
 
-    if (hits.len == 0 and skill_index.len == 0 and secret_names.len == 0) return system_prompt;
+    if (hits.len == 0 and skill_index.len == 0 and secret_names.len == 0 and pending.len == 0) return system_prompt;
 
     var buf: std.Io.Writer.Allocating = .init(arena);
     var w = &buf.writer;
@@ -262,6 +263,10 @@ fn withContext(arena: std.mem.Allocator, self: *Agent, query: []const u8, now: i
         for (secret_names) |n| {
             try w.print("- {s}\n", .{n});
         }
+    }
+    if (pending.len != 0) {
+        try w.writeAll("\n\n## waiting for the owner's yes or no\n");
+        try w.writeAll(pending);
     }
     return try buf.toOwnedSlice();
 }

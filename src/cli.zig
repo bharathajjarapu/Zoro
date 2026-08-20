@@ -2,6 +2,7 @@ const std = @import("std");
 const agent = @import("agent.zig");
 const memory = @import("memory.zig");
 const tasks = @import("tasks.zig");
+const outbox = @import("outbox.zig");
 const Db = @import("db.zig").Db;
 const Agent = agent.Agent;
 const testing = std.testing;
@@ -29,6 +30,7 @@ pub fn oneShot(a: *Agent, prompt: []const u8, out: *std.Io.Writer) !void {
     const reply = try a.turn(prompt);
     defer a.gpa.free(reply);
     try writeReply(out, reply);
+    try drain(a, out);
 }
 
 pub fn chat(a: *Agent, in: *std.Io.Reader, out: *std.Io.Writer, err_out: *std.Io.Writer) !void {
@@ -44,7 +46,20 @@ pub fn chat(a: *Agent, in: *std.Io.Reader, out: *std.Io.Writer, err_out: *std.Io
         const reply = try a.turn(text);
         defer a.gpa.free(reply);
         try writeReply(out, reply);
+        try drain(a, out);
     }
+}
+
+/// Anything a routine or tool queued for the owner. The terminal prints it; the
+/// Telegram driver sends it. Neither is visible to `agent.zig`.
+fn drain(a: *Agent, out: *std.Io.Writer) !void {
+    const items = try outbox.drain(a.db, a.gpa);
+    defer outbox.free(a.gpa, items);
+    for (items) |item| {
+        if (item.path) |p| try out.print("[{s}] {s}\n", .{ @tagName(item.kind), p });
+        if (item.text.len != 0) try writeReply(out, item.text);
+    }
+    try out.flush();
 }
 
 fn writeReply(out: *std.Io.Writer, reply: []const u8) !void {
@@ -107,6 +122,31 @@ pub fn printTasks(db: *Db, gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
     const text = try tasks.formatList(gpa, items);
     defer gpa.free(text);
     try writeReply(out, text);
+}
+
+/// Runtime state for every routine, including runs the scheduler declined to
+/// replay after downtime.
+pub fn printRoutines(db: *Db, out: *std.Io.Writer) !void {
+    var q = try db.prepare(
+        \\SELECT name, enabled, COALESCE(status, '-'), fails, skips,
+        \\       COALESCE(next, 0), COALESCE(last, 0)
+        \\FROM routines ORDER BY name
+    );
+    defer q.finalize();
+    var n: usize = 0;
+    while (try q.step()) : (n += 1) {
+        try out.print("{s} {s} status={s} fails={d} skips={d} next={d} last={d}\n", .{
+            q.text(0),
+            if (q.int(1) == 1) "on" else "off",
+            q.text(2),
+            q.int(3),
+            q.int(4),
+            q.int(5),
+            q.int(6),
+        });
+    }
+    if (n == 0) try out.writeAll("no routines\n");
+    try out.flush();
 }
 
 fn resolveDay(buf: *[10]u8, date: ?[]const u8, now: i64) ![]const u8 {
@@ -320,3 +360,27 @@ const Harness = struct {
         self.* = undefined;
     }
 };
+
+test "zoro routines shows tier state and the runs that were skipped" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
+    var db = try Db.open(path);
+    defer db.close();
+    try db.migrate();
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try printRoutines(&db, &out.writer);
+    try testing.expectEqualStrings("no routines\n", out.written());
+
+    try db.exec(
+        \\INSERT INTO routines(name, next, last, status, fails, enabled, skips)
+        \\VALUES ('payer', 900, 100, 'skipped', 0, 0, 2)
+    );
+    out.clearRetainingCapacity();
+    try printRoutines(&db, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "payer off status=skipped") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "skips=2") != null);
+}

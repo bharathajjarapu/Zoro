@@ -38,6 +38,7 @@ fn run(init: std.process.Init) !void {
     if (eql(u8, cmd, "diary")) return cmdDiary(init, &args);
     if (eql(u8, cmd, "memory")) return cmdMemory(init, &args);
     if (eql(u8, cmd, "tasks")) return cmdTasks(init);
+    if (eql(u8, cmd, "routines")) return cmdRoutines(init);
 
     log.err("unknown command: {s}", .{cmd});
     try print(init.io, usage, .{});
@@ -52,6 +53,7 @@ const usage =
     \\  zoro diary [DATE]  print a day's diary (today if omitted)
     \\  zoro memory QUERY  BM25 search; prints ref, kind, score
     \\  zoro tasks      list tasks with status, priority, and goal
+    \\  zoro routines   list routines with status, failures, and skipped runs
     \\  zoro --version  print the zoro and SQLite versions
     \\  zoro help       print this
     \\
@@ -207,6 +209,16 @@ fn cmdTasks(init: std.process.Init) !void {
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &out_buf);
     try cli.printTasks(&s.db, init.gpa, &out.interface);
+}
+
+fn cmdRoutines(init: std.process.Init) !void {
+    var s: Store = undefined;
+    try s.init(init);
+    defer s.deinit();
+
+    var out_buf: [4096]u8 = undefined;
+    var out = std.Io.File.stdout().writer(init.io, &out_buf);
+    try cli.printRoutines(&s.db, &out.interface);
 }
 
 const Terminal = struct {
@@ -374,6 +386,7 @@ test {
     _ = @import("secrets.zig");
     _ = @import("tasks.zig");
     _ = @import("scheduler.zig");
+    _ = @import("outbox.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {

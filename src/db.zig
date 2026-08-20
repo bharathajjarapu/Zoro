@@ -4,8 +4,12 @@ const testing = std.testing;
 
 const log = std.log.scoped(.db);
 
-/// Bump together with a new migration step in `migrate`.
-const version = 1;
+/// Ordered schema steps. Applying steps `n..` upgrades a database at
+/// `user_version = n`. Append a file; never edit one that has shipped.
+const steps = [_][:0]const u8{
+    @embedFile("schema.sql"),
+    @embedFile("migrations/002.sql"),
+};
 
 /// A SQLite connection. One per thread; WAL lets several coexist on one file.
 pub const Db = struct {
@@ -69,13 +73,23 @@ pub const Db = struct {
     /// version gate makes a second call a no-op, and the transaction means a
     /// failed run leaves nothing behind.
     pub fn migrate(self: *Db) !void {
-        var q = try self.prepare("PRAGMA user_version");
-        defer q.finalize();
-        if (!try q.step()) return error.Sqlite;
-        if (q.int(0) >= version) return;
+        const done = blk: {
+            var q = try self.prepare("PRAGMA user_version");
+            defer q.finalize();
+            if (!try q.step()) return error.Sqlite;
+            break :blk @as(usize, @intCast(q.int(0)));
+        };
+        if (done >= steps.len) return;
 
-        try self.exec("BEGIN;\n" ++ @embedFile("schema.sql") ++
-            std.fmt.comptimePrint("\nPRAGMA user_version = {d};\nCOMMIT;", .{version}));
+        for (steps[done..], done + 1..) |sql, level| {
+            var buf: [48]u8 = undefined;
+            const bump = try std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{level});
+            try self.exec("BEGIN;");
+            errdefer self.exec("ROLLBACK;") catch {};
+            try self.exec(sql);
+            try self.exec(bump);
+            try self.exec("COMMIT;");
+        }
     }
 
     pub fn lastId(self: *Db) i64 {
@@ -208,10 +222,10 @@ test "migrate creates every table and is idempotent" {
     var q = try db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'chunks_%' ORDER BY name");
     defer q.finalize();
     const want = [_][]const u8{
-        "approvals",    "approvals_status", "chunks",   "diary",
-        "facts",        "kv",               "messages", "messages_created",
-        "routines",     "routines_next",    "secrets",  "tasks",
-        "tasks_parent", "tasks_status",
+        "approvals", "approvals_status", "chunks",        "diary",
+        "facts",     "kv",               "messages",      "messages_created",
+        "outbox",    "routines",         "routines_next", "secrets",
+        "tasks",     "tasks_parent",     "tasks_status",
     };
 
     // Compare inside the loop: a column slice dies at the next step().
@@ -287,4 +301,20 @@ test "bind copies text, so a caller's buffer need not outlive the step" {
     defer q.finalize();
     try testing.expect(try q.step());
     try testing.expectEqualStrings("tg_offset", q.text(0));
+}
+
+test "an old database is upgraded in place instead of rebuilt" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try tmpDb(&tmp, &buf);
+    defer db.close();
+
+    try db.exec("BEGIN;\n" ++ @embedFile("schema.sql") ++ "\nPRAGMA user_version = 1;\nCOMMIT;");
+    try db.exec("INSERT INTO kv(key, value) VALUES ('tg_offset', '42')");
+
+    try db.migrate();
+    try testing.expectEqual(@as(i64, 42), try scalar(&db, "SELECT value FROM kv WHERE key = 'tg_offset'"));
+    try testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT count(*) FROM outbox"));
+    try testing.expectEqual(@as(i64, steps.len), try scalar(&db, "PRAGMA user_version"));
 }

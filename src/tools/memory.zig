@@ -17,6 +17,7 @@ pub const remember: Def = .{
     .name = "remember",
     .description = "Save a durable fact about the owner. Use a short key.",
     .params = &kv,
+    .mutates = true,
     .run = runRemember,
 };
 
@@ -31,6 +32,7 @@ pub const forget: Def = .{
     .name = "forget",
     .description = "Delete a saved fact by key.",
     .params = &key_only,
+    .mutates = true,
     .run = runForget,
 };
 

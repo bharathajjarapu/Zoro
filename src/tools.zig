@@ -17,6 +17,7 @@ pub const Ctx = struct {
     io: std.Io,
     db: *Db,
     skills_dir: []const u8 = "skills",
+    workspace: []const u8 = "workspace",
     fetch: ?web.Get = null,
     limiter: ?*web.Limiter = null,
 };
@@ -26,7 +27,34 @@ pub const Def = struct {
     description: []const u8,
     params: []const Param,
     run: *const fn (*Ctx, []const u8) anyerror![]u8,
+    /// Changes state the owner would care about. A `notify` routine never gets one.
+    mutates: bool = false,
+    /// Withheld from routines and subagents: delegation is the primary's job.
+    primary_only: bool = false,
 };
+
+/// The tools a restricted caller may use. `read_only` drops everything that
+/// mutates, `names` is a space-separated allowlist (null means no allowlist),
+/// and `primary_only` tools are never handed out. Caller frees the slice.
+pub fn subset(gpa: std.mem.Allocator, all: []const Def, read_only: bool, names: ?[]const u8) ![]Def {
+    var out: std.ArrayList(Def) = .empty;
+    errdefer out.deinit(gpa);
+    for (all) |t| {
+        if (t.primary_only) continue;
+        if (read_only and t.mutates) continue;
+        if (names) |list| if (!listed(list, t.name)) continue;
+        try out.append(gpa, t);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn listed(list: []const u8, name: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, list, " ,\t");
+    while (it.next()) |word| {
+        if (std.mem.eql(u8, word, name)) return true;
+    }
+    return false;
+}
 
 const secrets = @import("secrets.zig");
 const secret_params = [_]Param{
@@ -39,6 +67,7 @@ pub const store_secret: Def = .{
     .name = "store_secret",
     .description = "Store an API key. The value is scrubbed from the transcript; only the name remains visible.",
     .params = &secret_params,
+    .mutates = true,
     .run = runStoreSecret,
 };
 
@@ -55,6 +84,8 @@ pub const memory = @import("tools/memory.zig");
 const skills = @import("skills.zig");
 const web_tools = @import("tools/web.zig");
 const tasks = @import("tasks.zig");
+const outbox = @import("outbox.zig");
+const routine = @import("tools/routine.zig");
 
 const ask_params = [_]Param{
     .{ .name = "tool", .description = "tool to run if approved" },
@@ -67,6 +98,7 @@ pub const request_permission: Def = .{
     .name = "request_permission",
     .description = "Record a pending action. The owner must approve this exact tool and arguments in chat.",
     .params = &ask_params,
+    .mutates = true,
     .run = runAsk,
 };
 
@@ -96,7 +128,23 @@ pub const builtins = [_]Def{
     web_tools.search,
     store_secret,
     request_permission,
+    outbox.notify_owner,
+    outbox.attach_file,
 };
+
+/// Actions that exist only at the far end of an approval. They are never in
+/// `builtins`, so the model has no way to call one without the owner saying yes.
+pub const gated = [_]Def{
+    routine.enable_routine,
+    routine.run_routine,
+};
+
+/// Runs an action the owner just approved: gated tools first, then the caller's
+/// own list, so an approval can reach either.
+pub fn callApproved(ctx: *Ctx, own: []const Def, name: []const u8, args: []const u8) ![]u8 {
+    if (find(&gated, name) != null) return call(ctx, &gated, name, args);
+    return call(ctx, own, name, args);
+}
 
 /// Looks up `name`, rejects bad args, runs, and caps the result. Errors become
 /// a string the model can act on — they never crash the loop.
@@ -304,4 +352,50 @@ test "store_secret scrubs the value and keeps the name" {
     defer secrets.freeNames(testing.allocator, list);
     try testing.expectEqual(@as(usize, 1), list.len);
     try testing.expectEqualStrings("weather_api_key", list[0]);
+}
+
+test "a read-only caller gets no mutating tool, and delegation is never handed out" {
+    const list = try subset(testing.allocator, &builtins, true, null);
+    defer testing.allocator.free(list);
+    for (list) |t| try testing.expect(!t.mutates and !t.primary_only);
+    try testing.expect(find(list, "recall") != null);
+    try testing.expect(find(list, "remember") == null);
+    try testing.expect(find(list, "save_skill") == null);
+    try testing.expect(find(list, "notify_owner") != null);
+}
+
+test "an allowlist narrows to exactly the named tools" {
+    const list = try subset(testing.allocator, &builtins, false, "fetch_url remember");
+    defer testing.allocator.free(list);
+    try testing.expectEqual(@as(usize, 2), list.len);
+    try testing.expect(find(list, "fetch_url") != null);
+    try testing.expect(find(list, "remember") != null);
+}
+
+test "a gated tool is invisible to the model and reachable only once approved" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try tmpPath(&tmp, &buf));
+    defer db.close();
+    try db.migrate();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    try testing.expect(find(&builtins, "enable_routine") == null);
+
+    try db.exec("INSERT INTO routines(name, next, enabled) VALUES ('nightly', 0, 0)");
+    var ctx = ctxOf(&db, &threaded);
+    const denied = try call(&ctx, &builtins, "enable_routine", "{\"name\":\"nightly\"}");
+    defer testing.allocator.free(denied);
+    try testing.expectEqualStrings("unknown tool: enable_routine", denied);
+
+    const out = try callApproved(&ctx, &builtins, "enable_routine", "{\"name\":\"nightly\"}");
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "active") != null);
+
+    var q = try db.prepare("SELECT enabled FROM routines WHERE name = 'nightly'");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqual(@as(i64, 1), q.int(0));
 }

@@ -266,6 +266,19 @@ pub fn setApproval(db: *Db, id: i64, status: []const u8) !void {
     _ = try q.step();
 }
 
+/// One line per pending approval, oldest first, for the system prompt. Empty
+/// when nothing is waiting. Caller frees.
+pub fn pendingLines(db: *Db, gpa: std.mem.Allocator) ![]u8 {
+    var q = try db.prepare("SELECT id, tool, reason FROM approvals WHERE status = 'pending' ORDER BY id");
+    defer q.finalize();
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    errdefer buf.deinit();
+    while (try q.step()) {
+        try buf.writer.print("#{d} {s}: {s}\n", .{ q.int(0), q.text(1), q.text(2) });
+    }
+    return buf.toOwnedSlice();
+}
+
 pub fn formatList(gpa: std.mem.Allocator, items: []const Task) ![]u8 {
     if (items.len == 0) return try gpa.dupe(u8, "no tasks\n");
     var buf: std.Io.Writer.Allocating = .init(gpa);
