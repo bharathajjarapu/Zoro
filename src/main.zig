@@ -99,6 +99,7 @@ fn daemon(init: std.process.Init) !void {
         .model = model,
         .tools = &tools.builtins,
         .workspace = cfg.workspace,
+        .vision_model = cfg.vision_model orelse model,
         .fetch = http.getter(),
         .workers = &crew.pool.state,
         .pool = &crew.pool,
@@ -112,6 +113,8 @@ fn daemon(init: std.process.Init) !void {
         .token = token,
         .owner_id = owner_id,
         .chat_id = chat_id,
+        .fetch = http.getter(),
+        .workspace = cfg.workspace,
     };
 
     try bot.getMe();
@@ -316,6 +319,7 @@ const Terminal = struct {
             .model = model,
             .tools = &tools.builtins,
             .workspace = self.cfg.workspace,
+            .vision_model = self.cfg.vision_model orelse model,
             .fetch = self.http.getter(),
             .workers = &self.crew.pool.state,
             .pool = &self.crew.pool,

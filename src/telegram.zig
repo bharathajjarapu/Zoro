@@ -3,12 +3,17 @@ const testing = std.testing;
 const agent = @import("agent.zig");
 const config = @import("config.zig");
 const Db = @import("db.zig").Db;
+const outbox = @import("outbox.zig");
+const web = @import("web.zig");
 
 const log = std.log.scoped(.telegram);
 
 pub const max_text = 64 * 1024;
 /// Conservative under Telegram's 4096-character cap so a chunk always fits.
 const max_message = 3900;
+/// Bound on anything we pull off the wire or push back up. Telegram allows
+/// more; a personal assistant does not need it, and the model pays per byte.
+pub const max_file = 5 * 1024 * 1024;
 
 fn utf8ChunkEnd(text: []const u8, max_bytes: usize) usize {
     if (max_bytes == 0) return 0;
@@ -34,11 +39,16 @@ pub const Update = struct {
     from_id: i64,
     chat_id: i64,
     chat_type: []u8,
+    /// The message text, the caption of an attachment, or a one-line
+    /// description of an attachment we will not download.
     text: []u8,
+    /// Set only for a picture: the file to fetch and show the vision model.
+    photo: ?[]u8 = null,
 
     pub fn deinit(self: *Update, gpa: std.mem.Allocator) void {
         gpa.free(self.chat_type);
         gpa.free(self.text);
+        if (self.photo) |p| gpa.free(p);
         self.* = undefined;
     }
 };
@@ -57,7 +67,48 @@ const RawMessage = struct {
     from: ?RawUser = null,
     chat: RawChat,
     text: ?[]const u8 = null,
+    caption: ?[]const u8 = null,
+    photo: ?[]const RawPhoto = null,
+    document: ?RawFile = null,
+    audio: ?RawFile = null,
+    video: ?RawFile = null,
+    voice: ?RawFile = null,
 };
+
+const RawPhoto = struct {
+    file_id: []const u8 = "",
+    file_size: ?i64 = null,
+};
+
+const RawFile = struct {
+    file_id: []const u8 = "",
+    file_name: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+    file_size: ?i64 = null,
+};
+
+/// Telegram lists a photo smallest-first. The largest under the cap is the one
+/// worth showing the model.
+fn largest(sizes: []const RawPhoto) ?RawPhoto {
+    var best: ?RawPhoto = null;
+    for (sizes) |p| {
+        if (p.file_id.len == 0 or (p.file_size orelse 0) > max_file) continue;
+        if (best == null or (p.file_size orelse 0) > (best.?.file_size orelse 0)) best = p;
+    }
+    return best;
+}
+
+/// Anything that is not a picture becomes one line of metadata. It is never a
+/// failed turn, and never a download.
+fn describe(gpa: std.mem.Allocator, caption: []const u8, f: RawFile) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}{s}[attachment: {s}, {s}, {d} bytes — I can see its details but not its contents]", .{
+        caption,
+        if (caption.len == 0) "" else "\n",
+        f.file_name orelse "unnamed",
+        f.mime_type orelse "unknown type",
+        f.file_size orelse 0,
+    });
+}
 
 const RawChat = struct {
     id: i64,
@@ -89,21 +140,31 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
         if (next_offset == null or candidate > next_offset.?) next_offset = candidate;
 
         const msg = raw.message orelse continue;
-        const text = msg.text orelse continue;
-        if (text.len == 0 or text.len > max_text) continue;
         const from = msg.from orelse continue;
         if (from.is_bot) continue;
 
+        const caption = msg.text orelse msg.caption orelse "";
+        if (caption.len > max_text) continue;
+        const picture = if (msg.photo) |sizes| largest(sizes) else null;
+        const file = msg.document orelse msg.audio orelse msg.video orelse msg.voice;
+        if (caption.len == 0 and picture == null and file == null) continue;
+
         const chat_type = try gpa.dupe(u8, msg.chat.type);
         errdefer gpa.free(chat_type);
-        const owned_text = try gpa.dupe(u8, text);
+        const owned_text = if (picture == null and file != null)
+            try describe(gpa, caption, file.?)
+        else
+            try gpa.dupe(u8, caption);
         errdefer gpa.free(owned_text);
+        const photo_id = if (picture) |p| try gpa.dupe(u8, p.file_id) else null;
+        errdefer if (photo_id) |id| gpa.free(id);
         try items.append(gpa, .{
             .update_id = raw.update_id,
             .from_id = from.id,
             .chat_id = msg.chat.id,
             .chat_type = chat_type,
             .text = owned_text,
+            .photo = photo_id,
         });
     }
 
@@ -235,6 +296,8 @@ pub fn tryLock(io: std.Io, dir_path: []const u8) !?std.Io.File {
     };
 }
 
+const file_base = "https://api.telegram.org/file/bot";
+
 pub const Bot = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -244,6 +307,10 @@ pub const Bot = struct {
     token: config.Secret,
     owner_id: i64,
     chat_id: i64,
+    /// Plain GET, used only to pull a photo off Telegram's file host.
+    fetch: ?web.Get = null,
+    /// The one directory an outbound attachment may come from.
+    workspace: []const u8 = "workspace",
 
     pub fn getMe(self: *Bot) !void {
         const body = try self.call("getMe", "{}");
@@ -265,9 +332,8 @@ pub const Bot = struct {
             try saveOffset(self.db, u.update_id + 1);
             if (!admit(u, self.owner_id, self.chat_id)) continue;
             self.typing() catch |err| log.warn("{t}", .{err});
-            const reply = try self.agent.turn(u.text);
-            defer self.gpa.free(reply);
-            try self.send(reply);
+            try self.answer(u);
+            try self.flush();
         }
         if (batch.next_offset) |n| try saveOffset(self.db, n);
     }
@@ -279,6 +345,90 @@ pub const Bot = struct {
                 std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
             };
         }
+    }
+
+    /// A picture that will not download is still a turn: the owner gets an
+    /// answer about what we could see, never an error.
+    fn answer(self: *Bot, u: Update) !void {
+        var picture: ?[]u8 = null;
+        defer if (picture) |p| self.gpa.free(p);
+        var mime: []const u8 = "image/jpeg";
+
+        if (u.photo) |file_id| {
+            if (self.download(file_id)) |bytes| {
+                picture = bytes;
+                mime = sniff(bytes);
+            } else |err| log.warn("photo {s}: {t}", .{ file_id, err });
+        }
+
+        const reply = try self.agent.turnWith(.{
+            .text = if (u.text.len != 0) u.text else "(a picture, no caption)",
+            .image = if (picture) |p| .{ .mime = mime, .data = p } else null,
+        });
+        defer self.gpa.free(reply);
+        try self.send(reply);
+    }
+
+    /// Sends whatever the agent, a routine or a tool queued for the owner.
+    fn flush(self: *Bot) !void {
+        const items = try outbox.drain(self.db, self.gpa);
+        defer outbox.free(self.gpa, items);
+        for (items) |item| {
+            const err = switch (item.kind) {
+                .text => self.send(item.text),
+                .photo, .document => self.sendFile(item.kind, item.path.?, item.text),
+            };
+            err catch |e| log.err("outbox {s}: {t}", .{ @tagName(item.kind), e });
+        }
+    }
+
+    /// getFile then one plain GET against the file host, capped on the way in.
+    fn download(self: *Bot, file_id: []const u8) ![]u8 {
+        const get = self.fetch orelse return error.NoFetch;
+        const req = try jsonBody(self.gpa, .{ .file_id = file_id });
+        defer self.gpa.free(req);
+        const body = try self.call("getFile", req);
+        defer self.gpa.free(body);
+
+        const Reply = struct {
+            ok: bool = false,
+            result: struct { file_path: ?[]const u8 = null, file_size: ?i64 = null } = .{},
+        };
+        const parsed = std.json.parseFromSlice(Reply, self.gpa, body, .{ .ignore_unknown_fields = true }) catch
+            return error.InvalidTelegramResponse;
+        defer parsed.deinit();
+        if (!parsed.value.ok) return error.TelegramApiError;
+        const path = parsed.value.result.file_path orelse return error.TelegramApiError;
+        if ((parsed.value.result.file_size orelse 0) > max_file) return error.FileTooLarge;
+        if (std.mem.indexOfAny(u8, path, "?#") != null) return error.TelegramApiError;
+
+        const url = try std.fmt.allocPrint(self.gpa, "{s}{s}/{s}", .{ file_base, self.token.reveal(), path });
+        defer self.gpa.free(url);
+        var hop = try get.request(self.gpa, url, null);
+        errdefer hop.deinit(self.gpa);
+        if (hop.status != 200) return error.TelegramHttp;
+        if (hop.body.len > max_file) return error.FileTooLarge;
+        const bytes = hop.body;
+        hop.body = &.{};
+        hop.deinit(self.gpa);
+        return bytes;
+    }
+
+    fn sendFile(self: *Bot, kind: outbox.Kind, rel: []const u8, caption: []const u8) !void {
+        if (!outbox.safeRelative(rel)) return error.BadPath;
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ self.workspace, rel });
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(max_file));
+        defer self.gpa.free(bytes);
+
+        const field = if (kind == .photo) "photo" else "document";
+        const body = try multipart(self.gpa, self.chat_id, field, baseName(rel), caption, bytes);
+        defer self.gpa.free(body);
+
+        const method = if (kind == .photo) "sendPhoto" else "sendDocument";
+        const reply = try self.post(method, body, "multipart/form-data; boundary=" ++ boundary);
+        defer self.gpa.free(reply);
+        try ensureOk(self.gpa, reply);
     }
 
     fn typing(self: *Bot) !void {
@@ -304,6 +454,10 @@ pub const Bot = struct {
     }
 
     fn call(self: *Bot, method: []const u8, body: []const u8) ![]u8 {
+        return self.post(method, body, "application/json");
+    }
+
+    fn post(self: *Bot, method: []const u8, body: []const u8, content_type: []const u8) ![]u8 {
         const url = try endpoint(self.gpa, self.token.reveal(), method);
         defer self.gpa.free(url);
         var tries: u8 = 0;
@@ -312,6 +466,7 @@ pub const Bot = struct {
                 .url = url,
                 .auth = "",
                 .body = body,
+                .content_type = content_type,
             });
             if (res.status == 429) {
                 // ponytail: cap at 60s; honour the header fully if a flood wait exceeds that
@@ -411,6 +566,51 @@ fn buildChatAction(gpa: std.mem.Allocator, chat_id: i64) ![]u8 {
 
 fn buildSendMessage(gpa: std.mem.Allocator, chat_id: i64, text: []const u8) ![]u8 {
     return jsonBody(gpa, SendMessageRequest{ .chat_id = chat_id, .text = text });
+}
+
+/// Fixed and unguessable enough for a body we assembled ourselves; the parts
+/// are escaped below so it cannot appear inside one.
+const boundary = "zoroFormBoundary7Nn2Kq";
+
+/// Telegram's file upload form. Text fields first, the bytes last.
+fn multipart(
+    gpa: std.mem.Allocator,
+    chat_id: i64,
+    field: []const u8,
+    name: []const u8,
+    caption: []const u8,
+    bytes: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    try w.print("--{s}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{ boundary, chat_id });
+    if (caption.len != 0) {
+        const capped = caption[0..@min(caption.len, 1024)];
+        try w.print("--{s}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{s}\r\n", .{ boundary, capped });
+    }
+    try w.print(
+        "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+        .{ boundary, field, name },
+    );
+    try w.writeAll(bytes);
+    try w.print("\r\n--{s}--\r\n", .{boundary});
+    return out.toOwnedSlice();
+}
+
+fn baseName(path: []const u8) []const u8 {
+    const cut = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
+    return path[cut + 1 ..];
+}
+
+/// Enough to tell the vision model what it is looking at. Telegram re-encodes
+/// photos to JPEG, so this is mostly a courtesy for the odd PNG.
+fn sniff(bytes: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, bytes, "\x89PNG")) return "image/png";
+    if (std.mem.startsWith(u8, bytes, "GIF8")) return "image/gif";
+    if (bytes.len > 12 and std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
+    return "image/jpeg";
 }
 
 fn buildGetUpdates(gpa: std.mem.Allocator, offset: ?i64) ![]u8 {
@@ -534,6 +734,13 @@ const Harness = struct {
             .owner_id = 42,
             .chat_id = 42,
         };
+    }
+
+    /// A workspace directory beside the temp database.
+    fn workspace(self: *Harness, buf: []u8) ![]const u8 {
+        const dir = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/workspace", .{self.tmp.sub_path});
+        try std.Io.Dir.cwd().createDirPath(self.threaded.io(), dir);
+        return dir;
     }
 
     fn deinit(self: *Harness) void {
@@ -777,4 +984,125 @@ test "run returns without polling when stop is already set" {
         }
     };
     try h.bot.run(&halt.yes);
+}
+
+/// The file host is a plain GET, so the download seam is `web.Get`, not `Http`.
+const FakeGet = struct {
+    body: []const u8,
+    status: u16 = 200,
+    calls: usize = 0,
+    seen: [256]u8 = undefined,
+    seen_len: usize = 0,
+
+    fn get(self: *FakeGet) web.Get {
+        return .{ .ptr = self, .request_fn = request };
+    }
+
+    fn url(self: *FakeGet) []const u8 {
+        return self.seen[0..self.seen_len];
+    }
+
+    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, target: []const u8, _: ?[]const u8) anyerror!web.Hop {
+        const self: *FakeGet = @ptrCast(@alignCast(ptr));
+        self.seen_len = @min(target.len, self.seen.len);
+        @memcpy(self.seen[0..self.seen_len], target[0..self.seen_len]);
+        self.calls += 1;
+        return .{ .status = self.status, .body = try gpa.dupe(u8, self.body) };
+    }
+};
+
+const ok_json = "{\"ok\":true,\"result\":{}}";
+
+test "a photo is downloaded and reaches the vision model with its caption" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        \\{"ok":true,"result":[{"update_id":5,"message":{"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"caption":"what plant is this","photo":[{"file_id":"small","file_size":100},{"file_id":"big","file_size":900}]}}]}
+        ,
+        ok_json, // sendChatAction
+        "{\"ok\":true,\"result\":{\"file_path\":\"photos/x.png\",\"file_size\":8}}",
+        ok_json, // sendMessage
+    }, &.{"{\"choices\":[{\"message\":{\"content\":\"a fern\"}}]}"});
+    defer h.deinit();
+
+    var files: FakeGet = .{ .body = "\x89PNG\r\n\x1a\n" };
+    h.bot.fetch = files.get();
+    h.agent.vision_model = "sees-things";
+
+    try h.bot.pollOnce();
+
+    // The largest size is the one fetched, and the token never leaves the URL builder.
+    try testing.expectEqual(@as(usize, 1), files.calls);
+    try testing.expect(std.mem.endsWith(u8, files.url(), "/photos/x.png"));
+    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "\"big\"") != null or
+        std.mem.indexOf(u8, h.tg.urls.items[2], "getFile") != null);
+
+    const asked = h.llm.last_body.?;
+    try testing.expect(std.mem.indexOf(u8, asked, "\"sees-things\"") != null);
+    try testing.expect(std.mem.indexOf(u8, asked, "data:image/png;base64,") != null);
+    try testing.expect(std.mem.indexOf(u8, asked, "what plant is this") != null);
+}
+
+test "a photo that will not download still gets an answer" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        \\{"ok":true,"result":[{"update_id":5,"message":{"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"photo":[{"file_id":"big","file_size":900}]}}]}
+        ,
+        ok_json,
+        "{\"ok\":true,\"result\":{\"file_path\":\"photos/x.jpg\",\"file_size\":8}}",
+        ok_json,
+    }, &.{"{\"choices\":[{\"message\":{\"content\":\"I could not open it\"}}]}"});
+    defer h.deinit();
+
+    var files: FakeGet = .{ .body = "", .status = 404 };
+    h.bot.fetch = files.get();
+
+    try h.bot.pollOnce(); // the download fails; the turn happens anyway
+    try testing.expect(std.mem.indexOf(u8, h.llm.last_body.?, "a picture, no caption") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "I could not open it") != null);
+}
+
+test "a non-image attachment becomes metadata, never a failed turn" {
+    const body =
+        \\{"ok":true,"result":[{"update_id":1,"message":{"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"caption":"the lease","document":{"file_id":"d1","file_name":"lease.pdf","mime_type":"application/pdf","file_size":24576}}}]}
+    ;
+    var batch = try parseUpdates(testing.allocator, body);
+    defer batch.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), batch.items.len);
+    const u = batch.items[0];
+    try testing.expectEqual(@as(?[]u8, null), u.photo);
+    try testing.expect(std.mem.startsWith(u8, u.text, "the lease\n[attachment: lease.pdf, application/pdf, 24576 bytes"));
+}
+
+test "a workspace file goes out as a photo with its caption" {
+    var h: Harness = undefined;
+    try h.init(&.{ok_json}, &.{});
+    defer h.deinit();
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try h.workspace(&dir_buf);
+    h.bot.workspace = dir;
+    var d = try std.Io.Dir.cwd().openDir(h.threaded.io(), dir, .{});
+    defer d.close(h.threaded.io());
+    try d.writeFile(h.threaded.io(), .{ .sub_path = "chart.png", .data = "\x89PNG-bytes" });
+
+    try outbox.push(&h.db, .photo, "chart.png", "yesterday's spend", 100);
+    try h.bot.flush();
+
+    const sent = h.tg.last_body.?;
+    try testing.expect(std.mem.endsWith(u8, h.tg.last_url.?, "/sendPhoto"));
+    try testing.expect(std.mem.indexOf(u8, sent, "name=\"photo\"; filename=\"chart.png\"") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "yesterday's spend") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "\x89PNG-bytes") != null);
+
+    // Drained: a second flush sends nothing.
+    try h.bot.flush();
+    try testing.expectEqual(@as(usize, 1), h.tg.i);
+}
+
+test "an attachment pointing outside the workspace is refused" {
+    var h: Harness = undefined;
+    try h.init(&.{}, &.{});
+    defer h.deinit();
+    try testing.expectError(error.BadPath, h.bot.sendFile(.document, "../../etc/passwd", ""));
 }

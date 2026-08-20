@@ -34,6 +34,8 @@ pub const Http = struct {
         url: []const u8,
         auth: []const u8,
         body: []const u8,
+        /// Telegram wants multipart when a file rides along; everything else is JSON.
+        content_type: []const u8 = "application/json",
     };
 
     pub const Response = struct {
@@ -49,6 +51,21 @@ pub const Http = struct {
     pub fn post(self: Http, gpa: std.mem.Allocator, req: Request) anyerror!Response {
         return self.post_fn(self.ptr, gpa, req);
     }
+};
+
+/// A picture the owner sent, already downloaded and bounded by the channel.
+/// `data` is raw bytes; this file base64s them into the request and never
+/// stores them.
+pub const Image = struct {
+    mime: []const u8,
+    data: []const u8,
+};
+
+/// One turn's input. `turn` takes plain text; the Telegram driver uses
+/// `turnWith` when the owner sent a picture.
+pub const Input = struct {
+    text: []const u8,
+    image: ?Image = null,
 };
 
 /// A tool the loop can call. Defined in `tools.zig`; this alias keeps call
@@ -82,6 +99,9 @@ pub const Budget = struct {
     rounds: usize = max_rounds,
     system: []const u8 = system_prompt,
     cancel: ?*const Workers = null,
+    /// Overrides the agent's model for this run — a picture needs the vision
+    /// profile. Null keeps the default.
+    model: ?[]const u8 = null,
 };
 
 pub const Agent = struct {
@@ -95,6 +115,8 @@ pub const Agent = struct {
     tools: []const Tool = &.{},
     skills_dir: []const u8 = "skills",
     workspace: []const u8 = "workspace",
+    /// Model profile used when the owner sends a picture. Falls back to `model`.
+    vision_model: ?[]const u8 = null,
     fetch: ?web.Get = null,
     limiter: web.Limiter = .{},
     /// Set once delegation is wired up; null means nothing runs in the background.
@@ -103,6 +125,12 @@ pub const Agent = struct {
 
     /// Caller owns the returned reply.
     pub fn turn(self: *Agent, input: []const u8) ![]u8 {
+        return self.turnWith(.{ .text = input });
+    }
+
+    /// The one seam, widened by exactly one optional field. Caller owns the reply.
+    pub fn turnWith(self: *Agent, in: Input) ![]u8 {
+        const input = in.text;
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
         // A bare yes/no is only a verdict when something is actually waiting.
         const verdict = tasks.decide(input);
@@ -125,9 +153,14 @@ pub const Agent = struct {
         var messages: std.ArrayList(Msg) = .empty;
         try messages.append(arena, .{ .role = "system", .content = try withContext(arena, self, input, now) });
         try loadHistory(self.db, arena, &messages);
-        // loadHistory already includes the user row we just wrote.
+        // loadHistory already includes the user row we just wrote; the picture
+        // rides along on it and is never persisted.
+        if (in.image) |img| messages.items[messages.items.len - 1].image = img;
 
-        const reply = try drive(self, arena, &messages, .{ .tools = self.tools });
+        const reply = try drive(self, arena, &messages, .{
+            .tools = self.tools,
+            .model = if (in.image != null) self.vision_model else null,
+        });
         errdefer self.gpa.free(reply);
         try insertMsg(self.db, "assistant", reply, now);
         return reply;
@@ -167,7 +200,7 @@ fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), 
             );
         }
 
-        const body = try buildRequest(arena, self.model, messages.items, b.tools);
+        const body = try buildRequest(arena, b.model orelse self.model, messages.items, b.tools);
         var res = try self.http.post(self.gpa, .{
             .url = endpoint,
             .auth = auth,
@@ -229,6 +262,7 @@ const Msg = struct {
     content: []const u8,
     tool_calls: []const ToolCall = &.{},
     tool_call_id: ?[]const u8 = null,
+    image: ?Image = null,
 };
 
 const ToolCall = struct {
@@ -387,7 +421,7 @@ fn buildRequest(arena: std.mem.Allocator, model: []const u8, messages: []const M
         try w.writeAll("{\"role\":");
         try writeJsonString(w, m.role);
         try w.writeAll(",\"content\":");
-        try writeJsonString(w, m.content);
+        if (m.image) |img| try writeParts(arena, w, m.content, img) else try writeJsonString(w, m.content);
         if (m.tool_calls.len != 0) {
             try w.writeAll(",\"tool_calls\":[");
             for (m.tool_calls, 0..) |tc, j| {
@@ -430,6 +464,24 @@ fn buildRequest(arena: std.mem.Allocator, model: []const u8, messages: []const M
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try std.json.Stringify.encodeJsonString(s, .{}, w);
+}
+
+/// The OpenAI content-parts form: the caption stays with the picture, so the
+/// model reads both together.
+fn writeParts(arena: std.mem.Allocator, w: *std.Io.Writer, text: []const u8, img: Image) !void {
+    const enc = std.base64.standard.Encoder;
+    const b64 = try arena.alloc(u8, enc.calcSize(img.data.len));
+    defer arena.free(b64);
+    _ = enc.encode(b64, img.data);
+
+    const url = try std.fmt.allocPrint(arena, "data:{s};base64,{s}", .{ img.mime, b64 });
+    defer arena.free(url);
+
+    try w.writeAll("[{\"type\":\"text\",\"text\":");
+    try writeJsonString(w, text);
+    try w.writeAll("},{\"type\":\"image_url\",\"image_url\":{\"url\":");
+    try writeJsonString(w, url);
+    try w.writeAll("}}]");
 }
 
 const Parsed = struct {
@@ -541,7 +593,7 @@ pub const StdHttp = struct {
             .payload = req.body,
             .headers = .{
                 .authorization = .{ .override = req.auth },
-                .content_type = .{ .override = "application/json" },
+                .content_type = .{ .override = req.content_type },
             },
             .response_writer = &cap.writer,
         }) catch |err| {
@@ -1243,4 +1295,49 @@ test "a bare yes with nothing pending is an ordinary message" {
     defer testing.allocator.free(reply);
     try testing.expectEqualStrings("sure thing", reply);
     try testing.expectEqual(@as(usize, 1), fake.i);
+}
+
+test "a picture reaches the vision profile with its caption, and is not persisted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try std.fmt.bufPrintZ(&buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path}));
+    defer db.close();
+    try db.migrate();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var fake: FakeHttp = .{
+        .gpa = testing.allocator,
+        .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"a cat\"}}]}"},
+    };
+    defer fake.deinit();
+    var a: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = "https://api.openai.com/v1",
+        .model = "text-only",
+        .vision_model = "sees-things",
+    };
+
+    const reply = try a.turnWith(.{
+        .text = "what is this",
+        .image = .{ .mime = "image/jpeg", .data = "\xff\xd8\xff" },
+    });
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("a cat", reply);
+
+    const sent = fake.last_body.?;
+    try testing.expect(std.mem.indexOf(u8, sent, "\"sees-things\"") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "data:image/jpeg;base64,/9j/") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "\"what is this\"") != null);
+
+    // The transcript keeps the caption; the bytes are never written to the database.
+    var q = try db.prepare("SELECT content FROM messages WHERE role = 'user'");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("what is this", q.text(0));
 }
