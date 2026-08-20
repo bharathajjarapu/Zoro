@@ -9,7 +9,7 @@ pub const max_rounds: usize = 32;
 pub const max_tool_result: usize = 64 * 1024;
 const max_history: usize = 40;
 const max_http_body: usize = 2 * 1024 * 1024;
-const default_base_url = "https://api.openai.com/v1";
+pub const default_base_url = "https://api.openai.com/v1";
 
 pub const system_prompt =
     \\You are Zoro, a personal assistant for one owner. Speak briefly in plain

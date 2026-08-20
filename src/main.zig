@@ -2,6 +2,8 @@ const std = @import("std");
 const c = @import("c");
 const config = @import("config.zig");
 const Db = @import("db.zig").Db;
+const agent = @import("agent.zig");
+const cli = @import("cli.zig");
 
 const log = std.log.scoped(.zoro);
 
@@ -14,7 +16,7 @@ const version = "0.0.0";
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
         // Already reported in the owner's terms; a stack trace would only bury it.
-        error.MissingConfig => std.process.exit(1),
+        error.MissingConfig, error.ChatHttp => std.process.exit(1),
         else => return err,
     };
 }
@@ -27,6 +29,8 @@ fn run(init: std.process.Init) !void {
     const eql = std.mem.eql;
     if (eql(u8, cmd, "--version")) return print(init.io, "zoro {s} (sqlite {s})\n", .{ version, sqliteVersion() });
     if (eql(u8, cmd, "help") or eql(u8, cmd, "--help")) return print(init.io, usage, .{});
+    if (eql(u8, cmd, "run")) return cmdRun(init, &args);
+    if (eql(u8, cmd, "chat")) return cmdChat(init);
 
     log.err("unknown command: {s}", .{cmd});
     try print(init.io, usage, .{});
@@ -36,6 +40,8 @@ fn run(init: std.process.Init) !void {
 const usage =
     \\usage:
     \\  zoro            run the Telegram daemon
+    \\  zoro run PROMPT one-shot turn, print the reply, exit
+    \\  zoro chat       interactive REPL (same agent, same database)
     \\  zoro --version  print the zoro and SQLite versions
     \\  zoro help       print this
     \\
@@ -64,6 +70,82 @@ fn daemon(init: std.process.Init) !void {
     log.info("shutting down", .{});
 }
 
+/// run/chat: no Telegram token; the operator is the owner.
+fn cmdRun(init: std.process.Init, args: anytype) !void {
+    var buf: [cli.max_prompt]u8 = undefined;
+    const prompt = cli.takePrompt(&buf, args) catch {
+        log.err("prompt longer than {d} bytes", .{cli.max_prompt});
+        std.process.exit(2);
+    } orelse {
+        try print(init.io, usage, .{});
+        std.process.exit(2);
+    };
+
+    var t: Terminal = undefined;
+    try t.init(init);
+    defer t.deinit();
+
+    var out_buf: [4096]u8 = undefined;
+    var out = std.Io.File.stdout().writer(init.io, &out_buf);
+    try cli.oneShot(&t.agent, prompt, &out.interface);
+}
+
+fn cmdChat(init: std.process.Init) !void {
+    var t: Terminal = undefined;
+    try t.init(init);
+    defer t.deinit();
+
+    var in_buf: [cli.max_prompt]u8 = undefined;
+    var in = std.Io.File.stdin().readerStreaming(init.io, &in_buf);
+    var out_buf: [4096]u8 = undefined;
+    var out = std.Io.File.stdout().writer(init.io, &out_buf);
+    var err_buf: [256]u8 = undefined;
+    var err_out = std.Io.File.stderr().writer(init.io, &err_buf);
+    try cli.chat(&t.agent, &in.interface, &out.interface, &err_out.interface);
+}
+
+const Terminal = struct {
+    gpa: std.mem.Allocator,
+    cfg: config.Config,
+    db: Db,
+    http: agent.StdHttp,
+    agent: agent.Agent,
+
+    fn init(self: *Terminal, p: std.process.Init) !void {
+        self.gpa = p.gpa;
+        self.cfg = try config.load(p.gpa, p.io, ".env");
+        errdefer self.cfg.deinit(self.gpa);
+        self.cfg.overlay(p.environ_map);
+
+        const key = self.cfg.api_key orelse return config.missing("ZORO_API_KEY");
+        const model = self.cfg.model orelse return config.missing("ZORO_MODEL");
+
+        self.db = try openDb(p.io, self.cfg.data_dir);
+        errdefer self.db.close();
+        try self.db.migrate();
+
+        self.http = agent.StdHttp.init(p.gpa, p.io);
+        errdefer self.http.deinit();
+
+        self.agent = .{
+            .gpa = p.gpa,
+            .io = p.io,
+            .db = &self.db,
+            .http = self.http.http(),
+            .api_key = key,
+            .base_url = self.cfg.base_url orelse agent.default_base_url,
+            .model = model,
+        };
+    }
+
+    fn deinit(self: *Terminal) void {
+        self.http.deinit();
+        self.db.close();
+        self.cfg.deinit(self.gpa);
+        self.* = undefined;
+    }
+};
+
 fn openDb(io: std.Io, dir: []const u8) !Db {
     try std.Io.Dir.cwd().createDirPath(io, dir);
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -71,7 +153,7 @@ fn openDb(io: std.Io, dir: []const u8) !Db {
 }
 
 fn print(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
-    var buf: [256]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var file = std.Io.File.stdout().writer(io, &buf);
     try file.interface.print(fmt, args);
     try file.interface.flush();
@@ -153,6 +235,7 @@ test {
     _ = @import("db.zig");
     _ = @import("config.zig");
     _ = @import("agent.zig");
+    _ = @import("cli.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {
