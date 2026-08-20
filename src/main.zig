@@ -56,3 +56,7 @@ test "sqlite is linked with fts5 and bm25" {
 test "sqlite reports the pinned version" {
     try std.testing.expectEqualStrings("3.51.0", sqliteVersion());
 }
+
+test {
+    _ = @import("db.zig");
+}
