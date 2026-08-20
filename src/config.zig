@@ -33,6 +33,9 @@ pub const Config = struct {
 
     telegram_token: ?Secret = null,
     owner_id: ?i64 = null,
+    api_key: ?Secret = null,
+    /// OpenAI-compatible base, no trailing slash. Default applied by callers.
+    base_url: ?[]const u8 = null,
     model: ?[]const u8 = null,
     data_dir: []const u8 = "data",
 
@@ -48,6 +51,10 @@ pub const Config = struct {
                 log.warn("{s} is not a number", .{key});
                 break :blk null;
             };
+        } else if (eql(u8, key, "ZORO_API_KEY")) {
+            self.api_key = .init(val);
+        } else if (eql(u8, key, "ZORO_BASE_URL")) {
+            self.base_url = val;
         } else if (eql(u8, key, "ZORO_MODEL")) {
             self.model = val;
         } else if (eql(u8, key, "ZORO_DATA_DIR")) {
@@ -119,10 +126,14 @@ test "parse reads keys, skipping comments and blanks" {
         \\ZORO_TELEGRAM_TOKEN = 123:abc
         \\
         \\ZORO_OWNER_ID=42
+        \\ZORO_API_KEY = sk-test
+        \\ZORO_BASE_URL = https://api.example/v1
         \\ZORO_MODEL = gpt-5
     );
     try testing.expectEqualStrings("123:abc", cfg.telegram_token.?.reveal());
     try testing.expectEqual(@as(i64, 42), cfg.owner_id.?);
+    try testing.expectEqualStrings("sk-test", cfg.api_key.?.reveal());
+    try testing.expectEqualStrings("https://api.example/v1", cfg.base_url.?);
     try testing.expectEqualStrings("gpt-5", cfg.model.?);
 }
 

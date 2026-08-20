@@ -152,6 +152,7 @@ test "sqlite reports the pinned version" {
 test {
     _ = @import("db.zig");
     _ = @import("config.zig");
+    _ = @import("agent.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {
