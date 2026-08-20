@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const Db = @import("db.zig").Db;
+const memory = @import("memory.zig");
 const testing = std.testing;
 
 const log = std.log.scoped(.agent);
@@ -8,6 +9,7 @@ const log = std.log.scoped(.agent);
 pub const max_rounds: usize = 32;
 pub const max_tool_result: usize = 64 * 1024;
 const max_history: usize = 40;
+const max_memories: usize = 8;
 const max_http_body: usize = 2 * 1024 * 1024;
 pub const default_base_url = "https://api.openai.com/v1";
 
@@ -73,7 +75,7 @@ pub const Agent = struct {
         const arena = arena_inst.allocator();
 
         var messages: std.ArrayList(Msg) = .empty;
-        try messages.append(arena, .{ .role = "system", .content = system_prompt });
+        try messages.append(arena, .{ .role = "system", .content = try withMemory(arena, self.db, input, now) });
         try loadHistory(self.db, arena, &messages);
         // loadHistory already includes the user row we just wrote.
 
@@ -167,6 +169,25 @@ fn insertMsg(db: *Db, role: []const u8, content: []const u8, created: i64) !void
     try q.bind(2, content);
     try q.bind(3, created);
     _ = try q.step();
+}
+
+/// Top-N BM25 hits for this message, compacted onto the system prompt.
+/// Empty search → the static prompt unchanged.
+fn withMemory(arena: std.mem.Allocator, db: *Db, query: []const u8, now: i64) ![]const u8 {
+    const hits = try memory.searchAny(db, arena, query, now, max_memories);
+    if (hits.len == 0) return system_prompt;
+
+    var buf: std.Io.Writer.Allocating = .init(arena);
+    var w = &buf.writer;
+    try w.writeAll(system_prompt);
+    try w.writeAll("\n\n## memory\n");
+    for (hits) |h| {
+        try w.writeAll(h.ref);
+        try w.writeAll(": ");
+        try w.writeAll(h.text);
+        try w.writeByte('\n');
+    }
+    return try buf.toOwnedSlice();
 }
 
 /// Loads the newest `max_history` user/assistant rows (oldest first). Tool
@@ -672,4 +693,187 @@ test "agent module stays free of channel imports" {
     const b = [_]u8{ '@', 'i', 'm', 'p', 'o', 'r', 't', '(', '"', 't', 'e', 'l', 'e', 'g', 'r', 'a', 'm' };
     try testing.expect(std.mem.indexOf(u8, src, &a) == null);
     try testing.expect(std.mem.indexOf(u8, src, &b) == null);
+}
+
+test "turn injects a retrieved fact relevant to the message" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+
+    var fake: FakeHttp = .{
+        .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
+        .gpa = testing.allocator,
+    };
+    defer fake.deinit();
+
+    var db = try openTmpDb(&tmp, &buf);
+    defer db.close();
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    try memory.put(&db, "pet", "a black cat named mittens", .owner, 1000, null);
+
+    var agent: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+    };
+
+    const reply = try agent.turn("tell me about mittens");
+    defer testing.allocator.free(reply);
+
+    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, sent, "a black cat named mittens") != null);
+}
+
+test "turn does not inject an irrelevant memory" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+
+    var fake: FakeHttp = .{
+        .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
+        .gpa = testing.allocator,
+    };
+    defer fake.deinit();
+
+    var db = try openTmpDb(&tmp, &buf);
+    defer db.close();
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    try memory.put(&db, "pet", "a black cat named mittens", .owner, 1000, null);
+    try memory.put(&db, "dentist", "root canal on tuesday", .owner, 1000, null);
+
+    var agent: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+    };
+
+    const reply = try agent.turn("tell me about mittens");
+    defer testing.allocator.free(reply);
+
+    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, sent, "a black cat named mittens") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "root canal on tuesday") == null);
+}
+
+test "turn uses a fact from three turns ago without restating it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+
+    const ok = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
+    var fake: FakeHttp = .{
+        .bodies = &.{ ok, ok, ok, ok },
+        .gpa = testing.allocator,
+    };
+    defer fake.deinit();
+
+    var db = try openTmpDb(&tmp, &buf);
+    defer db.close();
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    try memory.put(&db, "pet", "a black cat named mittens", .owner, 1000, null);
+
+    var agent: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+    };
+
+    for (0..3) |_| {
+        const skip = try agent.turn("thanks");
+        testing.allocator.free(skip);
+    }
+
+    const reply = try agent.turn("how is mittens");
+    defer testing.allocator.free(reply);
+
+    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, sent, "a black cat named mittens") != null);
+}
+
+test "turn keeps injected memory and history bounded as history grows" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+
+    var fake: FakeHttp = .{
+        .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
+        .gpa = testing.allocator,
+    };
+    defer fake.deinit();
+
+    var db = try openTmpDb(&tmp, &buf);
+    defer db.close();
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var key_buf: [8]u8 = undefined;
+        var val_buf: [24]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>2}", .{i});
+        const val = try std.fmt.bufPrint(&val_buf, "widget spare alpha{d:0>2}", .{i});
+        try memory.put(&db, key, val, .owner, 1000, null);
+    }
+
+    {
+        var q = try db.prepare("INSERT INTO messages(role, content, created) VALUES ('user', 'UNIQUE_OLD_HISTORY', 1)");
+        defer q.finalize();
+        _ = try q.step();
+    }
+    i = 0;
+    while (i < 50) : (i += 1) {
+        var q = try db.prepare("INSERT INTO messages(role, content, created) VALUES ('user', 'filler', ?)");
+        defer q.finalize();
+        try q.bind(1, @as(i64, @intCast(i + 2)));
+        _ = try q.step();
+    }
+
+    var agent: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+    };
+
+    const reply = try agent.turn("widget");
+    defer testing.allocator.free(reply);
+
+    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, sent, "UNIQUE_OLD_HISTORY") == null);
+
+    var n: usize = 0;
+    i = 0;
+    while (i < 20) : (i += 1) {
+        var needle: [10]u8 = undefined;
+        const s = try std.fmt.bufPrint(&needle, "alpha{d:0>2}", .{i});
+        if (std.mem.indexOf(u8, sent, s) != null) n += 1;
+    }
+    try testing.expect(n > 0);
+    try testing.expect(n <= max_memories);
+    try testing.expect(n < 20);
 }

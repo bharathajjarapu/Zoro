@@ -149,9 +149,19 @@ pub fn freeHits(gpa: std.mem.Allocator, hits: []Hit) void {
     gpa.free(hits);
 }
 
-/// BM25 over diary and fact chunks. Caller owns the slice.
+/// BM25 over diary and fact chunks. Tokens are ANDed (precise lookup).
+/// Caller owns the slice.
 pub fn search(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64, limit: i64) ![]Hit {
-    const match = try expandQuery(db, gpa, query);
+    return searchJoin(db, gpa, query, now, limit, false);
+}
+
+/// Like `search`, but ORs tokens so a chat sentence still recalls.
+pub fn searchAny(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64, limit: i64) ![]Hit {
+    return searchJoin(db, gpa, query, now, limit, true);
+}
+
+fn searchJoin(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64, limit: i64, any: bool) ![]Hit {
+    const match = try expandQuery(db, gpa, query, any);
     defer gpa.free(match);
     if (match.len == 0 or limit <= 0) return &.{};
 
@@ -247,15 +257,17 @@ pub fn indexDiary(db: *Db, day: []const u8, summary: []const u8, now: i64) !void
     try db.exec("COMMIT");
 }
 
-fn expandQuery(db: *Db, gpa: std.mem.Allocator, query: []const u8) ![]u8 {
+fn expandQuery(db: *Db, gpa: std.mem.Allocator, query: []const u8, any: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
 
+    const join: []const u8 = if (any) " OR " else " AND ";
     var rest = query;
     var buf: [64]u8 = undefined;
     while (nextToken(&rest, &buf)) |tok| {
         if (isOperator(tok)) continue;
-        if (out.items.len != 0) try out.appendSlice(gpa, " AND ");
+        if (any and tok.len <= 2) continue;
+        if (out.items.len != 0) try out.appendSlice(gpa, join);
         if (try lookupAlias(db, gpa, tok)) |meaning| {
             defer gpa.free(meaning);
             try out.appendSlice(gpa, "(");
