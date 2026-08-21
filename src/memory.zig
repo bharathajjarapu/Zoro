@@ -38,6 +38,7 @@ pub const Fact = struct {
 
 /// Writes a fact. An inferred value never overwrites an owner statement.
 pub fn put(db: *Db, key: []const u8, value: []const u8, source: Source, now: i64, expires: ?i64) !void {
+    var text_buf: [1024]u8 = undefined;
     try db.exec("BEGIN");
     errdefer db.exec("ROLLBACK") catch {};
 
@@ -73,8 +74,15 @@ pub fn put(db: *Db, key: []const u8, value: []const u8, source: Source, now: i64
         try ins.bind(6, expires);
         _ = try ins.step();
     }
-    try reindex(db, "fact", key, value);
+    try reindex(db, "fact", key, indexed(&text_buf, key, value));
     try db.exec("COMMIT");
+}
+
+/// A fact is indexed as "key: value" so asking for the key finds it. Anything
+/// too long for the buffer falls back to the value, which is what was indexed
+/// before this existed.
+fn indexed(buf: []u8, key: []const u8, value: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}: {s}", .{ key, value }) catch value;
 }
 
 fn reindex(db: *Db, kind: []const u8, ref: []const u8, text: []const u8) !void {
@@ -832,4 +840,62 @@ test "compaction redacts secret values from the diary" {
     defer testing.allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "sk-secret-value") == null);
     try testing.expect(std.mem.indexOf(u8, text, "[secret:weather_api_key]") != null);
+}
+
+test "a fact is found by its own key, not only by its value" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try tmpPath(&tmp, &buf));
+    defer db.close();
+    try db.migrate();
+
+    try put(&db, "landlord", "Priya", .owner, 100, null);
+
+    for ([_][]const u8{ "landlord", "Priya" }) |q| {
+        const hits = try search(&db, testing.allocator, q, 200, 8);
+        defer freeHits(testing.allocator, hits);
+        try testing.expectEqual(@as(usize, 1), hits.len);
+        try testing.expectEqualStrings("landlord", hits[0].ref);
+    }
+}
+
+test "an existing database re-indexes its facts on upgrade" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try tmpPath(&tmp, &buf));
+    defer db.close();
+
+    // A database written the old way: the chunk holds the value alone.
+    try db.exec("BEGIN;\n" ++ @embedFile("schema.sql") ++ "\nPRAGMA user_version = 1;\nCOMMIT;");
+    try db.exec(
+        \\INSERT INTO facts(key, value, source, created, updated) VALUES ('landlord', 'Priya', 'owner', 1, 1);
+        \\INSERT INTO chunks(text, kind, ref) VALUES ('Priya', 'fact', 'landlord');
+    );
+    try db.migrate();
+
+    const hits = try search(&db, testing.allocator, "landlord", 200, 8);
+    defer freeHits(testing.allocator, hits);
+    try testing.expectEqual(@as(usize, 1), hits.len);
+}
+
+test "an alias makes the owner's shorthand recall the full word" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try tmpPath(&tmp, &buf));
+    defer db.close();
+    try db.migrate();
+
+    try put(&db, "clinic", "the veterinarian on Third Street", .owner, 100, null);
+
+    const miss = try search(&db, testing.allocator, "vet", 200, 8);
+    defer freeHits(testing.allocator, miss);
+    try testing.expectEqual(@as(usize, 0), miss.len); // porter cannot expand it
+
+    try putAlias(&db, "vet", "veterinarian");
+    const hit = try search(&db, testing.allocator, "vet", 200, 8);
+    defer freeHits(testing.allocator, hit);
+    try testing.expectEqual(@as(usize, 1), hit.len);
 }

@@ -9,7 +9,6 @@ const log = std.log.scoped(.worker);
 
 pub const max_live: usize = 3;
 pub const max_rounds: usize = 12;
-pub const max_retries: usize = 1;
 
 pub const system_prompt =
     \\You are a subagent with one job and no conversation history. Use the tools
@@ -101,7 +100,7 @@ pub const Pool = struct {
     /// wait stays `queued`; `pump` starts it when one frees up.
     pub fn spawn(self: *Pool, summary: []const u8, goal: []const u8, allowed: ?[]const u8, now: i64) !i64 {
         const parent = try self.rootTask(now);
-        try self.pump(); // whatever queued earlier goes first
+        try self.pump(now); // whatever queued earlier goes first
         const id = try tasks.create(self.db, summary, goal, now, parent, 0);
         self.start(id, summary, goal, allowed) catch |err| switch (err) {
             error.Busy => {},
@@ -112,14 +111,16 @@ pub const Pool = struct {
 
     /// Starts queued children into whatever slots are free. Cheap enough to
     /// call whenever the primary asks how its subagents are doing.
-    pub fn pump(self: *Pool) !void {
+    pub fn pump(self: *Pool, now: i64) !void {
         if (self.root_id == 0) return;
         var q = try self.db.prepare(
             \\SELECT id, summary, goal FROM tasks
-            \\WHERE parent = ? AND status = 'queued' ORDER BY prio DESC, id
+            \\WHERE parent = ? AND status = 'queued' AND (due IS NULL OR due <= ?)
+            \\ORDER BY prio DESC, id
         );
         defer q.finalize();
         try q.bind(1, self.root_id);
+        try q.bind(2, now);
         while (try q.step()) {
             self.start(q.int(0), q.text(1), q.text(2), null) catch |err| switch (err) {
                 error.Busy => return,
@@ -193,28 +194,31 @@ fn work(self: *Pool, i: usize) void {
     };
     defer self.gpa.free(list);
 
-    var tries: usize = 0;
-    while (true) : (tries += 1) {
-        const reply = slot.proto.isolated(slot.goal, .{
-            .tools = list,
-            .rounds = max_rounds,
-            .system = system_prompt,
-            .cancel = &slot.cancel,
-        }) catch |err| {
-            if (err == error.Cancelled) return markCancelled(db, slot.task);
-            if (tries >= max_retries) return giveUp(db, slot.task, @errorName(err));
-            continue;
-        };
-        defer self.gpa.free(reply);
-        // The verification call can be cancelled or fail too; either way the
-        // row must not be left sitting in `running`.
-        finish(self, slot, reply, now) catch |err| {
-            if (err == error.Cancelled) return markCancelled(db, slot.task);
-            log.err("{s}: {t}", .{ slot.summary, err });
+    // A goal that can act is never retried automatically: its tool may already
+    // have run, and a second attempt would send the message twice. Transient
+    // work is re-queued with backoff and restarted by `pump`.
+    const kind: tasks.Kind = if (consequential(slot.goal)) .mutating else .transient;
+
+    const reply = slot.proto.isolated(slot.goal, .{
+        .tools = list,
+        .rounds = max_rounds,
+        .system = system_prompt,
+        .cancel = &slot.cancel,
+    }) catch |err| {
+        if (err == error.Cancelled) return markCancelled(db, slot.task);
+        tasks.fail(db, slot.task, @errorName(err), kind, now) catch
             giveUp(db, slot.task, @errorName(err));
-        };
         return;
-    }
+    };
+    defer self.gpa.free(reply);
+
+    // The verification call can be cancelled or fail too; either way the row
+    // must not be left sitting in `running`.
+    finish(self, slot, reply, now) catch |err| {
+        if (err == error.Cancelled) return markCancelled(db, slot.task);
+        log.err("{s}: {t}", .{ slot.summary, err });
+        giveUp(db, slot.task, @errorName(err));
+    };
 }
 
 /// Consequential work is checked; bounded research is taken at its word. The
@@ -380,7 +384,7 @@ fn runCancel(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
 }
 
 fn runCheck(ctx: *tools.Ctx, _: []const u8) anyerror![]u8 {
-    if (ctx.pool) |pool| try pool.pump();
+    if (ctx.pool) |pool| try pool.pump(std.Io.Timestamp.now(ctx.io, .real).toSeconds());
     const items = try tasks.list(ctx.db, ctx.gpa);
     defer tasks.freeTasks(ctx.gpa, items);
     return tasks.formatList(ctx.gpa, items);
@@ -531,7 +535,7 @@ test "at most three subagents run at once; the fourth waits its turn" {
 
     // Once a slot frees, pump picks the waiting task up.
     for (&rig.fakes) |*f| f.i = 0;
-    try rig.pool.pump();
+    try rig.pool.pump(100);
     rig.pool.join();
     try testing.expectEqualStrings("done", try rig.statusOf(fourth));
 }
@@ -742,4 +746,37 @@ test "a verification that is cancelled leaves the task cancelled, not running" {
     const id = try rig.pool.spawn("mail", "Send the summary to the landlord.", null, 100);
     rig.pool.join();
     try testing.expectEqualStrings("cancelled", try rig.statusOf(id));
+}
+
+test "a subagent that could act is never retried; research is re-queued with backoff" {
+    var rig: Rig = undefined;
+    // No bodies at all: the very first model call errors.
+    try rig.init(.{ &.{}, &.{}, &.{} });
+    defer rig.deinit();
+
+    var held: std.atomic.Value(bool) = .init(true);
+    rig.fakes[0].hold = &held;
+    rig.fakes[1].hold = &held;
+    const acted = try rig.pool.spawn("mail", "Send the summary to the landlord.", null, 100);
+    const research = try rig.pool.spawn("read", "Summarize the tide table.", null, 100);
+    held.store(false, .release);
+    rig.pool.join();
+
+    // The send may already have gone out, so it stops and waits for the owner.
+    var a = (try tasks.get(&rig.main_db, testing.allocator, acted)).?;
+    defer a.deinit(testing.allocator);
+    try testing.expectEqual(tasks.Status.failed, a.status);
+    try testing.expect(std.mem.indexOf(u8, a.result.?, "do not retry") != null);
+
+    // Reading a page again is harmless, so it waits out a backoff instead.
+    var r = (try tasks.get(&rig.main_db, testing.allocator, research)).?;
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(tasks.Status.queued, r.status);
+    try testing.expectEqual(@as(i64, 1), r.tries);
+    // The worker stamps `due` from the real clock, so assert the shape, not the value.
+    try testing.expect(r.due.? > 100);
+
+    // pump leaves it alone until the backoff has passed.
+    try rig.pool.pump(r.due.? - 1);
+    try testing.expectEqualStrings("queued", try rig.statusOf(research));
 }

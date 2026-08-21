@@ -124,6 +124,7 @@ pub const builtins = [_]Def{
     memory.remember,
     memory.recall,
     memory.forget,
+    memory.remember_alias,
     skills.load_skill,
     skills.save_skill,
     web_tools.fetch_url,

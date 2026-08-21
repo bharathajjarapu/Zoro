@@ -116,6 +116,7 @@ pub const Agent = struct {
     tools: []const Tool = &.{},
     skills_dir: []const u8 = "skills",
     workspace: []const u8 = "workspace",
+    diary_dir: []const u8 = "data/diary",
     /// Model profile used when the owner sends a picture. Falls back to `model`.
     vision_model: ?[]const u8 = null,
     fetch: ?web.Get = null,

@@ -171,6 +171,10 @@ docs/             ARCHITECTURE.md is the source of truth for design
 
 ## Not built yet
 
-The daily spend cap described in `docs/ARCHITECTURE.md` is designed but not
-implemented; no ticket covers it. Every model call, image turns included, goes
-through one path in `agent.zig`, so it lands in one place when it is built.
+Two limits from `docs/ARCHITECTURE.md` are designed but not enforced:
+
+- **The daily spend cap.** No ticket covers metering. Every model call, image
+  turns included, goes through one path in `agent.zig`, so it lands in one place.
+- **The 10 s web request timeout.** Unreachable in Zig 0.16 — `std.http.Client`
+  ignores the timeout field it accepts. A hung host stalls that turn and the
+  poll loop with it. The 2 MB body cap and per-host rate limit still apply.

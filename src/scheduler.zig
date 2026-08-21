@@ -5,6 +5,7 @@ const skills = @import("skills.zig");
 const tools = @import("tools.zig");
 const tasks = @import("tasks.zig");
 const outbox = @import("outbox.zig");
+const memory = @import("memory.zig");
 const testing = std.testing;
 
 const log = std.log.scoped(.scheduler);
@@ -60,6 +61,40 @@ pub fn nextRun(spec: Spec, now: i64, tz: ?[]const u8) !i64 {
 pub fn tick(a: *agent.Agent, now: i64) !void {
     try sync(a.db, a.gpa, a.io, a.skills_dir, now);
     try fire(a, now);
+    try compact(a, now);
+}
+
+/// Yesterday's transcript becomes yesterday's diary, once. The scheduler owns
+/// the only clock in the process, so this is where nightly work belongs.
+/// A failure leaves the raw messages and the marker alone, so it retries.
+fn compact(a: *agent.Agent, now: i64) !void {
+    var day_buf: [10]u8 = undefined;
+    const day = memory.formatDay(&day_buf, now - 86_400);
+    if (try compacted(a.db, day)) return;
+
+    memory.compact(a.db, a.gpa, a.io, a.diary_dir, day, now, &.{}) catch |err| {
+        log.err("compacting {s}: {t}", .{ day, err });
+        return;
+    };
+    try mark(a.db, day);
+}
+
+/// A single high-water mark: days only move forward, so one row is enough.
+fn compacted(db: *Db, day: []const u8) !bool {
+    var q = try db.prepare("SELECT value FROM kv WHERE key = 'compacted'");
+    defer q.finalize();
+    if (!try q.step()) return false;
+    return std.mem.order(u8, q.text(0), day) != .lt;
+}
+
+fn mark(db: *Db, day: []const u8) !void {
+    var q = try db.prepare(
+        \\INSERT INTO kv(key, value) VALUES ('compacted', ?)
+        \\ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    );
+    defer q.finalize();
+    try q.bind(1, day);
+    _ = try q.step();
 }
 
 pub fn loop(a: *agent.Agent, stop: *const fn () bool) void {
@@ -767,4 +802,43 @@ test "an unanswered critical routine asks once, not once per firing" {
     defer q.finalize();
     try testing.expect(try q.step());
     try testing.expectEqual(@as(i64, 1), q.int(0));
+}
+
+test "yesterday is compacted once, and the diary the owner can read appears" {
+    var rig: Rig = undefined;
+    try rig.init(&.{});
+    defer rig.deinit();
+
+    var dir_buf: [128]u8 = undefined;
+    rig.a.diary_dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}/diary", .{rig.tmp.sub_path});
+
+    // 2026-08-21 00:00 UTC, so "yesterday" is 2026-08-20.
+    const today: i64 = 1_787_270_400;
+    const yesterday = today - 86_400;
+    var ins = try rig.db.prepare("INSERT INTO messages(role, content, created) VALUES ('user', 'walked the dog', ?)");
+    defer ins.finalize();
+    try ins.bind(1, yesterday + 3600);
+    _ = try ins.step();
+
+    try tick(&rig.a, today);
+
+    const text = (try memory.readDiary(testing.allocator, rig.a.io, rig.a.diary_dir, "2026-08-20")).?;
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "walked the dog") != null);
+
+    // The raw rows are gone only after the diary committed.
+    var q = try rig.db.prepare("SELECT count(*) FROM messages");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqual(@as(i64, 0), q.int(0));
+
+    // A second tick is a no-op rather than a rewrite.
+    try ins.reset();
+    try ins.bind(1, yesterday + 7200);
+    _ = try ins.step();
+    try tick(&rig.a, today + 60);
+    var again = try rig.db.prepare("SELECT count(*) FROM messages");
+    defer again.finalize();
+    try testing.expect(try again.step());
+    try testing.expectEqual(@as(i64, 1), again.int(0));
 }

@@ -9,6 +9,7 @@ const log = std.log.scoped(.db);
 const steps = [_][:0]const u8{
     @embedFile("schema.sql"),
     @embedFile("migrations/002.sql"),
+    @embedFile("migrations/003.sql"),
 };
 
 /// A SQLite connection. One per thread; WAL lets several coexist on one file.

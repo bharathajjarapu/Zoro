@@ -2,7 +2,9 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const testing = std.testing;
 
-pub const max_tries: i64 = 3;
+/// Attempts per task: one try plus one retry, matching the delegation limit in
+/// docs/ARCHITECTURE.md. This is the only retry policy in the codebase.
+pub const max_tries: i64 = 2;
 pub const approval_ttl: i64 = 15 * 60;
 
 pub const Status = enum {
@@ -133,11 +135,16 @@ pub fn setStatus(db: *Db, id: i64, next: Status) !void {
 
 /// Records a failure. Mutating work never retries. Transient work backs off until `max_tries`.
 pub fn fail(db: *Db, id: i64, err_text: []const u8, kind: Kind, now: i64) !void {
-    var tries_q = try db.prepare("SELECT tries FROM tasks WHERE id = ?");
-    defer tries_q.finalize();
-    try tries_q.bind(1, id);
-    if (!try tries_q.step()) return error.NotFound;
-    const tries = tries_q.int(0) + 1;
+    // Closed before the write below: an open read cursor keeps this connection's
+    // read transaction alive, and two workers upgrading at once then deadlock
+    // instead of waiting out busy_timeout.
+    const tries = blk: {
+        var q = try db.prepare("SELECT tries FROM tasks WHERE id = ?");
+        defer q.finalize();
+        try q.bind(1, id);
+        if (!try q.step()) return error.NotFound;
+        break :blk q.int(0) + 1;
+    };
 
     var buf: [512]u8 = undefined;
     const result = if (kind == .mutating or tries >= max_tries)
@@ -435,7 +442,6 @@ test "transient retries stop at the cap" {
     defer db.close();
 
     const id = try create(&db, "fetch", "ok", 0, null, 0);
-    try fail(&db, id, "e", .transient, 0);
     try fail(&db, id, "e", .transient, 0);
     try fail(&db, id, "e", .transient, 0);
     var t = (try get(&db, testing.allocator, id)).?;

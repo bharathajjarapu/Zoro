@@ -72,6 +72,8 @@ fn daemon(init: std.process.Init) !void {
     const key = cfg.api_key orelse return config.missing("ZORO_API_KEY");
     const model = cfg.model orelse return config.missing("ZORO_MODEL");
 
+    const diary_dir = try diaryDir(init, cfg);
+
     var db = try openDb(init.io, cfg.data_dir);
     defer db.close();
     try db.migrate();
@@ -100,6 +102,7 @@ fn daemon(init: std.process.Init) !void {
         .tools = &tools.builtins,
         .workspace = cfg.workspace,
         .skills_dir = cfg.skills_dir,
+        .diary_dir = diary_dir,
         .vision_model = cfg.vision_model orelse model,
         .fetch = http.getter(),
         .workers = &crew.pool.state,
@@ -139,6 +142,7 @@ fn daemon(init: std.process.Init) !void {
         .tools = &tools.builtins,
         .workspace = cfg.workspace,
         .skills_dir = cfg.skills_dir,
+        .diary_dir = diary_dir,
         .fetch = sched_http.getter(),
     };
     const sched = try std.Thread.spawn(.{}, scheduler.loop, .{ &sched_agent, &stop.requested });
@@ -191,8 +195,7 @@ fn cmdDiary(init: std.process.Init, args: anytype) !void {
 
     const date = args.next();
     const now = std.Io.Timestamp.now(init.io, .real).toSeconds();
-    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/diary", .{s.cfg.data_dir});
+    const dir = try diaryDir(init, s.cfg);
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &out_buf);
     try cli.printDiary(init.gpa, init.io, dir, date, now, &out.interface);
@@ -250,6 +253,7 @@ const Crew = struct {
     fn init(self: *Crew, p: std.process.Init, cfg: config.Config, db: *Db) !void {
         self.open = 0;
         errdefer self.closeOpen();
+        const diary_dir = try diaryDir(p, cfg);
 
         var protos: [worker.max_live]agent.Agent = undefined;
         for (&self.dbs, &self.https, &protos) |*wdb, *http, *proto| {
@@ -267,6 +271,7 @@ const Crew = struct {
                 .tools = &tools.builtins,
                 .workspace = cfg.workspace,
                 .skills_dir = cfg.skills_dir,
+                .diary_dir = diary_dir,
                 .fetch = http.getter(),
             };
         }
@@ -291,6 +296,7 @@ const Terminal = struct {
     gpa: std.mem.Allocator,
     cfg: config.Config,
     db: Db,
+    diary_dir: []const u8,
     http: agent.StdHttp,
     crew: Crew,
     agent: agent.Agent,
@@ -304,6 +310,7 @@ const Terminal = struct {
         const key = self.cfg.api_key orelse return config.missing("ZORO_API_KEY");
         const model = self.cfg.model orelse return config.missing("ZORO_MODEL");
 
+        self.diary_dir = try diaryDir(p, self.cfg);
         self.db = try openDb(p.io, self.cfg.data_dir);
         errdefer self.db.close();
         try self.db.migrate();
@@ -325,6 +332,7 @@ const Terminal = struct {
             .tools = &tools.builtins,
             .workspace = self.cfg.workspace,
             .skills_dir = self.cfg.skills_dir,
+            .diary_dir = self.diary_dir,
             .vision_model = self.cfg.vision_model orelse model,
             .fetch = self.http.getter(),
             .workers = &self.crew.pool.state,
@@ -363,6 +371,12 @@ const Store = struct {
         self.* = undefined;
     }
 };
+
+/// The diary sits under the data dir. Allocated from the process arena, which
+/// lives as long as every agent that borrows it.
+fn diaryDir(p: std.process.Init, cfg: config.Config) ![]const u8 {
+    return std.fmt.allocPrint(p.arena.allocator(), "{s}/diary", .{cfg.data_dir});
+}
 
 fn openDb(io: std.Io, dir: []const u8) !Db {
     try std.Io.Dir.cwd().createDirPath(io, dir);

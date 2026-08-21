@@ -2,7 +2,6 @@ const std = @import("std");
 const testing = std.testing;
 
 pub const max_body: usize = 2 * 1024 * 1024;
-pub const timeout_s: i64 = 10;
 pub const per_host_per_min: usize = 10;
 const max_hops: u8 = 5;
 
@@ -411,7 +410,9 @@ fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[
     });
     defer req.deinit();
     try req.sendBodiless();
-    // ponytail: Client.request has no timeout; connectTcpOptions.timeout is unused in 0.16.0.
+    // ponytail: no request timeout. `Client.fetch` never passes one, and
+    // `connectTcpOptions.timeout` is ignored in 0.16.0, so a hung host stalls
+    // the turn that called it. Revisit when std wires that field up.
     var response = try req.receiveHead(&.{});
 
     const status: u16 = @intFromEnum(response.head.status);

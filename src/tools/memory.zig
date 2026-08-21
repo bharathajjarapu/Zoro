@@ -12,6 +12,29 @@ const kv = [_]Param{
 };
 const key_only = [_]Param{.{ .name = "key", .description = "fact key to forget" }};
 const query = [_]Param{.{ .name = "query", .description = "what to search for" }};
+const alias = [_]Param{
+    .{ .name = "word", .description = "the owner's shorthand, e.g. vet" },
+    .{ .name = "meaning", .description = "what it stands for, e.g. veterinarian" },
+};
+
+/// Stemming reduces inflections but never expands an abbreviation, so this is
+/// the only thing that makes "the vet" recall "veterinarian".
+pub const remember_alias: Def = .{
+    .name = "remember_alias",
+    .description = "Record that a word the owner uses means something else, so searching either finds both.",
+    .params = &alias,
+    .mutates = true,
+    .run = runAlias,
+};
+
+fn runAlias(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
+    const Args = struct { word: []const u8, meaning: []const u8 };
+    const parsed = try std.json.parseFromSlice(Args, ctx.gpa, args, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    mem.putAlias(ctx.db, parsed.value.word, parsed.value.meaning) catch |err|
+        return std.fmt.allocPrint(ctx.gpa, "not recorded: {s}", .{@errorName(err)});
+    return std.fmt.allocPrint(ctx.gpa, "{s} means {s}", .{ parsed.value.word, parsed.value.meaning });
+}
 
 pub const remember: Def = .{
     .name = "remember",
