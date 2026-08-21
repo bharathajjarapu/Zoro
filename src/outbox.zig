@@ -82,11 +82,16 @@ fn clamp(text: []const u8) []const u8 {
 }
 
 /// Workspace-relative and nothing else: no absolute path, no `..`, no leading
-/// slash. The container mount is the outer boundary; this is the inner one.
+/// slash, and an allowlist of characters rather than a denylist — the name ends
+/// up inside a multipart header, where a quote or a newline would be an
+/// injection. The container mount is the outer boundary; this is the inner one.
 pub fn safeRelative(path: []const u8) bool {
     if (path.len == 0 or path.len > 512) return false;
-    if (path[0] == '/' or path[0] == '\\') return false;
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    if (path[0] == '/') return false;
+    for (path) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_' or c == '/';
+        if (!ok) return false;
+    }
     var it = std.mem.splitScalar(u8, path, '/');
     while (it.next()) |seg| {
         if (seg.len == 0 or std.mem.eql(u8, seg, "..") or std.mem.eql(u8, seg, ".")) return false;
@@ -160,6 +165,11 @@ test "safeRelative refuses escapes and absolutes" {
     try testing.expect(!safeRelative("out/../../etc"));
     try testing.expect(!safeRelative(""));
     try testing.expect(!safeRelative("./x"));
+    // The name lands in a multipart header; a quote or a newline would escape it.
+    try testing.expect(!safeRelative("a\"b.png"));
+    try testing.expect(!safeRelative("a\r\nb.png"));
+    try testing.expect(!safeRelative("a b.png"));
+    try testing.expect(!safeRelative("a\\b.png"));
 }
 
 test "push then drain returns items once and empties the queue" {

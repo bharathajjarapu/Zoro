@@ -122,7 +122,9 @@ retry, and an explicit tool allowlist. Subagents cannot spawn subagents and have
 no Telegram access; results go to the primary, which synthesizes and speaks with
 one voice.
 
-Send `stop` to cancel everything in flight. The primary can also call off a
+A subagent with no named tool list is read-only, so the default delegate is a
+researcher that cannot touch your files. Send `stop` to cancel everything in
+flight — it cancels that batch, not every batch after it. The primary can also call off a
 single task and redirect it while the others keep running, and your messages are
 answered immediately either way.
 

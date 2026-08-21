@@ -271,7 +271,6 @@ const Crew = struct {
             };
         }
         self.pool = worker.Pool.init(p.gpa, db, protos);
-        self.pool.arm();
     }
 
     fn deinit(self: *Crew) void {

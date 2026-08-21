@@ -67,12 +67,6 @@ pub const Pool = struct {
         return p;
     }
 
-    /// Chains each slot to the pool. Separate from `init` because it takes the
-    /// address of the pool's final home.
-    pub fn arm(self: *Pool) void {
-        for (&self.slots) |*slot| slot.cancel.parent = &self.state;
-    }
-
     /// Waits for every worker. Cancels first so a long run cannot hold shutdown.
     pub fn deinit(self: *Pool) void {
         self.state.stop.store(true, .release);
@@ -107,6 +101,7 @@ pub const Pool = struct {
     /// wait stays `queued`; `pump` starts it when one frees up.
     pub fn spawn(self: *Pool, summary: []const u8, goal: []const u8, allowed: ?[]const u8, now: i64) !i64 {
         const parent = try self.rootTask(now);
+        try self.pump(); // whatever queued earlier goes first
         const id = try tasks.create(self.db, summary, goal, now, parent, 0);
         self.start(id, summary, goal, allowed) catch |err| switch (err) {
             error.Busy => {},
@@ -144,6 +139,9 @@ pub const Pool = struct {
     /// atomic pair `state.live` and `slot.done`.
     fn start(self: *Pool, id: i64, summary: []const u8, goal: []const u8, allowed: ?[]const u8) !void {
         const i = try self.freeSlot();
+        // A "stop" that cancelled the last batch must not cancel every batch
+        // after it. Nothing is in flight to protect, so clear it.
+        if (self.state.count() == 0) self.state.stop.store(false, .release);
         const slot = &self.slots[i];
         slot.summary = try self.gpa.dupe(u8, summary);
         errdefer slot.release(self.gpa);
@@ -152,6 +150,8 @@ pub const Pool = struct {
         slot.task = id;
         slot.done.store(false, .release);
         slot.cancel.stop.store(false, .release);
+        // Chained here rather than at init, where the pool is still a local.
+        slot.cancel.parent = &self.state;
 
         try tasks.setStatus(self.db, id, .running);
         _ = self.state.live.fetchAdd(1, .release);
@@ -184,9 +184,11 @@ fn work(self: *Pool, i: usize) void {
     const db = slot.proto.db;
     const now = std.Io.Timestamp.now(slot.proto.io, .real).toSeconds();
 
-    // A subagent never gets `delegate`, so fan-out cannot escape its bound, and
-    // there is no Telegram tool for it to be denied.
-    const list = tools.subset(self.gpa, slot.proto.tools, false, slot.allowed) catch |err| {
+    // No allowlist means read-only: the default subagent is a researcher, and
+    // anything that can act has to be named. A subagent never gets `delegate`
+    // either, so fan-out cannot escape its bound, and there is no Telegram tool
+    // for it to be denied.
+    const list = tools.subset(self.gpa, slot.proto.tools, slot.allowed == null, slot.allowed) catch |err| {
         return giveUp(db, slot.task, @errorName(err));
     };
     defer self.gpa.free(list);
@@ -199,16 +201,18 @@ fn work(self: *Pool, i: usize) void {
             .system = system_prompt,
             .cancel = &slot.cancel,
         }) catch |err| {
-            if (err == error.Cancelled) {
-                tasks.setStatus(db, slot.task, .cancelled) catch {};
-                setResult(db, slot.task, "cancelled by the owner") catch {};
-                return;
-            }
+            if (err == error.Cancelled) return markCancelled(db, slot.task);
             if (tries >= max_retries) return giveUp(db, slot.task, @errorName(err));
             continue;
         };
         defer self.gpa.free(reply);
-        finish(self, slot, reply, now) catch |err| log.err("{s}: {t}", .{ slot.summary, err });
+        // The verification call can be cancelled or fail too; either way the
+        // row must not be left sitting in `running`.
+        finish(self, slot, reply, now) catch |err| {
+            if (err == error.Cancelled) return markCancelled(db, slot.task);
+            log.err("{s}: {t}", .{ slot.summary, err });
+            giveUp(db, slot.task, @errorName(err));
+        };
         return;
     }
 }
@@ -229,6 +233,10 @@ fn finish(self: *Pool, slot: *Slot, reply: []const u8, now: i64) !void {
     try followUp(self, slot, trimmed, now);
 }
 
+/// ponytail: the checker reads the worker's own report and no independent
+/// evidence, so it catches a worker that gave up or half-finished, not one that
+/// fabricates. Hand it the same tool allowlist when a wrong answer is worth a
+/// second round of tool calls.
 fn check(self: *Pool, slot: *Slot, reply: []const u8) ![]u8 {
     const question = try std.fmt.allocPrint(self.gpa, "goal:\n{s}\n\nreported result:\n{s}", .{ slot.goal, reply });
     defer self.gpa.free(question);
@@ -293,6 +301,11 @@ fn store(gpa: std.mem.Allocator, db: *Db, id: i64, status: tasks.Status, note: [
     try setResult(db, id, text);
 }
 
+fn markCancelled(db: *Db, id: i64) void {
+    tasks.setStatus(db, id, .cancelled) catch {};
+    setResult(db, id, "cancelled by the owner") catch {};
+}
+
 /// The worker has already used its one retry, so this is terminal.
 fn giveUp(db: *Db, id: i64, why: []const u8) void {
     tasks.setStatus(db, id, .failed) catch {};
@@ -310,7 +323,7 @@ fn setResult(db: *Db, id: i64, text: []const u8) !void {
 const delegate_params = [_]tools.Param{
     .{ .name = "summary", .description = "short label for the work" },
     .{ .name = "goal", .description = "the success criterion, in one or two sentences" },
-    .{ .name = "tools", .description = "space-separated tool names the subagent may use", .required = false },
+    .{ .name = "tools", .description = "space-separated tool names the subagent may use; omit for a read-only researcher", .required = false },
 };
 
 pub const delegate: tools.Def = .{
@@ -326,22 +339,20 @@ pub const check_tasks: tools.Def = .{
     .name = "check_tasks",
     .description = "Report every delegated task with its status and result. Synthesize these yourself; the owner never sees them.",
     .params = &.{},
+    // Primary-only: a subagent reading its siblings' goals is the parent's
+    // context leaking back in by another route.
+    .primary_only = true,
     .run = runCheck,
 };
-
-fn poolOf(ctx: *tools.Ctx) ?*Pool {
-    const p = ctx.pool orelse return null;
-    return @ptrCast(@alignCast(p));
-}
 
 fn runDelegate(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     const Args = struct { summary: []const u8, goal: []const u8, tools: ?[]const u8 = null };
     const parsed = try std.json.parseFromSlice(Args, ctx.gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    const pool = poolOf(ctx) orelse return ctx.gpa.dupe(u8, "delegation is not available; do it yourself");
+    const pool = ctx.pool orelse return ctx.gpa.dupe(u8, "delegation is not available; do it yourself");
     const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
     const id = try pool.spawn(parsed.value.summary, parsed.value.goal, parsed.value.tools, now);
-    return std.fmt.allocPrint(ctx.gpa, "task #{d} started: {s}", .{ id, parsed.value.summary });
+    return std.fmt.allocPrint(ctx.gpa, "task #{d} filed: {s}. Three run at once; check_tasks shows where it got to.", .{ id, parsed.value.summary });
 }
 
 const cancel_params = [_]tools.Param{
@@ -363,13 +374,13 @@ fn runCancel(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     defer parsed.deinit();
     const id = std.fmt.parseInt(i64, std.mem.trim(u8, parsed.value.id, " #"), 10) catch
         return ctx.gpa.dupe(u8, "that is not a task number");
-    const pool = poolOf(ctx) orelse return ctx.gpa.dupe(u8, "nothing is delegated");
+    const pool = ctx.pool orelse return ctx.gpa.dupe(u8, "nothing is delegated");
     if (!pool.cancel(id)) return std.fmt.allocPrint(ctx.gpa, "task #{d} is not running", .{id});
     return std.fmt.allocPrint(ctx.gpa, "task #{d} is stopping", .{id});
 }
 
 fn runCheck(ctx: *tools.Ctx, _: []const u8) anyerror![]u8 {
-    if (poolOf(ctx)) |pool| try pool.pump();
+    if (ctx.pool) |pool| try pool.pump();
     const items = try tasks.list(ctx.db, ctx.gpa);
     defer tasks.freeTasks(ctx.gpa, items);
     return tasks.formatList(ctx.gpa, items);
@@ -451,7 +462,6 @@ const Rig = struct {
             };
         }
         self.pool = Pool.init(testing.allocator, &self.main_db, protos);
-        self.pool.arm();
         self.primary = .{
             .gpa = testing.allocator,
             .io = self.threaded.io(),
@@ -679,4 +689,57 @@ test "one task is called off without touching the other two" {
 
     try testing.expectEqualStrings("cancelled", try rig.statusOf(doomed));
     try testing.expectEqualStrings("done", try rig.statusOf(spared));
+}
+
+test "a stop does not cancel every delegation that follows it" {
+    var rig: Rig = undefined;
+    // Slot 0 serves the cancelled run and then the one after it.
+    try rig.init(.{ &.{ called_recall, said_ok }, &.{said_ok}, &.{said_ok} });
+    defer rig.deinit();
+    rig.owner_fake.bodies = &.{};
+
+    var held: std.atomic.Value(bool) = .init(true);
+    rig.fakes[0].hold = &held;
+    const doomed = try rig.pool.spawn("job0", "Summarize the news.", null, 100);
+
+    // The owner says stop while that one is parked inside its model call.
+    const stopped = try rig.primary.turn("stop");
+    defer testing.allocator.free(stopped);
+    try testing.expect(std.mem.indexOf(u8, stopped, "Stopping 1") != null);
+    held.store(false, .release);
+    rig.pool.join();
+    try testing.expectEqualStrings("cancelled", try rig.statusOf(doomed));
+
+    // The next piece of work must actually run: the flag was for that batch.
+    const after = try rig.pool.spawn("job1", "Summarize the news.", null, 100);
+    rig.pool.join();
+    try testing.expectEqualStrings("done", try rig.statusOf(after));
+}
+
+test "a subagent with no allowlist is a researcher, not a free hand" {
+    var rig: Rig = undefined;
+    try rig.init(.{ &.{said_ok}, &.{}, &.{} });
+    defer rig.deinit();
+
+    _ = try rig.pool.spawn("research", "Summarize the tide table.", null, 100);
+    rig.pool.join();
+
+    const sent = rig.fakes[0].sent();
+    try testing.expect(std.mem.indexOf(u8, sent, "\"recall\"") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "\"save_skill\"") == null);
+    try testing.expect(std.mem.indexOf(u8, sent, "\"store_secret\"") == null);
+    try testing.expect(std.mem.indexOf(u8, sent, "\"remember\"") == null);
+    try testing.expect(std.mem.indexOf(u8, sent, "\"check_tasks\"") == null);
+}
+
+test "a verification that is cancelled leaves the task cancelled, not running" {
+    var rig: Rig = undefined;
+    // The work answers; the check is cancelled before it can be made.
+    try rig.init(.{ &.{said_ok}, &.{}, &.{} });
+    defer rig.deinit();
+    rig.fakes[0].trip = &rig.pool.state;
+
+    const id = try rig.pool.spawn("mail", "Send the summary to the landlord.", null, 100);
+    rig.pool.join();
+    try testing.expectEqualStrings("cancelled", try rig.statusOf(id));
 }

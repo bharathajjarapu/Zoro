@@ -77,7 +77,9 @@ pub const Db = struct {
             var q = try self.prepare("PRAGMA user_version");
             defer q.finalize();
             if (!try q.step()) return error.Sqlite;
-            break :blk @as(usize, @intCast(q.int(0)));
+            // user_version is a signed 32-bit field anyone can set; clamp rather
+            // than trap on a value we did not write.
+            break :blk @as(usize, @intCast(@max(0, q.int(0))));
         };
         if (done >= steps.len) return;
 

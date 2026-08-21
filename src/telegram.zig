@@ -13,7 +13,9 @@ pub const max_text = 64 * 1024;
 const max_message = 3900;
 /// Bound on anything we pull off the wire or push back up. Telegram allows
 /// more; a personal assistant does not need it, and the model pays per byte.
-pub const max_file = 5 * 1024 * 1024;
+/// Matched to `web.max_body`, which is the transport bound a download actually
+/// hits first — declaring a larger number here would just fail silently.
+pub const max_file = web.max_body;
 
 fn utf8ChunkEnd(text: []const u8, max_bytes: usize) usize {
     if (max_bytes == 0) return 0;
@@ -421,8 +423,8 @@ pub const Bot = struct {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(max_file));
         defer self.gpa.free(bytes);
 
-        const field = if (kind == .photo) "photo" else "document";
-        const body = try multipart(self.gpa, self.chat_id, field, baseName(rel), caption, bytes);
+        const part = if (kind == .photo) "photo" else "document";
+        const body = try multipart(self.gpa, self.chat_id, part, baseName(rel), caption, bytes);
         defer self.gpa.free(body);
 
         const method = if (kind == .photo) "sendPhoto" else "sendDocument";
@@ -568,15 +570,21 @@ fn buildSendMessage(gpa: std.mem.Allocator, chat_id: i64, text: []const u8) ![]u
     return jsonBody(gpa, SendMessageRequest{ .chat_id = chat_id, .text = text });
 }
 
-/// Fixed and unguessable enough for a body we assembled ourselves; the parts
-/// are escaped below so it cannot appear inside one.
 const boundary = "zoroFormBoundary7Nn2Kq";
+/// A caption is model-written text going into a form field. A boundary line
+/// begins with CRLF, so stripping every control byte makes one impossible to
+/// forge; the filename is safe by construction (`outbox.safeRelative`).
+fn field(w: *std.Io.Writer, text: []const u8) !void {
+    for (text) |c| {
+        if (c >= 0x20 or c == '\t') try w.writeByte(c) else try w.writeByte(' ');
+    }
+}
 
 /// Telegram's file upload form. Text fields first, the bytes last.
 fn multipart(
     gpa: std.mem.Allocator,
     chat_id: i64,
-    field: []const u8,
+    part: []const u8,
     name: []const u8,
     caption: []const u8,
     bytes: []const u8,
@@ -587,12 +595,13 @@ fn multipart(
 
     try w.print("--{s}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{ boundary, chat_id });
     if (caption.len != 0) {
-        const capped = caption[0..@min(caption.len, 1024)];
-        try w.print("--{s}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{s}\r\n", .{ boundary, capped });
+        try w.print("--{s}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n", .{boundary});
+        try field(w, caption[0..@min(caption.len, 1024)]);
+        try w.writeAll("\r\n");
     }
     try w.print(
         "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
-        .{ boundary, field, name },
+        .{ boundary, part, name },
     );
     try w.writeAll(bytes);
     try w.print("\r\n--{s}--\r\n", .{boundary});
@@ -609,7 +618,7 @@ fn baseName(path: []const u8) []const u8 {
 fn sniff(bytes: []const u8) []const u8 {
     if (std.mem.startsWith(u8, bytes, "\x89PNG")) return "image/png";
     if (std.mem.startsWith(u8, bytes, "GIF8")) return "image/gif";
-    if (bytes.len > 12 and std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
+    if (bytes.len >= 12 and std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
     return "image/jpeg";
 }
 

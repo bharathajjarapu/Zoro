@@ -20,9 +20,7 @@ pub const Ctx = struct {
     workspace: []const u8 = "workspace",
     fetch: ?web.Get = null,
     limiter: ?*web.Limiter = null,
-    /// A `*worker.Pool`, kept opaque so this file and `agent.zig` stay free of
-    /// worker types. `worker.zig` casts it back.
-    pool: ?*anyopaque = null,
+    pool: ?*worker.Pool = null,
 };
 
 pub const Def = struct {

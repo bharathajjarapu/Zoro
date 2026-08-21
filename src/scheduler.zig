@@ -164,7 +164,11 @@ fn exists(db: *Db, sql: [:0]const u8, tool: []const u8, target: []const u8) !boo
     return try q.step();
 }
 
+/// The approval binds to these exact bytes, so the name has to be the same
+/// restricted alphabet `skills.validName` already enforces — no escaping needed,
+/// and nothing else can reach here.
 fn nameArgs(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
+    if (!skills.validName(name)) return error.BadName;
     return std.fmt.allocPrint(gpa, "{{\"name\":\"{s}\"}}", .{name});
 }
 
@@ -248,7 +252,12 @@ fn execute(a: *agent.Agent, name: []const u8, skill: skills.Skill, tier: skills.
     }
 }
 
+/// Asks once per firing, not once per tick, and never twice while the owner
+/// still has the first question open.
 fn askFirst(a: *agent.Agent, name: []const u8, why: []const u8, now: i64, next: i64) !void {
+    if (try pendingFor(a.db, "run_routine", name)) {
+        return record(a.db, name, now, next, "awaiting-approval");
+    }
     const args = try nameArgs(a.gpa, name);
     defer a.gpa.free(args);
     const reason = try std.fmt.allocPrint(a.gpa, "{s} ({s}) is due. Run it?", .{ name, why });
@@ -739,4 +748,23 @@ test "a day of downtime is one catch-up run, and a missed critical is skipped" {
     // A second tick with nothing due adds no further runs.
     try tick(&rig.a, now + 1);
     try testing.expectEqual(@as(usize, 1), rig.fake.i);
+}
+
+test "an unanswered critical routine asks once, not once per firing" {
+    var rig: Rig = undefined;
+    try rig.init(&.{});
+    defer rig.deinit();
+    try rig.write(critical_skill);
+    try tick(&rig.a, 1000);
+    try rig.approve("enable_routine", "payer");
+    try rig.db.exec("UPDATE routines SET enabled = 1, next = 900 WHERE name = 'payer'");
+
+    try tick(&rig.a, 1000);
+    try tick(&rig.a, 1000);
+    try tick(&rig.a, 1000);
+
+    var q = try rig.db.prepare("SELECT count(*) FROM approvals WHERE tool = 'run_routine' AND target = 'payer'");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqual(@as(i64, 1), q.int(0));
 }

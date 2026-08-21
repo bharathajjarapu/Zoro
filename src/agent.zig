@@ -7,6 +7,7 @@ const tools = @import("tools.zig");
 const web = @import("web.zig");
 const secrets = @import("secrets.zig");
 const tasks = @import("tasks.zig");
+const worker = @import("worker.zig");
 const testing = std.testing;
 
 const log = std.log.scoped(.agent);
@@ -119,9 +120,11 @@ pub const Agent = struct {
     vision_model: ?[]const u8 = null,
     fetch: ?web.Get = null,
     limiter: web.Limiter = .{},
-    /// Set once delegation is wired up; null means nothing runs in the background.
+    /// Null means nothing runs in the background.
     workers: ?*Workers = null,
-    pool: ?*anyopaque = null,
+    /// Set once delegation is wired up. `Workers` above is what this file
+    /// actually touches; the pool is only carried through to the tools.
+    pool: ?*worker.Pool = null,
 
     /// Caller owns the returned reply.
     pub fn turn(self: *Agent, input: []const u8) ![]u8 {
@@ -584,7 +587,8 @@ pub const StdHttp = struct {
 
     fn post(ptr: *anyopaque, gpa: std.mem.Allocator, req: Http.Request) anyerror!Http.Response {
         const self: *StdHttp = @ptrCast(@alignCast(ptr));
-        var cap = CappedBody.init(gpa, max_http_body);
+        var cap: CappedBody = undefined;
+        cap.init(gpa, max_http_body);
         defer cap.deinit();
 
         const result = self.client.fetch(.{
@@ -615,13 +619,19 @@ const CappedBody = struct {
     max: usize,
     overflow: bool = false,
     taken: bool = false,
+    /// `std.Io` streams into the writer's own buffer and asserts it has room
+    /// for at least one byte, so this cannot be empty.
+    buf: [4096]u8 = undefined,
 
-    fn init(gpa: std.mem.Allocator, max: usize) CappedBody {
-        return .{
+    /// In place: the writer points at `buf`, which only has a stable address
+    /// once the struct is in its final home.
+    fn init(self: *CappedBody, gpa: std.mem.Allocator, max: usize) void {
+        self.* = .{
             .body = .init(gpa),
-            .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
+            .writer = undefined,
             .max = max,
         };
+        self.writer = .{ .buffer = &self.buf, .vtable = &.{ .drain = drain } };
     }
 
     fn deinit(self: *CappedBody) void {
@@ -629,7 +639,12 @@ const CappedBody = struct {
         self.* = undefined;
     }
 
+    /// Flushes whatever is still sitting in `buf` before handing the body over.
     fn take(self: *CappedBody) ![]u8 {
+        if (self.writer.end != 0) {
+            self.append(self.writer.buffered()) catch return error.ResponseTooLarge;
+            self.writer.end = 0;
+        }
         const bytes = try self.body.toOwnedSlice();
         self.taken = true;
         return bytes;
