@@ -3,17 +3,11 @@ const Db = @import("db.zig").Db;
 const Stmt = @import("db.zig").Stmt;
 const secrets = @import("secrets.zig");
 const testing = std.testing;
+const testkit = @import("testkit.zig");
 
 pub const Source = enum {
     owner,
     inferred,
-
-    fn sql(self: Source) []const u8 {
-        return switch (self) {
-            .owner => "owner",
-            .inferred => "inferred",
-        };
-    }
 
     fn parse(s: []const u8) Source {
         return if (std.mem.eql(u8, s, "owner")) .owner else .inferred;
@@ -55,7 +49,7 @@ pub fn put(db: *Db, key: []const u8, value: []const u8, source: Source, now: i64
         );
         defer u.finalize();
         try u.bind(1, value);
-        try u.bind(2, source.sql());
+        try u.bind(2, @tagName(source));
         try u.bind(3, now);
         try u.bind(4, expires);
         try u.bind(5, key);
@@ -68,7 +62,7 @@ pub fn put(db: *Db, key: []const u8, value: []const u8, source: Source, now: i64
         defer ins.finalize();
         try ins.bind(1, key);
         try ins.bind(2, value);
-        try ins.bind(3, source.sql());
+        try ins.bind(3, @tagName(source));
         try ins.bind(4, now);
         try ins.bind(5, now);
         try ins.bind(6, expires);
@@ -311,7 +305,7 @@ pub fn readDiary(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, day: []con
     };
     defer d.close(io);
     var name: [16]u8 = undefined;
-    const file_name = try diaryName(&name, day);
+    const file_name = try std.fmt.bufPrint(&name, "{s}.md", .{day});
     return d.readFileAlloc(io, file_name, gpa, .limited(1 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => null,
         else => err,
@@ -384,15 +378,11 @@ fn writeDiaryFile(io: std.Io, dir: []const u8, day: []const u8, summary: []const
     var d = try std.Io.Dir.cwd().openDir(io, dir, .{});
     defer d.close(io);
     var name: [16]u8 = undefined;
-    const file_name = try diaryName(&name, day);
+    const file_name = try std.fmt.bufPrint(&name, "{s}.md", .{day});
     var f = try d.createFile(io, file_name, .{});
     defer f.close(io);
     try f.writeStreamingAll(io, summary);
     try f.sync(io);
-}
-
-fn diaryName(buf: []u8, day: []const u8) ![]u8 {
-    return std.fmt.bufPrint(buf, "{s}.md", .{day});
 }
 
 fn deleteDay(db: *Db, start: i64) !void {
@@ -482,10 +472,6 @@ fn isOperator(tok: []const u8) bool {
         std.ascii.eqlIgnoreCase(tok, "NEAR");
 }
 
-fn tmpPath(tmp: *testing.TmpDir, buf: []u8) ![:0]u8 {
-    return std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
-}
-
 fn insertMsg(db: *Db, role: []const u8, content: []const u8, created: i64) !void {
     var q = try db.prepare("INSERT INTO messages(role, content, created) VALUES (?, ?, ?)");
     defer q.finalize();
@@ -506,7 +492,7 @@ test "a fact survives closing and reopening the database" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    const path = try tmpPath(&tmp, &buf);
+    const path = try testkit.tmpPath(&tmp, &buf, "zoro.db");
 
     {
         var db = try Db.open(path);
@@ -526,7 +512,7 @@ test "porter stemming matches inflections" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -541,7 +527,7 @@ test "an alias makes vet find veterinarian" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -562,7 +548,7 @@ test "alias expansion keeps other query terms" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -579,7 +565,7 @@ test "raw messages are never indexed" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -600,7 +586,7 @@ test "diary entries are indexed" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -616,7 +602,7 @@ test "expired facts are not returned" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -641,7 +627,7 @@ test "an inferred fact does not overwrite an owner statement" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -664,7 +650,7 @@ test "forget removes a fact from lookup and search" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -680,7 +666,7 @@ test "owner facts rank above inferred facts with the same text" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -697,7 +683,7 @@ test "recent facts rank above older facts with the same text" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -715,7 +701,7 @@ test "compaction writes a diary file and deletes that day's messages" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -754,7 +740,7 @@ test "a failure at each compaction step leaves raw messages intact" {
         var tmp = testing.tmpDir(.{});
         defer tmp.cleanup();
         var buf: [128]u8 = undefined;
-        var db = try Db.open(try tmpPath(&tmp, &buf));
+        var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
         defer db.close();
         try db.migrate();
 
@@ -786,7 +772,7 @@ test "compaction can be retried after a failed commit" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -820,7 +806,7 @@ test "compaction redacts secret values from the diary" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -846,7 +832,7 @@ test "a fact is found by its own key, not only by its value" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -864,7 +850,7 @@ test "an existing database re-indexes its facts on upgrade" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
 
     // A database written the old way: the chunk holds the value alone.
@@ -884,7 +870,7 @@ test "an alias makes the owner's shorthand recall the full word" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 

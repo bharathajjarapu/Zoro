@@ -44,11 +44,6 @@ pub const Entry = struct {
     }
 };
 
-pub fn freeIndex(gpa: std.mem.Allocator, entries: []Entry) void {
-    for (entries) |e| e.deinit(gpa);
-    gpa.free(entries);
-}
-
 /// Slices borrow from `text`.
 pub fn parse(text: []const u8) !Skill {
     var rest = std.mem.trim(u8, text, "\r\n");
@@ -245,8 +240,10 @@ test "save then load round-trips, and the index is name plus description only" {
     defer testing.allocator.free(body);
     try testing.expectEqualStrings("Call fetch_url on wttr.in.", body);
 
-    const entries = try list(testing.allocator, io, dir);
-    defer freeIndex(testing.allocator, entries);
+    // An arena, the way every production caller of `list` holds it.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const entries = try list(arena.allocator(), io, dir);
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqualStrings("weather", entries[0].name);
     try testing.expectEqualStrings("Look up the forecast", entries[0].description);

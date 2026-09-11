@@ -9,6 +9,8 @@ const secrets = @import("secrets.zig");
 const tasks = @import("tasks.zig");
 const worker = @import("worker.zig");
 const testing = std.testing;
+const testkit = @import("testkit.zig");
+const FakeHttp = testkit.FakeHttp;
 
 const log = std.log.scoped(.agent);
 
@@ -16,7 +18,6 @@ pub const max_rounds: usize = 32;
 pub const max_tool_result: usize = tools.max_result;
 const max_history: usize = 40;
 const max_memories: usize = 8;
-const max_http_body: usize = 2 * 1024 * 1024;
 pub const default_base_url = "https://api.openai.com/v1";
 
 pub const system_prompt =
@@ -286,7 +287,7 @@ fn chatUrl(arena: std.mem.Allocator, base: []const u8) ![]const u8 {
 fn resolveApproval(self: *Agent, input: []const u8, now: i64, verdict: tasks.Decision) ![]u8 {
     try insertMsg(self.db, "user", input, now);
     var pending = (try tasks.latestPending(self.db, self.gpa)) orelse
-        return say(self, now, "I have more than one pending action. Which one do you mean?");
+        return sayFmt(self, now, "{s}", .{"I have more than one pending action. Which one do you mean?"});
     defer pending.deinit(self.gpa);
 
     if (verdict == .deny) {
@@ -313,13 +314,6 @@ fn resolveApproval(self: *Agent, input: []const u8, now: i64, verdict: tasks.Dec
     const raw = try tools.callApproved(&ctx, self.tools, pending.tool, pending.args);
     defer self.gpa.free(raw);
     return sayFmt(self, now, "{s}: {s}", .{ pending.tool, raw });
-}
-
-fn say(self: *Agent, now: i64, text: []const u8) ![]u8 {
-    const reply = try self.gpa.dupe(u8, text);
-    errdefer self.gpa.free(reply);
-    try insertMsg(self.db, "assistant", reply, now);
-    return reply;
 }
 
 fn sayFmt(self: *Agent, now: i64, comptime fmt: []const u8, args: anytype) ![]u8 {
@@ -565,156 +559,7 @@ fn parseAssistant(gpa: std.mem.Allocator, body: []const u8) !Parsed {
     };
 }
 
-/// Production HTTP client over `std.http.Client`.
-pub const StdHttp = struct {
-    client: std.http.Client,
-
-    pub fn init(gpa: std.mem.Allocator, io: std.Io) StdHttp {
-        return .{ .client = .{ .allocator = gpa, .io = io } };
-    }
-
-    pub fn deinit(self: *StdHttp) void {
-        self.client.deinit();
-        self.* = undefined;
-    }
-
-    pub fn http(self: *StdHttp) Http {
-        return .{ .ptr = self, .post_fn = post };
-    }
-
-    pub fn getter(self: *StdHttp) web.Get {
-        return web.fromClient(&self.client);
-    }
-
-    fn post(ptr: *anyopaque, gpa: std.mem.Allocator, req: Http.Request) anyerror!Http.Response {
-        const self: *StdHttp = @ptrCast(@alignCast(ptr));
-        var cap: CappedBody = undefined;
-        cap.init(gpa, max_http_body);
-        defer cap.deinit();
-
-        const result = self.client.fetch(.{
-            .location = .{ .url = req.url },
-            .method = .POST,
-            .payload = req.body,
-            .headers = .{
-                .authorization = .{ .override = req.auth },
-                .content_type = .{ .override = req.content_type },
-            },
-            .response_writer = &cap.writer,
-        }) catch |err| {
-            if (cap.overflow) return error.ResponseTooLarge;
-            return err;
-        };
-
-        return .{
-            .status = @intFromEnum(result.status),
-            .body = try cap.take(),
-        };
-    }
-};
-
-/// Stops the fetch once the response exceeds `max_http_body`.
-const CappedBody = struct {
-    body: std.Io.Writer.Allocating,
-    writer: std.Io.Writer,
-    max: usize,
-    overflow: bool = false,
-    taken: bool = false,
-    /// `std.Io` streams into the writer's own buffer and asserts it has room
-    /// for at least one byte, so this cannot be empty.
-    buf: [4096]u8 = undefined,
-
-    /// In place: the writer points at `buf`, which only has a stable address
-    /// once the struct is in its final home.
-    fn init(self: *CappedBody, gpa: std.mem.Allocator, max: usize) void {
-        self.* = .{
-            .body = .init(gpa),
-            .writer = undefined,
-            .max = max,
-        };
-        self.writer = .{ .buffer = &self.buf, .vtable = &.{ .drain = drain } };
-    }
-
-    fn deinit(self: *CappedBody) void {
-        if (!self.taken) self.body.deinit();
-        self.* = undefined;
-    }
-
-    /// Flushes whatever is still sitting in `buf` before handing the body over.
-    fn take(self: *CappedBody) ![]u8 {
-        if (self.writer.end != 0) {
-            self.append(self.writer.buffered()) catch return error.ResponseTooLarge;
-            self.writer.end = 0;
-        }
-        const bytes = try self.body.toOwnedSlice();
-        self.taken = true;
-        return bytes;
-    }
-
-    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *CappedBody = @alignCast(@fieldParentPtr("writer", w));
-        if (w.end != 0) {
-            self.append(w.buffered()) catch {
-                self.overflow = true;
-                return error.WriteFailed;
-            };
-            w.end = 0;
-        }
-        if (data.len == 0) return 0;
-        var n: usize = 0;
-        for (data[0 .. data.len - 1]) |bytes| {
-            self.append(bytes) catch {
-                self.overflow = true;
-                return error.WriteFailed;
-            };
-            n += bytes.len;
-        }
-        const last = data[data.len - 1];
-        for (0..splat) |_| {
-            self.append(last) catch {
-                self.overflow = true;
-                return error.WriteFailed;
-            };
-            n += last.len;
-        }
-        return n;
-    }
-
-    fn append(self: *CappedBody, bytes: []const u8) error{Overflow}!void {
-        if (bytes.len == 0) return;
-        const next = std.math.add(usize, self.body.written().len, bytes.len) catch return error.Overflow;
-        if (next > self.max) return error.Overflow;
-        self.body.writer.writeAll(bytes) catch return error.Overflow;
-    }
-};
-
 // ── test helpers ──────────────────────────────────────────────────────────
-
-const FakeHttp = struct {
-    bodies: []const []const u8,
-    i: usize = 0,
-    last_body: ?[]u8 = null,
-    gpa: std.mem.Allocator,
-
-    fn http(self: *FakeHttp) Http {
-        return .{ .ptr = self, .post_fn = post };
-    }
-
-    fn post(ptr: *anyopaque, gpa: std.mem.Allocator, req: Http.Request) anyerror!Http.Response {
-        const self: *FakeHttp = @ptrCast(@alignCast(ptr));
-        if (self.last_body) |b| gpa.free(b);
-        self.last_body = try gpa.dupe(u8, req.body);
-        if (self.i >= self.bodies.len) return error.TooManyCalls;
-        const body = try gpa.dupe(u8, self.bodies[self.i]);
-        self.i += 1;
-        return .{ .status = 200, .body = body };
-    }
-
-    fn deinit(self: *FakeHttp) void {
-        if (self.last_body) |b| self.gpa.free(b);
-        self.* = undefined;
-    }
-};
 
 fn openTmpDb(tmp: *testing.TmpDir, buf: []u8) !Db {
     const path = try std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
@@ -731,9 +576,7 @@ test "turn returns the stubbed assistant reply" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hello back\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -763,9 +606,7 @@ test "turn persists user and assistant messages" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -822,8 +663,7 @@ test "tool loop stops at 32 rounds and reports the blocker" {
     var bodies: [32][]const u8 = undefined;
     for (&bodies) |*b| b.* = tool_call_body;
 
-    var fake: FakeHttp = .{ .bodies = &bodies, .gpa = testing.allocator };
-    defer fake.deinit();
+    var fake: FakeHttp = .{ .bodies = &bodies };
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -862,9 +702,7 @@ test "tool results truncate at 64 KiB" {
     ;
     var fake: FakeHttp = .{
         .bodies = &.{ big_call, final },
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -888,7 +726,7 @@ test "tool results truncate at 64 KiB" {
     defer testing.allocator.free(reply);
     try testing.expectEqualStrings("done", reply);
 
-    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    const sent = fake.sent();
     try testing.expect(std.mem.indexOf(u8, sent, "[truncated]") != null);
 }
 
@@ -908,9 +746,7 @@ test "turn injects a retrieved fact relevant to the message" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -933,7 +769,7 @@ test "turn injects a retrieved fact relevant to the message" {
     const reply = try agent.turn("tell me about mittens");
     defer testing.allocator.free(reply);
 
-    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    const sent = fake.sent();
     try testing.expect(std.mem.indexOf(u8, sent, "a black cat named mittens") != null);
 }
 
@@ -944,9 +780,7 @@ test "turn does not inject an irrelevant memory" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -970,7 +804,7 @@ test "turn does not inject an irrelevant memory" {
     const reply = try agent.turn("tell me about mittens");
     defer testing.allocator.free(reply);
 
-    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    const sent = fake.sent();
     try testing.expect(std.mem.indexOf(u8, sent, "a black cat named mittens") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "root canal on tuesday") == null);
 }
@@ -983,9 +817,7 @@ test "turn uses a fact from three turns ago without restating it" {
     const ok = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
     var fake: FakeHttp = .{
         .bodies = &.{ ok, ok, ok, ok },
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -1013,7 +845,7 @@ test "turn uses a fact from three turns ago without restating it" {
     const reply = try agent.turn("how is mittens");
     defer testing.allocator.free(reply);
 
-    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    const sent = fake.sent();
     try testing.expect(std.mem.indexOf(u8, sent, "a black cat named mittens") != null);
 }
 
@@ -1024,9 +856,7 @@ test "turn keeps injected memory and history bounded as history grows" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -1069,7 +899,7 @@ test "turn keeps injected memory and history bounded as history grows" {
     const reply = try agent.turn("widget");
     defer testing.allocator.free(reply);
 
-    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    const sent = fake.sent();
     try testing.expect(std.mem.indexOf(u8, sent, "UNIQUE_OLD_HISTORY") == null);
 
     var n: usize = 0;
@@ -1091,9 +921,7 @@ test "turn injects the skill index without the skill body" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -1125,7 +953,7 @@ test "turn injects the skill index without the skill body" {
 
     const reply = try agent.turn("hi");
     defer testing.allocator.free(reply);
-    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    const sent = fake.sent();
     try testing.expect(std.mem.indexOf(u8, sent, "weather") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "Look up the forecast") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "SECRET_BODY_SHOULD_STAY_OFF_THE_PROMPT") == null);
@@ -1138,9 +966,7 @@ test "turn lists secret names but never their values" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -1162,7 +988,7 @@ test "turn lists secret names but never their values" {
 
     const reply = try agent.turn("hi");
     defer testing.allocator.free(reply);
-    const sent = fake.last_body orelse return error.TestUnexpectedResult;
+    const sent = fake.sent();
     try testing.expect(std.mem.indexOf(u8, sent, "weather_api_key") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "sk-secret-value") == null);
 }
@@ -1185,9 +1011,7 @@ test "yes runs the bound pending action and skips the model" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"should not run\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -1220,9 +1044,7 @@ test "yes on an expired approval is refused and reported" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"no\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -1253,9 +1075,7 @@ test "yes with two pending actions asks which" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"no\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -1288,9 +1108,7 @@ test "a bare yes with nothing pending is an ordinary message" {
 
     var fake: FakeHttp = .{
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"sure thing\"}}]}"},
-        .gpa = testing.allocator,
     };
-    defer fake.deinit();
 
     var db = try openTmpDb(&tmp, &buf);
     defer db.close();
@@ -1324,10 +1142,8 @@ test "a picture reaches the vision profile with its caption, and is not persiste
     defer threaded.deinit();
 
     var fake: FakeHttp = .{
-        .gpa = testing.allocator,
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"a cat\"}}]}"},
     };
-    defer fake.deinit();
     var a: Agent = .{
         .gpa = testing.allocator,
         .io = threaded.io(),
@@ -1346,7 +1162,7 @@ test "a picture reaches the vision profile with its caption, and is not persiste
     defer testing.allocator.free(reply);
     try testing.expectEqualStrings("a cat", reply);
 
-    const sent = fake.last_body.?;
+    const sent = fake.sent();
     try testing.expect(std.mem.indexOf(u8, sent, "\"sees-things\"") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "data:image/jpeg;base64,/9j/") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "\"what is this\"") != null);

@@ -2,6 +2,7 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const tools = @import("tools.zig");
 const testing = std.testing;
+const testkit = @import("testkit.zig");
 
 /// Nothing the agent queues may be larger than one Telegram message; the
 /// channel chunks anything longer.
@@ -149,14 +150,6 @@ fn runAttach(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     return std.fmt.allocPrint(ctx.gpa, "queued {s}", .{a.path});
 }
 
-fn tmpDb(tmp: *testing.TmpDir, buf: []u8) !Db {
-    const path = try std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
-    var db = try Db.open(path);
-    errdefer db.close();
-    try db.migrate();
-    return db;
-}
-
 test "safeRelative refuses escapes and absolutes" {
     try testing.expect(safeRelative("report.pdf"));
     try testing.expect(safeRelative("out/chart.png"));
@@ -176,7 +169,7 @@ test "push then drain returns items once and empties the queue" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     try push(&db, .text, null, "brief is ready", 100);
@@ -200,7 +193,7 @@ test "an over-long message is trimmed on a codepoint boundary, not rejected" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     const long = try testing.allocator.alloc(u8, max_text + 64);

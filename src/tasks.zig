@@ -1,6 +1,7 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const testing = std.testing;
+const testkit = @import("testkit.zig");
 
 /// Attempts per task: one try plus one retry, matching the delegation limit in
 /// docs/ARCHITECTURE.md. This is the only retry policy in the codebase.
@@ -14,10 +15,6 @@ pub const Status = enum {
     done,
     failed,
     cancelled,
-
-    fn sql(self: Status) []const u8 {
-        return @tagName(self);
-    }
 
     fn parse(s: []const u8) ?Status {
         inline for (std.meta.fields(Status)) |f| {
@@ -128,7 +125,7 @@ pub fn setStatus(db: *Db, id: i64, next: Status) !void {
     if (!legal(cur, next)) return error.BadTransition;
     var q = try db.prepare("UPDATE tasks SET status = ? WHERE id = ?");
     defer q.finalize();
-    try q.bind(1, next.sql());
+    try q.bind(1, @tagName(next));
     try q.bind(2, id);
     _ = try q.step();
 }
@@ -204,17 +201,6 @@ pub fn ask(
     try q.bind(7, now + approval_ttl);
     _ = try q.step();
     return db.lastId();
-}
-
-pub fn getApproval(db: *Db, gpa: std.mem.Allocator, id: i64) !?Approval {
-    var q = try db.prepare(
-        \\SELECT id, task, tool, args, target, reason, status, created, expires
-        \\FROM approvals WHERE id = ?
-    );
-    defer q.finalize();
-    try q.bind(1, id);
-    if (!try q.step()) return null;
-    return try readApproval(gpa, &q);
 }
 
 pub const AuthorizeError = error{ NotFound, Expired, WrongAction, Sqlite, OutOfMemory };
@@ -295,7 +281,7 @@ pub fn formatList(gpa: std.mem.Allocator, items: []const Task) ![]u8 {
         try buf.writer.print("{s}#{d} {s} prio={d}  {s}\n{s}  goal: {s}\n", .{
             indent,
             t.id,
-            t.status.sql(),
+            @tagName(t.status),
             t.prio,
             t.summary,
             indent,
@@ -367,13 +353,6 @@ fn eqlIgnore(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-fn tmpDb(tmp: *testing.TmpDir, buf: []u8) !Db {
-    const path = try std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
-    var db = try Db.open(path);
-    try db.migrate();
-    return db;
-}
-
 test "a task survives reopen and carries a success criterion" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -400,7 +379,7 @@ test "status machine rejects a jump from done back to running" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     const id = try create(&db, "x", "done means the file exists", 0, null, 0);
@@ -413,7 +392,7 @@ test "transient failure retries with backoff; mutating never retries" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     const a = try create(&db, "fetch", "page saved", 0, null, 0);
@@ -438,7 +417,7 @@ test "transient retries stop at the cap" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     const id = try create(&db, "fetch", "ok", 0, null, 0);
@@ -455,7 +434,7 @@ test "approval for action A cannot authorize action B" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     const id = try ask(&db, "fetch_url", "{\"url\":\"https://example.com\"}", "example.com", "read the page", null, 0);
@@ -467,7 +446,7 @@ test "expired approval is refused" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     const id = try ask(&db, "fetch_url", "{}", null, "x", null, 0);
@@ -479,15 +458,15 @@ test "approvals survive reopen" {
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
-    const id = blk: {
+    {
         var db = try Db.open(path);
         defer db.close();
         try db.migrate();
-        break :blk try ask(&db, "fetch_url", "{}", "h", "why", null, 10);
-    };
+        _ = try ask(&db, "fetch_url", "{}", "h", "why", null, 10);
+    }
     var db = try Db.open(path);
     defer db.close();
-    var a = (try getApproval(&db, testing.allocator, id)).?;
+    var a = (try latestPending(&db, testing.allocator)).?;
     defer a.deinit(testing.allocator);
     try testing.expectEqualStrings("pending", a.status);
     try testing.expectEqualStrings("fetch_url", a.tool);
@@ -502,7 +481,7 @@ test "yes maps to the single pending action; two pendings need clarification" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     _ = try ask(&db, "a", "{}", null, "one", null, 0);

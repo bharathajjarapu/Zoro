@@ -1,5 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
+const testkit = @import("testkit.zig");
+const FakeHttp = testkit.FakeHttp;
 const agent = @import("agent.zig");
 const config = @import("config.zig");
 const Db = @import("db.zig").Db;
@@ -631,14 +633,6 @@ fn buildGetUpdates(gpa: std.mem.Allocator, offset: ?i64) ![]u8 {
     });
 }
 
-fn tmpDb(tmp: *testing.TmpDir, buf: []u8) !Db {
-    const path = try std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
-    var db = try Db.open(path);
-    errdefer db.close();
-    try db.migrate();
-    return db;
-}
-
 fn scalar(db: *Db, sql: [:0]const u8) !i64 {
     var q = try db.prepare(sql);
     defer q.finalize();
@@ -652,7 +646,7 @@ test "offset persists in kv and a second open sees it" {
     var buf: [128]u8 = undefined;
 
     {
-        var db = try tmpDb(&tmp, &buf);
+        var db = try testkit.tmpDb(&tmp, &buf);
         defer db.close();
         try testing.expectEqual(@as(?i64, null), try loadOffset(&db));
         try saveOffset(&db, 42);
@@ -661,47 +655,10 @@ test "offset persists in kv and a second open sees it" {
         try testing.expectEqual(@as(?i64, 99), try loadOffset(&db));
     }
 
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
     try testing.expectEqual(@as(?i64, 99), try loadOffset(&db));
 }
-
-const FakeHttp = struct {
-    bodies: []const []const u8,
-    i: usize = 0,
-    gpa: std.mem.Allocator,
-    status: u16 = 200,
-    last_url: ?[]u8 = null,
-    last_body: ?[]u8 = null,
-    urls: std.ArrayList([]u8) = .empty,
-    statuses: []const u16 = &.{},
-
-    fn http(self: *FakeHttp) agent.Http {
-        return .{ .ptr = self, .post_fn = post };
-    }
-
-    fn post(ptr: *anyopaque, gpa: std.mem.Allocator, req: agent.Http.Request) anyerror!agent.Http.Response {
-        const self: *FakeHttp = @ptrCast(@alignCast(ptr));
-        try self.urls.append(self.gpa, try self.gpa.dupe(u8, req.url));
-        if (self.last_url) |u| self.gpa.free(u);
-        self.last_url = try self.gpa.dupe(u8, req.url);
-        if (self.last_body) |b| self.gpa.free(b);
-        self.last_body = try self.gpa.dupe(u8, req.body);
-        if (self.i >= self.bodies.len) return error.TooManyCalls;
-        const st: u16 = if (self.i < self.statuses.len) self.statuses[self.i] else self.status;
-        const body = try gpa.dupe(u8, self.bodies[self.i]);
-        self.i += 1;
-        return .{ .status = st, .body = body };
-    }
-
-    fn deinit(self: *FakeHttp) void {
-        for (self.urls.items) |u| self.gpa.free(u);
-        self.urls.deinit(self.gpa);
-        if (self.last_url) |u| self.gpa.free(u);
-        if (self.last_body) |b| self.gpa.free(b);
-        self.* = undefined;
-    }
-};
 
 const Harness = struct {
     tmp: testing.TmpDir,
@@ -718,8 +675,8 @@ const Harness = struct {
         errdefer self.tmp.cleanup();
         self.threaded = .init(testing.allocator, .{});
         errdefer self.threaded.deinit();
-        self.tg = .{ .bodies = tg_bodies, .gpa = testing.allocator };
-        self.llm = .{ .bodies = llm_bodies, .gpa = testing.allocator };
+        self.tg = .{ .bodies = tg_bodies };
+        self.llm = .{ .bodies = llm_bodies };
         const path = try std.fmt.bufPrintZ(&self.path_buf, ".zig-cache/tmp/{s}/zoro.db", .{self.tmp.sub_path});
         self.db = try Db.open(path);
         errdefer self.db.close();
@@ -753,8 +710,6 @@ const Harness = struct {
     }
 
     fn deinit(self: *Harness) void {
-        self.tg.deinit();
-        self.llm.deinit();
         self.db.close();
         self.threaded.deinit();
         self.tmp.cleanup();
@@ -797,9 +752,9 @@ test "pollOnce sends the reply via sendMessage" {
     defer h.deinit();
 
     try h.bot.pollOnce();
-    try testing.expect(std.mem.indexOf(u8, h.tg.last_url.?, "sendMessage") != null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "\"chat_id\":42") != null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "\"text\":\"hi\"") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sentUrl(), "sendMessage") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"chat_id\":42") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"text\":\"hi\"") != null);
 }
 
 test "pollOnce sends a typing indicator before the turn" {
@@ -815,9 +770,9 @@ test "pollOnce sends a typing indicator before the turn" {
     defer h.deinit();
 
     try h.bot.pollOnce();
-    try testing.expectEqual(@as(usize, 3), h.tg.urls.items.len);
-    try testing.expect(std.mem.endsWith(u8, h.tg.urls.items[1], "sendChatAction"));
-    try testing.expect(std.mem.endsWith(u8, h.tg.urls.items[2], "sendMessage"));
+    try testing.expectEqual(@as(usize, 3), h.tg.n);
+    try testing.expect(std.mem.endsWith(u8, h.tg.url(1), "sendChatAction"));
+    try testing.expect(std.mem.endsWith(u8, h.tg.url(2), "sendMessage"));
 }
 
 test "a 429 is retried after retry-after rather than failing immediately" {
@@ -836,9 +791,9 @@ test "a 429 is retried after retry-after rather than failing immediately" {
 
     try h.bot.pollOnce();
     try testing.expectEqual(@as(usize, 4), h.tg.i);
-    try testing.expect(std.mem.endsWith(u8, h.tg.urls.items[2], "sendMessage"));
-    try testing.expect(std.mem.endsWith(u8, h.tg.urls.items[3], "sendMessage"));
-    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "\"text\":\"hi\"") != null);
+    try testing.expect(std.mem.endsWith(u8, h.tg.url(2), "sendMessage"));
+    try testing.expect(std.mem.endsWith(u8, h.tg.url(3), "sendMessage"));
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"text\":\"hi\"") != null);
 }
 
 test "send failure is returned rather than swallowed" {
@@ -881,10 +836,10 @@ test "pollOnce splits a long reply into UTF-8-safe chunks" {
 
     try h.bot.pollOnce();
     try testing.expectEqual(@as(usize, 4), h.tg.i);
-    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "sendMessage") == null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.last_url.?, "sendMessage") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "sendMessage") == null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sentUrl(), "sendMessage") != null);
     const want = "a" ** extra;
-    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, want) != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), want) != null);
 }
 
 test "pollOnce serves the owner and persists the offset" {
@@ -958,7 +913,7 @@ test "a later pollOnce sends the persisted offset" {
     defer h.deinit();
     try h.bot.pollOnce();
     try h.bot.pollOnce();
-    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "\"offset\":11") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"offset\":11") != null);
 }
 
 test "poller lock is exclusive and does not cover the database" {
@@ -977,7 +932,7 @@ test "poller lock is exclusive and does not cover the database" {
     try testing.expect(try tryLock(io, dir) == null);
 
     var db_buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &db_buf);
+    var db = try testkit.tmpDb(&tmp, &db_buf);
     defer db.close();
     try db.exec("INSERT INTO kv(key, value) VALUES ('x', '1')");
     try testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM kv"));
@@ -1042,10 +997,10 @@ test "a photo is downloaded and reaches the vision model with its caption" {
     // The largest size is the one fetched, and the token never leaves the URL builder.
     try testing.expectEqual(@as(usize, 1), files.calls);
     try testing.expect(std.mem.endsWith(u8, files.url(), "/photos/x.png"));
-    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "\"big\"") != null or
-        std.mem.indexOf(u8, h.tg.urls.items[2], "getFile") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"big\"") != null or
+        std.mem.indexOf(u8, h.tg.url(2), "getFile") != null);
 
-    const asked = h.llm.last_body.?;
+    const asked = h.llm.sent();
     try testing.expect(std.mem.indexOf(u8, asked, "\"sees-things\"") != null);
     try testing.expect(std.mem.indexOf(u8, asked, "data:image/png;base64,") != null);
     try testing.expect(std.mem.indexOf(u8, asked, "what plant is this") != null);
@@ -1066,8 +1021,8 @@ test "a photo that will not download still gets an answer" {
     h.bot.fetch = files.get();
 
     try h.bot.pollOnce(); // the download fails; the turn happens anyway
-    try testing.expect(std.mem.indexOf(u8, h.llm.last_body.?, "a picture, no caption") != null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.last_body.?, "I could not open it") != null);
+    try testing.expect(std.mem.indexOf(u8, h.llm.sent(), "a picture, no caption") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "I could not open it") != null);
 }
 
 test "a non-image attachment becomes metadata, never a failed turn" {
@@ -1098,8 +1053,8 @@ test "a workspace file goes out as a photo with its caption" {
     try outbox.push(&h.db, .photo, "chart.png", "yesterday's spend", 100);
     try h.bot.flush();
 
-    const sent = h.tg.last_body.?;
-    try testing.expect(std.mem.endsWith(u8, h.tg.last_url.?, "/sendPhoto"));
+    const sent = h.tg.sent();
+    try testing.expect(std.mem.endsWith(u8, h.tg.sentUrl(), "/sendPhoto"));
     try testing.expect(std.mem.indexOf(u8, sent, "name=\"photo\"; filename=\"chart.png\"") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "yesterday's spend") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "\x89PNG-bytes") != null);

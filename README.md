@@ -157,12 +157,15 @@ three mounts.
 ```
 src/          the product
   agent.zig       context assembly and the bounded model/tool loop
+  http.zig        the HTTP client behind the one injected seam
+  cron.zig        schedule expressions, independent of what fires them
   worker.zig      subagents: slots, budgets, cancellation, verification
   scheduler.zig   tick loop, cron and intervals, authority, missed runs
   telegram.zig    long poll, owner auth, chunking, media
   memory.zig      facts, diary, BM25 retrieval, nightly compaction
   tasks.zig       tasks, approvals, routine state
   outbox.zig      queued messages and attachments for the owner
+  testkit.zig     shared test scaffolding; never reaches the binary
   schema.sql      fresh-install DDL
   migrations/     one file per upgrade step, append-only
 vendor/sqlite3/   pinned, checksummed amalgamation

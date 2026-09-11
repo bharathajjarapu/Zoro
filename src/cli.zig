@@ -6,6 +6,8 @@ const outbox = @import("outbox.zig");
 const Db = @import("db.zig").Db;
 const Agent = agent.Agent;
 const testing = std.testing;
+const testkit = @import("testkit.zig");
+const FakeHttp = testkit.FakeHttp;
 
 pub const max_prompt = 64 * 1024;
 
@@ -306,23 +308,6 @@ test "tasks lists parent and child with status, priority, and goal" {
 }
 
 // ── test helpers ──────────────────────────────────────────────────────────
-
-const FakeHttp = struct {
-    bodies: []const []const u8,
-    i: usize = 0,
-
-    fn http(self: *FakeHttp) agent.Http {
-        return .{ .ptr = self, .post_fn = post };
-    }
-
-    fn post(ptr: *anyopaque, gpa: std.mem.Allocator, _: agent.Http.Request) anyerror!agent.Http.Response {
-        const self: *FakeHttp = @ptrCast(@alignCast(ptr));
-        if (self.i >= self.bodies.len) return error.TooManyCalls;
-        const body = try gpa.dupe(u8, self.bodies[self.i]);
-        self.i += 1;
-        return .{ .status = 200, .body = body };
-    }
-};
 
 const Harness = struct {
     tmp: testing.TmpDir,

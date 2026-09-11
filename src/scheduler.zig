@@ -2,11 +2,14 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const agent = @import("agent.zig");
 const skills = @import("skills.zig");
+const cron = @import("cron.zig");
 const tools = @import("tools.zig");
 const tasks = @import("tasks.zig");
 const outbox = @import("outbox.zig");
 const memory = @import("memory.zig");
 const testing = std.testing;
+const testkit = @import("testkit.zig");
+const FakeHttp = testkit.FakeHttp;
 
 const log = std.log.scoped(.scheduler);
 
@@ -15,48 +18,6 @@ pub const tick_every: u64 = 30;
 /// A run further behind than this was missed while the process was down, not
 /// merely delayed by a slow tick.
 pub const missed_after: i64 = 5 * 60;
-
-pub const Spec = union(enum) {
-    interval: i64,
-    cron: Cron,
-};
-
-pub const Cron = struct {
-    min: u64,
-    hour: u64,
-    dom: u64,
-    mon: u64,
-    dow: u64,
-    dom_any: bool,
-    dow_any: bool,
-};
-
-pub fn parse(expr: []const u8) !Spec {
-    const s = std.mem.trim(u8, expr, &std.ascii.whitespace);
-    if (std.mem.startsWith(u8, s, "every ")) {
-        return .{ .interval = try parseDuration(std.mem.trim(u8, s["every ".len..], &std.ascii.whitespace)) };
-    }
-    return .{ .cron = try parseCron(s) };
-}
-
-pub fn tzOffset(name: ?[]const u8) i32 {
-    const n = name orelse return 0;
-    if (n.len == 0 or std.ascii.eqlIgnoreCase(n, "UTC") or std.ascii.eqlIgnoreCase(n, "GMT")) return 0;
-    if (n[0] == '+' or n[0] == '-') return parseOffset(n) catch 0;
-    if (std.mem.eql(u8, n, "Asia/Kolkata") or std.mem.eql(u8, n, "Asia/Calcutta")) return 330;
-    if (std.mem.eql(u8, n, "Europe/London")) return 0;
-    if (std.mem.eql(u8, n, "America/New_York")) return -300; // ponytail: no DST
-    // ponytail: table of four zones; parse /usr/share/zoneinfo via std.tz when a fifth is needed.
-    log.warn("unknown timezone {s}: scheduling in UTC", .{n});
-    return 0;
-}
-
-pub fn nextRun(spec: Spec, now: i64, tz: ?[]const u8) !i64 {
-    return switch (spec) {
-        .interval => |sec| now + sec,
-        .cron => |c| nextCron(c, now, tzOffset(tz)),
-    };
-}
 
 pub fn tick(a: *agent.Agent, now: i64) !void {
     try sync(a.db, a.gpa, a.io, a.skills_dir, now);
@@ -123,10 +84,10 @@ fn sync(db: *Db, gpa: std.mem.Allocator, io: std.Io, dir: []const u8, now: i64) 
         defer gpa.free(text);
         const skill = skills.parse(text) catch continue;
         const expr = skill.schedule orelse continue;
-        const spec = parse(expr) catch continue;
+        const spec = cron.parse(expr) catch continue;
         const tier = skills.Authority.of(skill.authority);
         if (!try hasRoutine(db, skill.name)) {
-            const next = nextRun(spec, now, skill.timezone) catch continue;
+            const next = cron.nextRun(spec, now, skill.timezone) catch continue;
             try insertRoutine(db, skill.name, next, tier);
         }
         try gate(db, gpa, skill.name, skill.description, tier, now);
@@ -159,9 +120,9 @@ fn insertRoutine(db: *Db, name: []const u8, next: i64, tier: skills.Authority) !
 /// switches the routine back off instead of granting it authority.
 fn gate(db: *Db, gpa: std.mem.Allocator, name: []const u8, why: []const u8, tier: skills.Authority, now: i64) !void {
     if (tier.readOnly()) return;
-    if (try approved(db, "enable_routine", name)) return;
+    if (try hasApproval(db, "enable_routine", name, "approved")) return;
     try setEnabled(db, name, false);
-    if (try pendingFor(db, "enable_routine", name)) return;
+    if (try hasApproval(db, "enable_routine", name, "pending")) return;
 
     const args = try nameArgs(gpa, name);
     defer gpa.free(args);
@@ -183,19 +144,12 @@ fn setEnabled(db: *Db, name: []const u8, on: bool) !void {
     _ = try q.step();
 }
 
-fn approved(db: *Db, tool: []const u8, target: []const u8) !bool {
-    return exists(db, "SELECT 1 FROM approvals WHERE tool = ? AND target = ? AND status = 'approved' LIMIT 1", tool, target);
-}
-
-fn pendingFor(db: *Db, tool: []const u8, target: []const u8) !bool {
-    return exists(db, "SELECT 1 FROM approvals WHERE tool = ? AND target = ? AND status = 'pending' LIMIT 1", tool, target);
-}
-
-fn exists(db: *Db, sql: [:0]const u8, tool: []const u8, target: []const u8) !bool {
-    var q = try db.prepare(sql);
+fn hasApproval(db: *Db, tool: []const u8, target: []const u8, status: []const u8) !bool {
+    var q = try db.prepare("SELECT 1 FROM approvals WHERE tool = ? AND target = ? AND status = ? LIMIT 1");
     defer q.finalize();
     try q.bind(1, tool);
     try q.bind(2, target);
+    try q.bind(3, status);
     return try q.step();
 }
 
@@ -241,8 +195,8 @@ fn runOne(a: *agent.Agent, name: []const u8, now: i64) !void {
     defer a.gpa.free(text);
     const skill = try skills.parse(text);
     const expr = skill.schedule orelse return;
-    const spec = try parse(expr);
-    const next = try nextRun(spec, now, skill.timezone);
+    const spec = try cron.parse(expr);
+    const next = try cron.nextRun(spec, now, skill.timezone);
     const tier = skills.Authority.of(skill.authority);
     const state = try stateOf(a.db, name);
 
@@ -290,7 +244,7 @@ fn execute(a: *agent.Agent, name: []const u8, skill: skills.Skill, tier: skills.
 /// Asks once per firing, not once per tick, and never twice while the owner
 /// still has the first question open.
 fn askFirst(a: *agent.Agent, name: []const u8, why: []const u8, now: i64, next: i64) !void {
-    if (try pendingFor(a.db, "run_routine", name)) {
+    if (try hasApproval(a.db, "run_routine", name, "pending")) {
         return record(a.db, name, now, next, "awaiting-approval");
     }
     const args = try nameArgs(a.gpa, name);
@@ -329,160 +283,6 @@ fn record(db: *Db, name: []const u8, now: i64, next: i64, status: []const u8) !v
     _ = try q.step();
 }
 
-fn parseDuration(s: []const u8) !i64 {
-    if (s.len == 0) return error.BadSchedule;
-    const last = s[s.len - 1];
-    const num = if (std.ascii.isAlphabetic(last)) s[0 .. s.len - 1] else s;
-    const n = std.fmt.parseInt(i64, num, 10) catch return error.BadSchedule;
-    if (n <= 0) return error.BadSchedule;
-    const mul: i64 = switch (last) {
-        's' => 1,
-        'm' => 60,
-        'h' => 3600,
-        'd' => 86400,
-        else => if (std.ascii.isDigit(last)) 1 else return error.BadSchedule,
-    };
-    return n * mul;
-}
-
-fn parseOffset(s: []const u8) !i32 {
-    const sign: i32 = if (s[0] == '-') -1 else 1;
-    const body = s[1..];
-    var hour: i32 = 0;
-    var min: i32 = 0;
-    if (body.len >= 5 and body[2] == ':') {
-        hour = try std.fmt.parseInt(i32, body[0..2], 10);
-        min = try std.fmt.parseInt(i32, body[3..5], 10);
-    } else if (body.len == 4) {
-        hour = try std.fmt.parseInt(i32, body[0..2], 10);
-        min = try std.fmt.parseInt(i32, body[2..4], 10);
-    } else if (body.len == 2 or body.len == 1) {
-        hour = try std.fmt.parseInt(i32, body, 10);
-    } else return error.BadTimezone;
-    return sign * (hour * 60 + min);
-}
-
-fn parseCron(s: []const u8) !Cron {
-    var it = std.mem.tokenizeAny(u8, s, " \t");
-    const min = it.next() orelse return error.BadSchedule;
-    const hour = it.next() orelse return error.BadSchedule;
-    const dom = it.next() orelse return error.BadSchedule;
-    const mon = it.next() orelse return error.BadSchedule;
-    const dow = it.next() orelse return error.BadSchedule;
-    if (it.next() != null) return error.BadSchedule;
-    var c: Cron = .{
-        .min = try parseField(min, 0, 59),
-        .hour = try parseField(hour, 0, 23),
-        .dom = try parseField(dom, 1, 31),
-        .mon = try parseField(mon, 1, 12),
-        .dow = try parseField(dow, 0, 7),
-        .dom_any = std.mem.eql(u8, dom, "*"),
-        .dow_any = std.mem.eql(u8, dow, "*"),
-    };
-    if (c.dow & (@as(u64, 1) << 7) != 0) c.dow |= 1; // 7 = Sunday
-    return c;
-}
-
-fn parseField(field: []const u8, min: u6, max: u6) !u64 {
-    var bits: u64 = 0;
-    var parts = std.mem.splitScalar(u8, field, ',');
-    while (parts.next()) |part| {
-        if (part.len == 0) return error.BadSchedule;
-        var rest = part;
-        var step: u6 = 1;
-        if (std.mem.indexOfScalar(u8, part, '/')) |slash| {
-            step = std.fmt.parseInt(u6, part[slash + 1 ..], 10) catch return error.BadSchedule;
-            if (step == 0) return error.BadSchedule;
-            rest = part[0..slash];
-        }
-        var start: u32 = min;
-        var end: u32 = max;
-        if (!std.mem.eql(u8, rest, "*")) {
-            if (std.mem.indexOfScalar(u8, rest, '-')) |dash| {
-                start = std.fmt.parseInt(u32, rest[0..dash], 10) catch return error.BadSchedule;
-                end = std.fmt.parseInt(u32, rest[dash + 1 ..], 10) catch return error.BadSchedule;
-            } else {
-                start = std.fmt.parseInt(u32, rest, 10) catch return error.BadSchedule;
-                end = start;
-            }
-        }
-        if (start < min or end > max or start > end) return error.BadSchedule;
-        var v = start;
-        while (v <= end) : (v += step) {
-            bits |= @as(u64, 1) << @intCast(v);
-        }
-    }
-    return bits;
-}
-
-fn nextCron(c: Cron, now: i64, off_min: i32) !i64 {
-    var t = now - @mod(now, 60) + 60;
-    const limit = now + 366 * 86400;
-    while (t <= limit) : (t += 60) {
-        if (matchCron(c, t, off_min)) return t;
-    }
-    return error.NoMatch;
-}
-
-fn matchCron(c: Cron, unix: i64, off_min: i32) bool {
-    const local = unix + @as(i64, off_min) * 60;
-    const tod = @mod(local, 86400);
-    const minute: u6 = @intCast(@divFloor(@mod(tod, 3600), 60));
-    const hour: u6 = @intCast(@divFloor(tod, 3600));
-    if (c.min & (@as(u64, 1) << minute) == 0) return false;
-    if (c.hour & (@as(u64, 1) << hour) == 0) return false;
-    const days = @divFloor(local, 86400);
-    const civil = civilFromDays(days);
-    if (c.mon & (@as(u64, 1) << @intCast(civil.month)) == 0) return false;
-
-    const dow: u6 = @intCast(@mod(days + 4, 7));
-    const dom_ok = c.dom & (@as(u64, 1) << @intCast(civil.day)) != 0;
-    const dow_ok = c.dow & (@as(u64, 1) << dow) != 0;
-    // Vixie cron: two restricted day fields are OR'd, not AND'd.
-    if (!c.dom_any and !c.dow_any) return dom_ok or dow_ok;
-    return dom_ok and dow_ok;
-}
-
-const Civil = struct { year: i32, month: u8, day: u8 };
-
-fn civilFromDays(z: i64) Civil {
-    const era = @divFloor(z + 719468, 146097);
-    const doe: i64 = z + 719468 - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    var y: i32 = @intCast(yoe + era * 400);
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d: u8 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-    const m: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    if (m <= 2) y += 1;
-    return .{ .year = y, .month = m, .day = d };
-}
-
-fn tmpDb(tmp: *testing.TmpDir, buf: []u8) !Db {
-    const path = try std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
-    var db = try Db.open(path);
-    try db.migrate();
-    return db;
-}
-
-test "interval and cron parse, including timezone" {
-    try testing.expectEqual(@as(i64, 900), (try parse("every 15m")).interval);
-    try testing.expectEqual(@as(i64, 3600), (try parse("every 1h")).interval);
-    const c = (try parse("0 7 * * *")).cron;
-    try testing.expect(c.min & 1 != 0);
-    try testing.expect(c.hour & (@as(u64, 1) << 7) != 0);
-
-    const now: i64 = 1_755_648_000; // 2026-08-20 00:00 UTC
-    const next_utc = try nextRun(try parse("0 7 * * *"), now, "UTC");
-    try testing.expectEqual(@as(i64, now + 7 * 3600), next_utc);
-
-    const next_ist = try nextRun(try parse("0 7 * * *"), now, "Asia/Kolkata");
-    try testing.expectEqual(@as(i64, now + (7 * 3600 - 330 * 60)), next_ist);
-
-    const n = try nextRun(try parse("every 30s"), now, null);
-    try testing.expectEqual(@as(i64, now + 30), n);
-}
-
 test "tick runs a due routine through agent.turn and updates next/last" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -492,7 +292,7 @@ test "tick runs a due routine through agent.turn and updates next/last" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"briefed\"}}]}"},
     };
 
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -538,41 +338,11 @@ test "tick runs a due routine through agent.turn and updates next/last" {
     try testing.expectEqualStrings("ok", q.text(2));
 }
 
-const FakeHttp = struct {
-    bodies: []const []const u8,
-    i: usize = 0,
-    seen: [8 * 1024]u8 = undefined,
-    last: ?[]const u8 = null,
-
-    fn http(self: *FakeHttp) agent.Http {
-        return .{ .ptr = self, .post_fn = post };
-    }
-
-    fn post(ptr: *anyopaque, gpa: std.mem.Allocator, req: agent.Http.Request) anyerror!agent.Http.Response {
-        const self: *FakeHttp = @ptrCast(@alignCast(ptr));
-        if (self.i >= self.bodies.len) return error.TooManyCalls;
-        const n = @min(req.body.len, self.seen.len);
-        @memcpy(self.seen[0..n], req.body[0..n]);
-        self.last = self.seen[0..n];
-        const body = try gpa.dupe(u8, self.bodies[self.i]);
-        self.i += 1;
-        return .{ .status = 200, .body = body };
-    }
-};
-
-test "two restricted day fields are OR'd, one restricted is AND'd" {
-    const now: i64 = 1_754_006_400; // 2025-08-01 00:00 UTC, a Friday
-    // 1st of the month OR Monday: today (the 1st) matches even though it is not Monday.
-    try testing.expectEqual(now + 9 * 3600, try nextRun(try parse("0 9 1 * 1"), now, "UTC"));
-    // Only the day-of-week restricted: the next Monday, three days out.
-    try testing.expectEqual(now + 3 * 86400 + 9 * 3600, try nextRun(try parse("0 9 * * 1"), now, "UTC"));
-}
-
 test "a routine whose skill vanished backs off instead of hot-looping" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     try insertRoutine(&db, "ghost", 0, .notify);
@@ -600,7 +370,7 @@ const Rig = struct {
         errdefer self.tmp.cleanup();
         self.threaded = .init(testing.allocator, .{});
         var path_buf: [128]u8 = undefined;
-        self.db = try tmpDb(&self.tmp, &path_buf);
+        self.db = try testkit.tmpDb(&self.tmp, &path_buf);
         self.fake = .{ .bodies = bodies };
         self.dir = try std.fmt.bufPrint(&self.dir_buf, ".zig-cache/tmp/{s}/skills", .{self.tmp.sub_path});
         self.a = .{
@@ -728,7 +498,7 @@ test "a notify routine is handed no tool that can mutate" {
     try tick(&rig.a, 1000);
 
     try testing.expectEqual(@as(usize, 1), rig.fake.i);
-    const sent = rig.fake.last.?;
+    const sent = rig.fake.sent();
     try testing.expect(std.mem.indexOf(u8, sent, "\"recall\"") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "\"remember\"") == null);
     try testing.expect(std.mem.indexOf(u8, sent, "\"save_skill\"") == null);

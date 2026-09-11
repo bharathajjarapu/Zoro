@@ -8,6 +8,7 @@ const telegram = @import("telegram.zig");
 const tools = @import("tools.zig");
 const scheduler = @import("scheduler.zig");
 const worker = @import("worker.zig");
+const http = @import("http.zig");
 
 const log = std.log.scoped(.zoro);
 
@@ -69,8 +70,8 @@ fn daemon(init: std.process.Init) !void {
     const token = cfg.telegram_token orelse return config.missing("ZORO_TELEGRAM_TOKEN");
     const owner_id = cfg.owner_id orelse return config.missing("ZORO_OWNER_ID");
     const chat_id = cfg.chat_id orelse return config.missing("ZORO_CHAT_ID");
-    const key = cfg.api_key orelse return config.missing("ZORO_API_KEY");
-    const model = cfg.model orelse return config.missing("ZORO_MODEL");
+    if (cfg.api_key == null) return config.missing("ZORO_API_KEY");
+    if (cfg.model == null) return config.missing("ZORO_MODEL");
 
     const diary_dir = try diaryDir(init, cfg);
 
@@ -84,40 +85,26 @@ fn daemon(init: std.process.Init) !void {
     };
     defer lock.close(init.io);
 
-    var http = agent.StdHttp.init(init.gpa, init.io);
-    defer http.deinit();
+    var client = http.StdHttp.init(init.gpa, init.io);
+    defer client.deinit();
 
     var crew: Crew = undefined;
     try crew.init(init, cfg, &db);
     defer crew.deinit();
 
-    var a: agent.Agent = .{
-        .gpa = init.gpa,
-        .io = init.io,
-        .db = &db,
-        .http = http.http(),
-        .api_key = key,
-        .base_url = cfg.base_url orelse agent.default_base_url,
-        .model = model,
-        .tools = &tools.builtins,
-        .workspace = cfg.workspace,
-        .skills_dir = cfg.skills_dir,
-        .diary_dir = diary_dir,
-        .vision_model = cfg.vision_model orelse model,
-        .fetch = http.getter(),
-        .workers = &crew.pool.state,
-        .pool = &crew.pool,
-    };
+    var a = makeAgent(init, cfg, &db, &client, diary_dir);
+    a.workers = &crew.pool.state;
+    a.pool = &crew.pool;
     var bot: telegram.Bot = .{
         .gpa = init.gpa,
         .io = init.io,
-        .http = http.http(),
+        .http = client.http(),
         .db = &db,
         .agent = &a,
         .token = token,
         .owner_id = owner_id,
         .chat_id = chat_id,
-        .fetch = http.getter(),
+        .fetch = client.getter(),
         .workspace = cfg.workspace,
     };
 
@@ -129,22 +116,9 @@ fn daemon(init: std.process.Init) !void {
 
     var sched_db = try openDb(init.io, cfg.data_dir);
     defer sched_db.close();
-    var sched_http = agent.StdHttp.init(init.gpa, init.io);
+    var sched_http = http.StdHttp.init(init.gpa, init.io);
     defer sched_http.deinit();
-    var sched_agent: agent.Agent = .{
-        .gpa = init.gpa,
-        .io = init.io,
-        .db = &sched_db,
-        .http = sched_http.http(),
-        .api_key = key,
-        .base_url = cfg.base_url orelse agent.default_base_url,
-        .model = model,
-        .tools = &tools.builtins,
-        .workspace = cfg.workspace,
-        .skills_dir = cfg.skills_dir,
-        .diary_dir = diary_dir,
-        .fetch = sched_http.getter(),
-    };
+    var sched_agent = makeAgent(init, cfg, &sched_db, &sched_http, diary_dir);
     const sched = try std.Thread.spawn(.{}, scheduler.loop, .{ &sched_agent, &stop.requested });
     defer sched.join();
 
@@ -190,15 +164,12 @@ fn cmdChat(init: std.process.Init) !void {
 /// Inspection only: WAL lets this run while the daemon holds the poller lock.
 fn cmdDiary(init: std.process.Init, args: anytype) !void {
     var s: Store = undefined;
-    try s.init(init);
+    var out = try s.open(init);
     defer s.deinit();
 
     const date = args.next();
     const now = std.Io.Timestamp.now(init.io, .real).toSeconds();
-    const dir = try diaryDir(init, s.cfg);
-    var out_buf: [4096]u8 = undefined;
-    var out = std.Io.File.stdout().writer(init.io, &out_buf);
-    try cli.printDiary(init.gpa, init.io, dir, date, now, &out.interface);
+    try cli.printDiary(init.gpa, init.io, try diaryDir(init, s.cfg), date, now, &out.interface);
 }
 
 fn cmdMemory(init: std.process.Init, args: anytype) !void {
@@ -212,32 +183,24 @@ fn cmdMemory(init: std.process.Init, args: anytype) !void {
     };
 
     var s: Store = undefined;
-    try s.init(init);
+    var out = try s.open(init);
     defer s.deinit();
 
     const now = std.Io.Timestamp.now(init.io, .real).toSeconds();
-    var out_buf: [4096]u8 = undefined;
-    var out = std.Io.File.stdout().writer(init.io, &out_buf);
     try cli.printMemory(&s.db, init.gpa, query, now, &out.interface);
 }
 
 fn cmdTasks(init: std.process.Init) !void {
     var s: Store = undefined;
-    try s.init(init);
+    var out = try s.open(init);
     defer s.deinit();
-
-    var out_buf: [4096]u8 = undefined;
-    var out = std.Io.File.stdout().writer(init.io, &out_buf);
     try cli.printTasks(&s.db, init.gpa, &out.interface);
 }
 
 fn cmdRoutines(init: std.process.Init) !void {
     var s: Store = undefined;
-    try s.init(init);
+    var out = try s.open(init);
     defer s.deinit();
-
-    var out_buf: [4096]u8 = undefined;
-    var out = std.Io.File.stdout().writer(init.io, &out_buf);
     try cli.printRoutines(&s.db, &out.interface);
 }
 
@@ -246,7 +209,7 @@ fn cmdRoutines(init: std.process.Init) !void {
 /// either, so a worker owns both or neither.
 const Crew = struct {
     dbs: [worker.max_live]Db = undefined,
-    https: [worker.max_live]agent.StdHttp = undefined,
+    https: [worker.max_live]http.StdHttp = undefined,
     open: usize = 0,
     pool: worker.Pool = undefined,
 
@@ -256,24 +219,11 @@ const Crew = struct {
         const diary_dir = try diaryDir(p, cfg);
 
         var protos: [worker.max_live]agent.Agent = undefined;
-        for (&self.dbs, &self.https, &protos) |*wdb, *http, *proto| {
+        for (&self.dbs, &self.https, &protos) |*wdb, *h, *proto| {
             wdb.* = try openDb(p.io, cfg.data_dir);
             self.open += 1;
-            http.* = agent.StdHttp.init(p.gpa, p.io);
-            proto.* = .{
-                .gpa = p.gpa,
-                .io = p.io,
-                .db = wdb,
-                .http = http.http(),
-                .api_key = cfg.api_key.?,
-                .base_url = cfg.base_url orelse agent.default_base_url,
-                .model = cfg.model.?,
-                .tools = &tools.builtins,
-                .workspace = cfg.workspace,
-                .skills_dir = cfg.skills_dir,
-                .diary_dir = diary_dir,
-                .fetch = http.getter(),
-            };
+            h.* = http.StdHttp.init(p.gpa, p.io);
+            proto.* = makeAgent(p, cfg, wdb, h, diary_dir);
         }
         self.pool = worker.Pool.init(p.gpa, db, protos);
     }
@@ -284,8 +234,8 @@ const Crew = struct {
     }
 
     fn closeOpen(self: *Crew) void {
-        for (self.dbs[0..self.open], self.https[0..self.open]) |*wdb, *http| {
-            http.deinit();
+        for (self.dbs[0..self.open], self.https[0..self.open]) |*wdb, *h| {
+            h.deinit();
             wdb.close();
         }
         self.open = 0;
@@ -293,58 +243,32 @@ const Crew = struct {
 };
 
 const Terminal = struct {
-    gpa: std.mem.Allocator,
-    cfg: config.Config,
-    db: Db,
-    diary_dir: []const u8,
-    http: agent.StdHttp,
+    store: Store,
+    http: http.StdHttp,
     crew: Crew,
     agent: agent.Agent,
 
     fn init(self: *Terminal, p: std.process.Init) !void {
-        self.gpa = p.gpa;
-        self.cfg = try config.load(p.gpa, p.io, ".env");
-        errdefer self.cfg.deinit(self.gpa);
-        self.cfg.overlay(p.environ_map);
+        try self.store.init(p);
+        errdefer self.store.deinit();
+        if (self.store.cfg.api_key == null) return config.missing("ZORO_API_KEY");
+        if (self.store.cfg.model == null) return config.missing("ZORO_MODEL");
 
-        const key = self.cfg.api_key orelse return config.missing("ZORO_API_KEY");
-        const model = self.cfg.model orelse return config.missing("ZORO_MODEL");
-
-        self.diary_dir = try diaryDir(p, self.cfg);
-        self.db = try openDb(p.io, self.cfg.data_dir);
-        errdefer self.db.close();
-        try self.db.migrate();
-
-        self.http = agent.StdHttp.init(p.gpa, p.io);
+        self.http = http.StdHttp.init(p.gpa, p.io);
         errdefer self.http.deinit();
 
-        try self.crew.init(p, self.cfg, &self.db);
+        try self.crew.init(p, self.store.cfg, &self.store.db);
         errdefer self.crew.deinit();
 
-        self.agent = .{
-            .gpa = p.gpa,
-            .io = p.io,
-            .db = &self.db,
-            .http = self.http.http(),
-            .api_key = key,
-            .base_url = self.cfg.base_url orelse agent.default_base_url,
-            .model = model,
-            .tools = &tools.builtins,
-            .workspace = self.cfg.workspace,
-            .skills_dir = self.cfg.skills_dir,
-            .diary_dir = self.diary_dir,
-            .vision_model = self.cfg.vision_model orelse model,
-            .fetch = self.http.getter(),
-            .workers = &self.crew.pool.state,
-            .pool = &self.crew.pool,
-        };
+        self.agent = makeAgent(p, self.store.cfg, &self.store.db, &self.http, try diaryDir(p, self.store.cfg));
+        self.agent.workers = &self.crew.pool.state;
+        self.agent.pool = &self.crew.pool;
     }
 
     fn deinit(self: *Terminal) void {
         self.crew.deinit();
         self.http.deinit();
-        self.db.close();
-        self.cfg.deinit(self.gpa);
+        self.store.deinit();
         self.* = undefined;
     }
 };
@@ -354,6 +278,7 @@ const Store = struct {
     gpa: std.mem.Allocator,
     cfg: config.Config,
     db: Db,
+    out_buf: [4096]u8 = undefined,
 
     fn init(self: *Store, p: std.process.Init) !void {
         self.gpa = p.gpa;
@@ -363,6 +288,14 @@ const Store = struct {
         self.db = try openDb(p.io, self.cfg.data_dir);
         errdefer self.db.close();
         try self.db.migrate();
+    }
+
+    /// The four inspection commands all want the same thing: a migrated
+    /// database and stdout. The writer borrows `out_buf`, so `self` must
+    /// outlive it — which it does, since the caller `defer`s `deinit`.
+    fn open(self: *Store, p: std.process.Init) !std.Io.File.Writer {
+        try self.init(p);
+        return std.Io.File.stdout().writer(p.io, &self.out_buf);
     }
 
     fn deinit(self: *Store) void {
@@ -376,6 +309,27 @@ const Store = struct {
 /// lives as long as every agent that borrows it.
 fn diaryDir(p: std.process.Init, cfg: config.Config) ![]const u8 {
     return std.fmt.allocPrint(p.arena.allocator(), "{s}/diary", .{cfg.data_dir});
+}
+
+/// Every agent in the process is built here, so a new field is one edit rather
+/// than four. `api_key` and `model` must already have been checked.
+fn makeAgent(p: std.process.Init, cfg: config.Config, db: *Db, client: *http.StdHttp, diary: []const u8) agent.Agent {
+    const model = cfg.model.?;
+    return .{
+        .gpa = p.gpa,
+        .io = p.io,
+        .db = db,
+        .http = client.http(),
+        .api_key = cfg.api_key.?,
+        .base_url = cfg.base_url orelse agent.default_base_url,
+        .model = model,
+        .vision_model = cfg.vision_model orelse model,
+        .tools = &tools.builtins,
+        .workspace = cfg.workspace,
+        .skills_dir = cfg.skills_dir,
+        .diary_dir = diary,
+        .fetch = client.getter(),
+    };
 }
 
 fn openDb(io: std.Io, dir: []const u8) !Db {
@@ -476,8 +430,10 @@ test {
     _ = @import("secrets.zig");
     _ = @import("tasks.zig");
     _ = @import("scheduler.zig");
+    _ = @import("cron.zig");
     _ = @import("outbox.zig");
     _ = @import("worker.zig");
+    _ = @import("http.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {

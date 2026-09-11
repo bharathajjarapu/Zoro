@@ -4,6 +4,8 @@ const Db = @import("db.zig").Db;
 const tasks = @import("tasks.zig");
 const tools = @import("tools.zig");
 const testing = std.testing;
+const testkit = @import("testkit.zig");
+const FakeHttp = testkit.FakeHttp;
 
 const log = std.log.scoped(.worker);
 
@@ -392,39 +394,6 @@ fn runCheck(ctx: *tools.Ctx, _: []const u8) anyerror![]u8 {
 
 /// One fake per slot: a worker owns its HTTP client, so nothing here is shared
 /// across threads.
-const FakeHttp = struct {
-    bodies: []const []const u8,
-    i: usize = 0,
-    seen: [16 * 1024]u8 = undefined,
-    seen_len: usize = 0,
-    /// Trips on the first call, standing in for the owner saying "stop" while
-    /// the worker is mid-round.
-    trip: ?*agent.Workers = null,
-    /// Parks the worker inside the model call so a test can observe three of
-    /// them in flight at once.
-    hold: ?*std.atomic.Value(bool) = null,
-
-    fn http(self: *FakeHttp) agent.Http {
-        return .{ .ptr = self, .post_fn = post };
-    }
-
-    fn sent(self: *FakeHttp) []const u8 {
-        return self.seen[0..self.seen_len];
-    }
-
-    fn post(ptr: *anyopaque, gpa: std.mem.Allocator, req: agent.Http.Request) anyerror!agent.Http.Response {
-        const self: *FakeHttp = @ptrCast(@alignCast(ptr));
-        self.seen_len = @min(req.body.len, self.seen.len);
-        @memcpy(self.seen[0..self.seen_len], req.body[0..self.seen_len]);
-        if (self.trip) |w| w.stop.store(true, .release);
-        if (self.hold) |h| while (h.load(.acquire)) std.atomic.spinLoopHint();
-        if (self.i >= self.bodies.len) return error.TooManyCalls;
-        const body = try gpa.dupe(u8, self.bodies[self.i]);
-        self.i += 1;
-        return .{ .status = 200, .body = body };
-    }
-};
-
 const said_done = "{\"choices\":[{\"message\":{\"content\":\"DONE\"}}]}";
 const said_failed = "{\"choices\":[{\"message\":{\"content\":\"FAILED nothing was actually sent\"}}]}";
 const said_ok = "{\"choices\":[{\"message\":{\"content\":\"finished\"}}]}";
@@ -445,7 +414,7 @@ const Rig = struct {
     fn init(self: *Rig, bodies: [max_live][]const []const u8) !void {
         self.tmp = testing.tmpDir(.{});
         self.threaded = .init(testing.allocator, .{});
-        const path = try std.fmt.bufPrintZ(&self.path, ".zig-cache/tmp/{s}/zoro.db", .{self.tmp.sub_path});
+        const path = try testkit.tmpPath(&self.tmp, &self.path, "zoro.db");
         self.main_db = try Db.open(path);
         try self.main_db.migrate();
         self.owner_fake = .{ .bodies = &.{} };

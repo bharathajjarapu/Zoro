@@ -1,6 +1,7 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const testing = std.testing;
+const testkit = @import("testkit.zig");
 
 /// Accepted risk: the raw key reaches the LLM provider once, in the message
 /// that carries it. Intake is conversational; the scrub runs after storage.
@@ -46,11 +47,6 @@ pub fn names(db: *Db, gpa: std.mem.Allocator) ![][]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-pub fn freeNames(gpa: std.mem.Allocator, list: [][]u8) void {
-    for (list) |n| gpa.free(n);
-    gpa.free(list);
-}
-
 fn scrubMessages(db: *Db, value: []const u8, name: []const u8) !void {
     var token_buf: [80]u8 = undefined;
     const token = std.fmt.bufPrint(&token_buf, "[secret:{s}]", .{name}) catch "[secret]";
@@ -93,21 +89,18 @@ fn replaceAll(gpa: std.mem.Allocator, text: []const u8, needle: []const u8, with
     return out.toOwnedSlice(gpa);
 }
 
-fn tmpPath(tmp: *testing.TmpDir, buf: []u8) ![:0]u8 {
-    return std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
-}
-
 test "the model-visible list is names only" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
     try put(&db, "weather_api_key", "sk-secret-value", "api.weather.com", 1000);
-    const list = try names(&db, testing.allocator);
-    defer freeNames(testing.allocator, list);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const list = try names(&db, arena.allocator());
     try testing.expectEqual(@as(usize, 1), list.len);
     try testing.expectEqualStrings("weather_api_key", list[0]);
 }
@@ -116,7 +109,7 @@ test "the value is attached only to its approved host" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -134,7 +127,7 @@ test "storing a secret scrubs it from the transcript" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 
@@ -156,7 +149,7 @@ test "redact strips secret values from text" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const web = @import("web.zig");
 const testing = std.testing;
+const testkit = @import("testkit.zig");
 
 pub const max_result: usize = 64 * 1024;
 const trunc_mark = "\n[truncated]";
@@ -218,10 +219,6 @@ fn bound(gpa: std.mem.Allocator, raw: []u8) ![]u8 {
     return out;
 }
 
-fn tmpPath(tmp: *testing.TmpDir, buf: []u8) ![:0]u8 {
-    return std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
-}
-
 fn echoRun(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     return try ctx.gpa.dupe(u8, args);
 }
@@ -255,7 +252,7 @@ test "invalid arguments are rejected before the tool runs" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -272,7 +269,7 @@ test "a failing tool returns an error result instead of crashing" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -290,7 +287,7 @@ test "tool output is truncated at the cap with a visible marker" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -308,7 +305,7 @@ test "unknown tool is an error result" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -333,7 +330,7 @@ test "store_secret scrubs the value and keeps the name" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -354,8 +351,9 @@ test "store_secret scrubs the value and keeps the name" {
     try testing.expect(try q.step());
     try testing.expect(std.mem.indexOf(u8, q.text(0), "sk-secret-value") == null);
 
-    const list = try secrets.names(&db, testing.allocator);
-    defer secrets.freeNames(testing.allocator, list);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const list = try secrets.names(&db, arena.allocator());
     try testing.expectEqual(@as(usize, 1), list.len);
     try testing.expectEqualStrings("weather_api_key", list[0]);
 }
@@ -382,7 +380,7 @@ test "a gated tool is invisible to the model and reachable only once approved" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
     try db.migrate();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
