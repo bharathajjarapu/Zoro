@@ -15,9 +15,7 @@ const log = std.log.scoped(.zoro);
 /// Kept in step with `build.zig.zon` by hand.
 const version = "0.0.0";
 
-/// Zig 0.16 hands us a ready gpa, arena, args and the process `Io` — files,
-/// timing and cancellation all flow through that one `Io`, which is why
-/// nothing below ever builds its own.
+/// Zig supplies process memory, arguments, and I/O.
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
         // Already reported in the owner's terms; a stack trace would only bury it.
@@ -29,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn run(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
-    _ = args.next(); // argv[0]
+    _ = args.next();
     const cmd = args.next() orelse return daemon(init);
 
     const eql = std.mem.eql;
@@ -61,17 +59,16 @@ const usage =
     \\
 ;
 
-/// Startup and shutdown for the daemon.
 fn daemon(init: std.process.Init) !void {
     var cfg = try config.load(init.gpa, init.io, ".env");
     defer cfg.deinit(init.gpa);
     cfg.overlay(init.environ_map);
 
-    const token = cfg.telegram_token orelse return config.missing("ZORO_TELEGRAM_TOKEN");
-    const owner_id = cfg.owner_id orelse return config.missing("ZORO_OWNER_ID");
-    const chat_id = cfg.chat_id orelse return config.missing("ZORO_CHAT_ID");
-    if (cfg.api_key == null) return config.missing("ZORO_API_KEY");
-    if (cfg.model == null) return config.missing("ZORO_MODEL");
+    const token = cfg.telegram_token orelse return config.missing("TELEGRAM_TOKEN");
+    const owner_id = cfg.owner_id orelse return config.missing("OWNER_ID");
+    const chat_id = cfg.chat_id orelse return config.missing("CHAT_ID");
+    if (cfg.api_key == null) return config.missing("LLM_API_KEY");
+    if (cfg.model == null) return config.missing("LLM_MODEL");
 
     const diary_dir = try diaryDir(init, cfg);
 
@@ -109,7 +106,7 @@ fn daemon(init: std.process.Init) !void {
     };
 
     bot.getMe() catch |err| {
-        log.err("telegram refused the token ({t}); check ZORO_TELEGRAM_TOKEN", .{err});
+        log.err("telegram refused the token ({t}); check TELEGRAM_TOKEN", .{err});
         return err;
     };
     stop.install();
@@ -204,9 +201,7 @@ fn cmdRoutines(init: std.process.Init) !void {
     try cli.printRoutines(&s.db, &out.interface);
 }
 
-/// Three worker slots, each with its own database connection and HTTP client:
-/// SQLite is opened NOMUTEX and `std.http.Client` is not shared across threads
-/// either, so a worker owns both or neither.
+/// Each worker owns its database and HTTP client.
 const Crew = struct {
     dbs: [worker.max_live]Db = undefined,
     https: [worker.max_live]http.StdHttp = undefined,
@@ -251,8 +246,8 @@ const Terminal = struct {
     fn init(self: *Terminal, p: std.process.Init) !void {
         try self.store.init(p);
         errdefer self.store.deinit();
-        if (self.store.cfg.api_key == null) return config.missing("ZORO_API_KEY");
-        if (self.store.cfg.model == null) return config.missing("ZORO_MODEL");
+        if (self.store.cfg.api_key == null) return config.missing("LLM_API_KEY");
+        if (self.store.cfg.model == null) return config.missing("LLM_MODEL");
 
         self.http = http.StdHttp.init(p.gpa, p.io);
         errdefer self.http.deinit();
@@ -273,7 +268,6 @@ const Terminal = struct {
     }
 };
 
-/// Database without an LLM — diary/memory inspection.
 const Store = struct {
     gpa: std.mem.Allocator,
     cfg: config.Config,
@@ -290,9 +284,7 @@ const Store = struct {
         try self.db.migrate();
     }
 
-    /// The four inspection commands all want the same thing: a migrated
-    /// database and stdout. The writer borrows `out_buf`, so `self` must
-    /// outlive it — which it does, since the caller `defer`s `deinit`.
+    /// The returned writer borrows `self.out_buf`.
     fn open(self: *Store, p: std.process.Init) !std.Io.File.Writer {
         try self.init(p);
         return std.Io.File.stdout().writer(p.io, &self.out_buf);
@@ -305,14 +297,12 @@ const Store = struct {
     }
 };
 
-/// The diary sits under the data dir. Allocated from the process arena, which
-/// lives as long as every agent that borrows it.
+/// The process arena owns the returned path.
 fn diaryDir(p: std.process.Init, cfg: config.Config) ![]const u8 {
     return std.fmt.allocPrint(p.arena.allocator(), "{s}/diary", .{cfg.data_dir});
 }
 
-/// Every agent in the process is built here, so a new field is one edit rather
-/// than four. `api_key` and `model` must already have been checked.
+/// Requires checked API key and model values.
 fn makeAgent(p: std.process.Init, cfg: config.Config, db: *Db, client: *http.StdHttp, diary: []const u8) agent.Agent {
     const model = cfg.model.?;
     return .{
@@ -345,8 +335,7 @@ fn print(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     try file.interface.flush();
 }
 
-/// Graceful shutdown. A signal handler is handed no context, so the flag has to
-/// be a global — the only one in the codebase.
+/// Signal handlers require process-global shutdown state.
 const stop = struct {
     var flag: std.atomic.Value(bool) = .init(false);
 
@@ -369,8 +358,7 @@ const stop = struct {
         return flag.load(.acquire);
     }
 
-    /// Test-only: puts the disposition back so a later interrupt still kills
-    /// the test runner.
+    /// Restores default signal behavior after tests.
     fn restoreDefault() void {
         flag.store(false, .release);
         const act: std.posix.Sigaction = .{
@@ -402,8 +390,7 @@ test "sqlite is linked with fts5 and bm25" {
     ;
     try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(db, setup, null, null, null));
 
-    // 'appointments' stems to 'appointment'. Porter is inflectional only:
-    // it does NOT match abbreviations or synonyms (vet != veterinarian).
+    // Porter handles inflections, not synonyms.
     var stmt: ?*c.sqlite3_stmt = null;
     const sql = "SELECT bm25(chunks) FROM chunks WHERE chunks MATCH 'appointments'";
     try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, sql, -1, &stmt, null));

@@ -72,9 +72,7 @@ pub fn put(db: *Db, key: []const u8, value: []const u8, source: Source, now: i64
     try db.exec("COMMIT");
 }
 
-/// A fact is indexed as "key: value" so asking for the key finds it. Anything
-/// too long for the buffer falls back to the value, which is what was indexed
-/// before this existed.
+/// Indexes both fact keys and values when bounded.
 fn indexed(buf: []u8, key: []const u8, value: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}: {s}", .{ key, value }) catch value;
 }
@@ -152,8 +150,7 @@ pub fn freeHits(gpa: std.mem.Allocator, hits: []Hit) void {
     gpa.free(hits);
 }
 
-/// BM25 over diary and fact chunks. Tokens are ANDed (precise lookup).
-/// Caller owns the slice.
+/// Precise BM25 search. Caller owns the slice.
 pub fn search(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64, limit: i64) ![]Hit {
     return searchJoin(db, gpa, query, now, limit, false);
 }
@@ -183,8 +180,7 @@ fn searchJoin(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64, limi
     defer q.finalize();
     try q.bind(1, match);
     try q.bind(2, now);
-    // ponytail: reweight the top 64 BM25 hits. Raise the cap if an owner
-    // fact that should rank in the caller's limit is getting cut.
+    // ponytail: raise 64 if relevant facts get cut before reranking.
     try q.bind(3, @max(limit, 64));
 
     var out: std.ArrayList(Hit) = .empty;
@@ -229,8 +225,7 @@ fn readHit(q: *Stmt, gpa: std.mem.Allocator, score: f64) !Hit {
     return .{ .text = text, .kind = kind, .ref = ref, .score = score };
 }
 
-/// Stores a retrieval synonym. `vet` → `veterinarian` is the load-bearing case
-/// porter stemming does not cover.
+/// Stores a retrieval synonym that stemming misses.
 pub fn putAlias(db: *Db, word: []const u8, meaning: []const u8) !void {
     var key_buf: [72]u8 = undefined;
     const key = aliasKey(&key_buf, word) orelse return error.AliasTooLong;
@@ -250,9 +245,7 @@ pub const Extracted = struct {
 
 const Fail = enum { none, summarize, facts, write, commit, delete };
 
-/// Compacts one day's messages into the diary file and index, then deletes
-/// the raw rows. `facts` are durable extracts (empty is fine). Order is
-/// load-bearing: summarize → facts → write+fsync → commit → delete.
+/// Persists summary and facts before deleting raw messages.
 pub fn compact(
     db: *Db,
     gpa: std.mem.Allocator,
@@ -393,8 +386,7 @@ fn deleteDay(db: *Db, start: i64) !void {
     _ = try q.step();
 }
 
-/// Writes a diary row and its FTS chunk in one transaction. Ticket 10 owns
-/// the file + fsync; this is the machine index.
+/// Writes a diary row and search chunk atomically.
 pub fn indexDiary(db: *Db, day: []const u8, summary: []const u8, now: i64) !void {
     try db.exec("BEGIN");
     errdefer db.exec("ROLLBACK") catch {};
@@ -853,7 +845,6 @@ test "an existing database re-indexes its facts on upgrade" {
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
 
-    // A database written the old way: the chunk holds the value alone.
     try db.exec("BEGIN;\n" ++ @embedFile("schema.sql") ++ "\nPRAGMA user_version = 1;\nCOMMIT;");
     try db.exec(
         \\INSERT INTO facts(key, value, source, created, updated) VALUES ('landlord', 'Priya', 'owner', 1, 1);

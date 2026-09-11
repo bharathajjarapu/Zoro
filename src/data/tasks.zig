@@ -3,8 +3,7 @@ const Db = @import("db.zig").Db;
 const testing = std.testing;
 const testkit = @import("../testing/testkit.zig");
 
-/// Attempts per task: one try plus one retry, matching the delegation limit in
-/// docs/ARCHITECTURE.md. This is the only retry policy in the codebase.
+/// One initial attempt and one retry.
 pub const max_tries: i64 = 2;
 pub const approval_ttl: i64 = 15 * 60;
 
@@ -132,9 +131,7 @@ pub fn setStatus(db: *Db, id: i64, next: Status) !void {
 
 /// Records a failure. Mutating work never retries. Transient work backs off until `max_tries`.
 pub fn fail(db: *Db, id: i64, err_text: []const u8, kind: Kind, now: i64) !void {
-    // Closed before the write below: an open read cursor keeps this connection's
-    // read transaction alive, and two workers upgrading at once then deadlock
-    // instead of waiting out busy_timeout.
+    // Close the read cursor before upgrading to a write transaction.
     const tries = blk: {
         var q = try db.prepare("SELECT tries FROM tasks WHERE id = ?");
         defer q.finalize();
@@ -259,8 +256,7 @@ pub fn setApproval(db: *Db, id: i64, status: []const u8) !void {
     _ = try q.step();
 }
 
-/// One line per pending approval, oldest first, for the system prompt. Empty
-/// when nothing is waiting. Caller frees.
+/// Formats pending approvals oldest first. Caller frees.
 pub fn pendingLines(db: *Db, gpa: std.mem.Allocator) ![]u8 {
     var q = try db.prepare("SELECT id, tool, reason FROM approvals WHERE status = 'pending' ORDER BY id");
     defer q.finalize();

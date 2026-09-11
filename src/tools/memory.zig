@@ -17,8 +17,7 @@ const alias = [_]Param{
     .{ .name = "meaning", .description = "what it stands for, e.g. veterinarian" },
 };
 
-/// Stemming reduces inflections but never expands an abbreviation, so this is
-/// the only thing that makes "the vet" recall "veterinarian".
+/// Adds retrieval synonyms that stemming cannot infer.
 pub const remember_alias: Def = .{
     .name = "remember_alias",
     .description = "Record that a word the owner uses means something else, so searching either finds both.",

@@ -1,5 +1,3 @@
-# Build stage: fetch a pinned Zig, compile the one binary. Nothing from here
-# reaches the image except zoro itself.
 FROM debian:trixie-slim AS build
 
 ARG ZIG_VERSION=0.16.0
@@ -19,10 +17,9 @@ RUN curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x8
 COPY build.zig build.zig.zon ./
 COPY vendor ./vendor
 COPY src ./src
-# musl gives a static binary, so the runtime image needs no toolchain at all.
+# Build a static runtime binary.
 RUN /opt/zig/zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl
 
-# Runtime stage: a CA bundle, a non-root user, and the binary. Nothing else.
 FROM debian:trixie-slim
 
 RUN apt-get update \
@@ -31,7 +28,7 @@ RUN apt-get update \
  && useradd --system --uid 10001 --create-home --home-dir /home/zoro zoro \
  && mkdir -p /data /skills /workspace \
  && chown zoro:zoro /data /skills /workspace \
- # No package manager at runtime: the agent must never install anything.
+ # Prevent runtime package installation.
  && rm -rf /usr/bin/apt /usr/bin/apt-get /usr/bin/apt-cache /usr/bin/apt-config \
            /usr/bin/apt-key /usr/bin/apt-mark /usr/bin/dpkg /usr/bin/dpkg-deb \
            /usr/bin/dpkg-query /usr/bin/dpkg-split /usr/bin/dpkg-trigger \

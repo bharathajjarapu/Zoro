@@ -34,19 +34,19 @@ file, so secrets can stay out of it entirely.
 
 | Key | Required | Meaning |
 |---|---|---|
-| `ZORO_API_KEY` | yes | Key for the OpenAI-compatible endpoint |
-| `ZORO_MODEL` | yes | Model name, e.g. `gpt-4.1-mini` |
-| `ZORO_TELEGRAM_TOKEN` | daemon only | Bot token from BotFather |
-| `ZORO_OWNER_ID` | daemon only | Your numeric Telegram user id |
-| `ZORO_CHAT_ID` | daemon only | The private chat id to serve |
-| `ZORO_BASE_URL` | no | Defaults to `https://api.openai.com/v1` |
-| `ZORO_VISION_MODEL` | no | Profile used when you send a picture; defaults to `ZORO_MODEL` |
+| `LLM_API_KEY` | yes | Key for the OpenAI-compatible endpoint |
+| `LLM_MODEL` | yes | Model name, e.g. `gpt-4.1-mini` |
+| `TELEGRAM_TOKEN` | daemon only | Bot token from BotFather |
+| `OWNER_ID` | daemon only | Your numeric Telegram user id |
+| `CHAT_ID` | daemon only | The private chat id to serve |
+| `LLM_BASE_URL` | no | Defaults to `https://api.openai.com/v1` |
+| `LLM_VISION_MODEL` | no | Profile used when you send a picture; defaults to `LLM_MODEL` |
 | `ZORO_DATA_DIR` | no | Database, diary and lock file. Default `data` |
 | `ZORO_SKILLS_DIR` | no | Where `SKILL.md` files live. Default `skills` |
 | `ZORO_WORKSPACE` | no | The only directory files may be read from or attached. Default `workspace` |
 
-An unrecognised `ZORO_*` key is logged as a warning rather than ignored, because
-a typo in a token name is otherwise silent.
+An unrecognised `ZORO_*` or `LLM_*` key is logged as a warning rather than
+ignored, because a typo in a token name is otherwise silent.
 
 ## First run
 

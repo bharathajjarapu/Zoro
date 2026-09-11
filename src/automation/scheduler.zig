@@ -15,8 +15,7 @@ const log = std.log.scoped(.scheduler);
 
 pub const tick_every: u64 = 30;
 
-/// A run further behind than this was missed while the process was down, not
-/// merely delayed by a slow tick.
+/// Runs older than this are missed, not delayed.
 pub const missed_after: i64 = 5 * 60;
 
 pub fn tick(a: *agent.Agent, now: i64) !void {
@@ -25,9 +24,7 @@ pub fn tick(a: *agent.Agent, now: i64) !void {
     try compact(a, now);
 }
 
-/// Yesterday's transcript becomes yesterday's diary, once. The scheduler owns
-/// the only clock in the process, so this is where nightly work belongs.
-/// A failure leaves the raw messages and the marker alone, so it retries.
+/// Failures preserve messages and retry later.
 fn compact(a: *agent.Agent, now: i64) !void {
     var day_buf: [10]u8 = undefined;
     const day = memory.formatDay(&day_buf, now - 86_400);
@@ -40,7 +37,7 @@ fn compact(a: *agent.Agent, now: i64) !void {
     try mark(a.db, day);
 }
 
-/// A single high-water mark: days only move forward, so one row is enough.
+/// One high-water mark covers ordered days.
 fn compacted(db: *Db, day: []const u8) !bool {
     var q = try db.prepare("SELECT value FROM kv WHERE key = 'compacted'");
     defer q.finalize();
@@ -101,7 +98,7 @@ fn hasRoutine(db: *Db, name: []const u8) !bool {
     return try q.step();
 }
 
-/// A read-only routine is active on sight; one that can act starts off.
+/// Mutating routines start disabled.
 fn insertRoutine(db: *Db, name: []const u8, next: i64, tier: skills.Authority) !void {
     var q = try db.prepare(
         \\INSERT INTO routines(name, next, last, status, fails, enabled)
@@ -114,10 +111,7 @@ fn insertRoutine(db: *Db, name: []const u8, next: i64, tier: skills.Authority) !
     _ = try q.step();
 }
 
-/// The tier lives on disk and the agent can rewrite its own SKILL.md, so this
-/// re-checks every tick against the owner's approvals rather than against
-/// whatever the row said last time. Rewriting `notify` to `safe` therefore
-/// switches the routine back off instead of granting it authority.
+/// Rechecks disk authority each tick before enabling mutations.
 fn gate(db: *Db, gpa: std.mem.Allocator, name: []const u8, why: []const u8, tier: skills.Authority, now: i64) !void {
     if (tier.readOnly()) return;
     if (try hasApproval(db, "enable_routine", name, "approved")) return;
@@ -153,9 +147,7 @@ fn hasApproval(db: *Db, tool: []const u8, target: []const u8, status: []const u8
     return try q.step();
 }
 
-/// The approval binds to these exact bytes, so the name has to be the same
-/// restricted alphabet `skills.validName` already enforces — no escaping needed,
-/// and nothing else can reach here.
+/// Valid names are safe inside the bound approval JSON.
 fn nameArgs(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
     if (!skills.validName(name)) return error.BadName;
     return std.fmt.allocPrint(gpa, "{{\"name\":\"{s}\"}}", .{name});
@@ -181,8 +173,7 @@ fn fire(a: *agent.Agent, now: i64) !void {
     for (names.items) |name| {
         runOne(a, name, now) catch |err| {
             log.err("{s}: {t}", .{ name, err });
-            // A routine whose skill will not even load backs off an hour so it
-            // cannot hot-loop the tick.
+            // Back off broken skills to avoid a hot loop.
             try record(a.db, name, now, now + 3600, "failed");
         };
     }
@@ -201,8 +192,7 @@ fn runOne(a: *agent.Agent, name: []const u8, now: i64) !void {
     const state = try stateOf(a.db, name);
 
     if (tier == .critical and !state.approved) {
-        // Downtime must never turn into an unattended action, so a critical run
-        // that came due while we were off is dropped rather than queued.
+        // Never replay critical work after downtime.
         if (now - state.due > missed_after) return skip(a, name, now, next);
         return askFirst(a, name, skill.description, now, next);
     }
@@ -225,8 +215,7 @@ fn execute(a: *agent.Agent, name: []const u8, skill: skills.Skill, tier: skills.
     const prompt = try std.fmt.allocPrint(a.gpa, "Run routine {s}.\n\n{s}", .{ name, skill.body });
     defer a.gpa.free(prompt);
 
-    // The scheduler owns this agent on its own thread, so swapping the tool
-    // list for one turn is safe and costs nothing.
+    // This thread exclusively owns the agent.
     const full = a.tools;
     a.tools = list;
     defer a.tools = full;
@@ -241,8 +230,7 @@ fn execute(a: *agent.Agent, name: []const u8, skill: skills.Skill, tier: skills.
     }
 }
 
-/// Asks once per firing, not once per tick, and never twice while the owner
-/// still has the first question open.
+/// Keeps one pending approval per firing.
 fn askFirst(a: *agent.Agent, name: []const u8, why: []const u8, now: i64, next: i64) !void {
     if (try hasApproval(a.db, "run_routine", name, "pending")) {
         return record(a.db, name, now, next, "awaiting-approval");
@@ -267,7 +255,7 @@ fn skip(a: *agent.Agent, name: []const u8, now: i64, next: i64) !void {
     try record(a.db, name, now, next, "skipped");
 }
 
-/// The one place a run's outcome lands, so `next` always moves forward.
+/// Records outcomes and advances `next` together.
 fn record(db: *Db, name: []const u8, now: i64, next: i64, status: []const u8) !void {
     var q = try db.prepare(
         \\UPDATE routines SET last = ?, next = ?, status = ?, fails = fails + ?, skips = skips + ?
@@ -323,7 +311,7 @@ test "tick runs a due routine through agent.turn and updates next/last" {
     };
 
     const now: i64 = 1_000;
-    try tick(&a, now); // sync; next is now+3600, not due yet
+    try tick(&a, now);
     try testing.expectEqual(@as(usize, 0), fake.i);
 
     try db.exec("UPDATE routines SET next = 500 WHERE name = 'morning-brief'");
@@ -355,7 +343,6 @@ test "a routine whose skill vanished backs off instead of hot-looping" {
     try testing.expectEqualStrings("failed", q.text(1));
 }
 
-/// Builds a scheduler-driven agent over a temp DB and a skills dir on disk.
 const Rig = struct {
     tmp: testing.TmpDir,
     threaded: std.Io.Threaded,
@@ -407,7 +394,6 @@ const Rig = struct {
         return std.fmt.bufPrint(buf, "{s}", .{q.text(0)});
     }
 
-    /// Stands in for the owner saying yes to the pending approval.
     fn approve(self: *Rig, tool: []const u8, name: []const u8) !void {
         var q = try self.db.prepare("UPDATE approvals SET status = 'approved' WHERE tool = ? AND target = ?");
         defer q.finalize();
@@ -457,10 +443,9 @@ test "a mutating routine stays off until the owner approves it" {
     const before = try rig.routine("payer");
     try testing.expectEqual(@as(i64, 0), before.enabled);
 
-    // One pending approval, and re-syncing does not file a second.
     try tick(&rig.a, 1001);
     try testing.expectEqual(@as(usize, 1), try tasks.pendingCount(&rig.db));
-    try testing.expectEqual(@as(usize, 0), rig.fake.i); // never ran
+    try testing.expectEqual(@as(usize, 0), rig.fake.i);
 }
 
 test "rewriting notify to critical switches the routine back off" {
@@ -471,7 +456,6 @@ test "rewriting notify to critical switches the routine back off" {
     try tick(&rig.a, 1000);
     try testing.expectEqual(@as(i64, 1), (try rig.routine("brief")).enabled);
 
-    // The agent rewrites its own SKILL.md to claim a higher tier.
     try rig.write(
         \\---
         \\name: brief
@@ -513,13 +497,11 @@ test "a critical routine asks first and only runs once approved" {
     try rig.approve("enable_routine", "payer");
     try rig.db.exec("UPDATE routines SET enabled = 1, next = 900 WHERE name = 'payer'");
 
-    // Due and inside the grace window: it asks instead of acting.
     var buf: [32]u8 = undefined;
     try tick(&rig.a, 1000);
     try testing.expectEqual(@as(usize, 0), rig.fake.i);
     try testing.expectEqualStrings("awaiting-approval", try rig.status("payer", &buf));
 
-    // The owner approves this exact firing.
     try rig.db.exec("UPDATE routines SET next = 0, status = 'approved' WHERE name = 'payer'");
     try tick(&rig.a, 1100);
     try testing.expectEqual(@as(usize, 1), rig.fake.i);
@@ -534,13 +516,12 @@ test "a day of downtime is one catch-up run, and a missed critical is skipped" {
     try rig.write(critical_skill);
 
     const now: i64 = 2_000_000;
-    try tick(&rig.a, now - 86400); // discovers both, schedules an hour out
+    try tick(&rig.a, now - 86400);
     try rig.approve("enable_routine", "payer");
     try rig.db.exec("UPDATE routines SET enabled = 1");
 
-    // The clock is injected: a day passes with the process down.
     try tick(&rig.a, now);
-    try testing.expectEqual(@as(usize, 1), rig.fake.i); // exactly one, not 24
+    try testing.expectEqual(@as(usize, 1), rig.fake.i);
 
     const brief = try rig.routine("brief");
     try testing.expect(brief.next > now);
@@ -550,7 +531,6 @@ test "a day of downtime is one catch-up run, and a missed critical is skipped" {
     try testing.expectEqual(@as(i64, 1), payer.skips);
     try testing.expect(payer.next > now);
 
-    // A second tick with nothing due adds no further runs.
     try tick(&rig.a, now + 1);
     try testing.expectEqual(@as(usize, 1), rig.fake.i);
 }
@@ -582,7 +562,6 @@ test "yesterday is compacted once, and the diary the owner can read appears" {
     var dir_buf: [128]u8 = undefined;
     rig.a.diary_dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}/diary", .{rig.tmp.sub_path});
 
-    // 2026-08-21 00:00 UTC, so "yesterday" is 2026-08-20.
     const today: i64 = 1_787_270_400;
     const yesterday = today - 86_400;
     var ins = try rig.db.prepare("INSERT INTO messages(role, content, created) VALUES ('user', 'walked the dog', ?)");
@@ -596,13 +575,11 @@ test "yesterday is compacted once, and the diary the owner can read appears" {
     defer testing.allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "walked the dog") != null);
 
-    // The raw rows are gone only after the diary committed.
     var q = try rig.db.prepare("SELECT count(*) FROM messages");
     defer q.finalize();
     try testing.expect(try q.step());
     try testing.expectEqual(@as(i64, 0), q.int(0));
 
-    // A second tick is a no-op rather than a rewrite.
     try ins.reset();
     try ins.bind(1, yesterday + 7200);
     _ = try ins.step();

@@ -4,8 +4,7 @@ const testing = std.testing;
 
 const log = std.log.scoped(.db);
 
-/// Ordered schema steps. Applying steps `n..` upgrades a database at
-/// `user_version = n`. Append a file; never edit one that has shipped.
+/// Append migrations; never edit shipped steps.
 const steps = [_][:0]const u8{
     @embedFile("schema.sql"),
     @embedFile("migrations/002.sql"),
@@ -16,8 +15,7 @@ const steps = [_][:0]const u8{
 pub const Db = struct {
     ptr: *c.sqlite3,
 
-    /// Opens (creating if absent) the database at `path` with WAL and foreign
-    /// keys on. Caller owns the handle and must `close()` it.
+    /// Opens a configured database. Caller must close it.
     pub fn open(path: [:0]const u8) !Db {
         _ = c.sqlite3_initialize(); // SQLITE_OMIT_AUTOINIT: nobody else does it
 
@@ -42,9 +40,7 @@ pub const Db = struct {
             \\PRAGMA busy_timeout = 5000;
         );
 
-        // journal_mode reports the mode it settled on instead of failing, so a
-        // filesystem without mmap (9p, NFS, CIFS) leaves us in DELETE silently.
-        // Degraded still works for one process; it is concurrency that breaks.
+        // SQLite silently falls back when the filesystem cannot support WAL.
         var mode = try db.prepare("PRAGMA journal_mode");
         defer mode.finalize();
         if (try mode.step() and !std.mem.eql(u8, mode.text(0), "wal")) {
@@ -53,8 +49,7 @@ pub const Db = struct {
         return db;
     }
 
-    /// A non-OK close means a statement was never finalized, which leaks the
-    /// connection. Loud in tests is the whole point.
+    /// Logs leaked statements reported during close.
     pub fn close(self: *Db) void {
         if (c.sqlite3_close(self.ptr) != c.SQLITE_OK) {
             log.err("close: {s}", .{c.sqlite3_errmsg(self.ptr)});
@@ -62,7 +57,6 @@ pub const Db = struct {
         self.* = undefined;
     }
 
-    /// Runs one or more statements, discarding any rows.
     pub fn exec(self: *Db, sql: [:0]const u8) !void {
         if (c.sqlite3_exec(self.ptr, sql.ptr, null, null, null) != c.SQLITE_OK) {
             log.err("exec: {s}", .{c.sqlite3_errmsg(self.ptr)});
@@ -70,16 +64,13 @@ pub const Db = struct {
         }
     }
 
-    /// Brings the database up to the current schema version. Idempotent: the
-    /// version gate makes a second call a no-op, and the transaction means a
-    /// failed run leaves nothing behind.
+    /// Applies pending migrations atomically.
     pub fn migrate(self: *Db) !void {
         const done = blk: {
             var q = try self.prepare("PRAGMA user_version");
             defer q.finalize();
             if (!try q.step()) return error.Sqlite;
-            // user_version is a signed 32-bit field anyone can set; clamp rather
-            // than trap on a value we did not write.
+            // Clamp externally editable user_version values.
             break :blk @as(usize, @intCast(@max(0, q.int(0))));
         };
         if (done >= steps.len) return;
@@ -110,8 +101,7 @@ pub const Db = struct {
     }
 };
 
-/// A compiled statement. Column slices point into SQLite's own memory and stay
-/// valid only until the next `step`, `reset` or `finalize`.
+/// Column slices expire on step, reset, or finalize.
 pub const Stmt = struct {
     ptr: *c.sqlite3_stmt,
     db: *c.sqlite3,
@@ -121,9 +111,7 @@ pub const Stmt = struct {
         self.* = undefined;
     }
 
-    /// Binds parameter `i` (1-based). Text is copied by SQLite, so the caller's
-    /// slice need not outlive the call. Accepts integers, floats, `[]const u8`,
-    /// `null` and optionals of those.
+    /// Binds a 1-based parameter; SQLite copies text.
     pub fn bind(self: *Stmt, i: c_int, val: anytype) !void {
         const rc = switch (@typeInfo(@TypeOf(val))) {
             .null => c.sqlite3_bind_null(self.ptr, i),
@@ -177,8 +165,7 @@ pub const Stmt = struct {
         return c.sqlite3_column_type(self.ptr, col) == c.SQLITE_NULL;
     }
 
-    /// Returns "" for a NULL column, so it cannot tell NULL from an empty
-    /// string. Use `isNull` when that distinction matters.
+    /// Returns "" for NULL; use `isNull` to distinguish it.
     pub fn text(self: *Stmt, col: c_int) []const u8 {
         const ptr = c.sqlite3_column_text(self.ptr, col) orelse return "";
         const len: usize = @intCast(c.sqlite3_column_bytes(self.ptr, col));

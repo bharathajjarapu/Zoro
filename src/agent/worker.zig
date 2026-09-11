@@ -24,18 +24,15 @@ const verify_prompt =
     \\missing. Nothing else.
 ;
 
-/// Marks a task as already being someone's second attempt, so a failure
-/// reports instead of spawning a third.
+/// Marks a task's final allowed attempt.
 const follow_mark = "follow-up: ";
 
 const Slot = struct {
-    /// Its own agent, and through it its own HTTP client and database
-    /// connection: SQLite is opened NOMUTEX, so a connection has one thread.
+    /// Owns its agent, database, and HTTP client.
     proto: agent.Agent,
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
-    /// Chained to the pool's flag, so one task can be called off without
-    /// stopping the other two.
+    /// Chains task and pool cancellation.
     cancel: agent.Workers = .{},
     task: i64 = 0,
     summary: []u8 = &.{},
@@ -58,8 +55,7 @@ pub const Pool = struct {
     db: *Db,
     state: agent.Workers = .{},
     slots: [max_live]Slot,
-    /// Every subagent hangs off one row so `zoro tasks` shows a tree rather
-    /// than a flat list. Created on first spawn, one per process.
+    /// Root row for this process's task tree.
     root_id: i64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, db: *Db, protos: [max_live]agent.Agent) Pool {
@@ -68,14 +64,13 @@ pub const Pool = struct {
         return p;
     }
 
-    /// Waits for every worker. Cancels first so a long run cannot hold shutdown.
+    /// Cancels and joins every worker.
     pub fn deinit(self: *Pool) void {
         self.state.stop.store(true, .release);
         self.join();
         self.* = undefined;
     }
 
-    /// Waits for every running worker without cancelling it.
     pub fn join(self: *Pool) void {
         for (&self.slots) |*slot| {
             if (slot.thread) |t| t.join();
@@ -88,7 +83,6 @@ pub const Pool = struct {
         return self.state.count();
     }
 
-    /// Calls off one running task and leaves the rest alone.
     pub fn cancel(self: *Pool, id: i64) bool {
         for (&self.slots) |*slot| {
             if (slot.thread == null or slot.task != id) continue;
@@ -98,11 +92,10 @@ pub const Pool = struct {
         return false;
     }
 
-    /// Files the task row and starts it if a slot is free. A task that has to
-    /// wait stays `queued`; `pump` starts it when one frees up.
+    /// Queues work and starts it when a slot is free.
     pub fn spawn(self: *Pool, summary: []const u8, goal: []const u8, allowed: ?[]const u8, now: i64) !i64 {
         const parent = try self.rootTask(now);
-        try self.pump(now); // whatever queued earlier goes first
+        try self.pump(now);
         const id = try tasks.create(self.db, summary, goal, now, parent, 0);
         self.start(id, summary, goal, allowed) catch |err| switch (err) {
             error.Busy => {},
@@ -111,8 +104,7 @@ pub const Pool = struct {
         return id;
     }
 
-    /// Starts queued children into whatever slots are free. Cheap enough to
-    /// call whenever the primary asks how its subagents are doing.
+    /// Starts queued work in free slots.
     pub fn pump(self: *Pool, now: i64) !void {
         if (self.root_id == 0) return;
         var q = try self.db.prepare(
@@ -137,13 +129,10 @@ pub const Pool = struct {
         return self.root_id;
     }
 
-    /// Only ever called from the thread that owns the pool — the primary's tool
-    /// loop — so slot bookkeeping needs no lock. What crosses threads is the
-    /// atomic pair `state.live` and `slot.done`.
+    /// The primary thread alone updates slots.
     fn start(self: *Pool, id: i64, summary: []const u8, goal: []const u8, allowed: ?[]const u8) !void {
         const i = try self.freeSlot();
-        // A "stop" that cancelled the last batch must not cancel every batch
-        // after it. Nothing is in flight to protect, so clear it.
+        // Clear cancellation after the stopped batch exits.
         if (self.state.count() == 0) self.state.stop.store(false, .release);
         const slot = &self.slots[i];
         slot.summary = try self.gpa.dupe(u8, summary);
@@ -153,7 +142,7 @@ pub const Pool = struct {
         slot.task = id;
         slot.done.store(false, .release);
         slot.cancel.stop.store(false, .release);
-        // Chained here rather than at init, where the pool is still a local.
+        // Pool state has a stable address only after initialization.
         slot.cancel.parent = &self.state;
 
         try tasks.setStatus(self.db, id, .running);
@@ -164,7 +153,7 @@ pub const Pool = struct {
         };
     }
 
-    /// A finished thread still has to be joined before its slot is reusable.
+    /// Joins a finished thread before reuse.
     fn freeSlot(self: *Pool) !usize {
         for (&self.slots, 0..) |*slot, i| {
             if (slot.thread == null) return i;
@@ -187,18 +176,13 @@ fn work(self: *Pool, i: usize) void {
     const db = slot.proto.db;
     const now = std.Io.Timestamp.now(slot.proto.io, .real).toSeconds();
 
-    // No allowlist means read-only: the default subagent is a researcher, and
-    // anything that can act has to be named. A subagent never gets `delegate`
-    // either, so fan-out cannot escape its bound, and there is no Telegram tool
-    // for it to be denied.
+    // Empty allowlists keep subagents read-only and prevent nested delegation.
     const list = tools.subset(self.gpa, slot.proto.tools, slot.allowed == null, slot.allowed) catch |err| {
         return giveUp(db, slot.task, @errorName(err));
     };
     defer self.gpa.free(list);
 
-    // A goal that can act is never retried automatically: its tool may already
-    // have run, and a second attempt would send the message twice. Transient
-    // work is re-queued with backoff and restarted by `pump`.
+    // Never retry work that may have caused an external action.
     const kind: tasks.Kind = if (consequential(slot.goal)) .mutating else .transient;
 
     const reply = slot.proto.isolated(slot.goal, .{
@@ -214,8 +198,7 @@ fn work(self: *Pool, i: usize) void {
     };
     defer self.gpa.free(reply);
 
-    // The verification call can be cancelled or fail too; either way the row
-    // must not be left sitting in `running`.
+    // Verification failure must still leave a terminal task state.
     finish(self, slot, reply, now) catch |err| {
         if (err == error.Cancelled) return markCancelled(db, slot.task);
         log.err("{s}: {t}", .{ slot.summary, err });
@@ -223,8 +206,7 @@ fn work(self: *Pool, i: usize) void {
     };
 }
 
-/// Consequential work is checked; bounded research is taken at its word. The
-/// primary therefore never reports success for something that did not verify.
+/// Checks consequential work before reporting success.
 fn finish(self: *Pool, slot: *Slot, reply: []const u8, now: i64) !void {
     const db = slot.proto.db;
     if (!consequential(slot.goal)) return store(self.gpa, db, slot.task, .done, "unverified (bounded research)", reply);
@@ -239,10 +221,7 @@ fn finish(self: *Pool, slot: *Slot, reply: []const u8, now: i64) !void {
     try followUp(self, slot, trimmed, now);
 }
 
-/// ponytail: the checker reads the worker's own report and no independent
-/// evidence, so it catches a worker that gave up or half-finished, not one that
-/// fabricates. Hand it the same tool allowlist when a wrong answer is worth a
-/// second round of tool calls.
+/// ponytail: checker trusts reports; add evidence when wrong answers matter.
 fn check(self: *Pool, slot: *Slot, reply: []const u8) ![]u8 {
     const question = try std.fmt.allocPrint(self.gpa, "goal:\n{s}\n\nreported result:\n{s}", .{ slot.goal, reply });
     defer self.gpa.free(question);
@@ -254,8 +233,7 @@ fn check(self: *Pool, slot: *Slot, reply: []const u8) ![]u8 {
     });
 }
 
-/// One follow-up per failure, never a chain: a follow-up that fails is reported
-/// to the primary instead of spawning a third attempt.
+/// Allows one follow-up, never a retry chain.
 fn followUp(self: *Pool, slot: *Slot, why: []const u8, now: i64) !void {
     if (std.mem.startsWith(u8, slot.summary, follow_mark)) return;
     const summary = try std.fmt.allocPrint(self.gpa, "{s}{s}", .{ follow_mark, slot.summary });
@@ -265,8 +243,7 @@ fn followUp(self: *Pool, slot: *Slot, why: []const u8, now: i64) !void {
     _ = try tasks.create(slot.proto.db, summary, goal, now, self.root_id, 1);
 }
 
-/// Verification costs a model call, so it is spent only where being wrong has
-/// consequences outside this process.
+/// Detects goals with external consequences.
 fn consequential(goal: []const u8) bool {
     const acts = [_][]const u8{
         "send",   "email",  "post",     "message", "reply",  "buy",
@@ -312,7 +289,6 @@ fn markCancelled(db: *Db, id: i64) void {
     setResult(db, id, "cancelled by the owner") catch {};
 }
 
-/// The worker has already used its one retry, so this is terminal.
 fn giveUp(db: *Db, id: i64, why: []const u8) void {
     tasks.setStatus(db, id, .failed) catch {};
     setResult(db, id, why) catch {};
@@ -345,8 +321,7 @@ pub const check_tasks: tools.Def = .{
     .name = "check_tasks",
     .description = "Report every delegated task with its status and result. Synthesize these yourself; the owner never sees them.",
     .params = &.{},
-    // Primary-only: a subagent reading its siblings' goals is the parent's
-    // context leaking back in by another route.
+    // Sibling goals belong only in the primary context.
     .primary_only = true,
     .run = runCheck,
 };
@@ -392,14 +367,12 @@ fn runCheck(ctx: *tools.Ctx, _: []const u8) anyerror![]u8 {
     return tasks.formatList(ctx.gpa, items);
 }
 
-/// One fake per slot: a worker owns its HTTP client, so nothing here is shared
-/// across threads.
+/// One fake HTTP client per worker slot.
 const said_done = "{\"choices\":[{\"message\":{\"content\":\"DONE\"}}]}";
 const said_failed = "{\"choices\":[{\"message\":{\"content\":\"FAILED nothing was actually sent\"}}]}";
 const said_ok = "{\"choices\":[{\"message\":{\"content\":\"finished\"}}]}";
 
-/// A pool over one temp database, with a private connection and fake model per
-/// slot — the same shape as production, where each worker owns both.
+/// Mirrors production worker ownership in tests.
 const Rig = struct {
     tmp: testing.TmpDir,
     threaded: std.Io.Threaded,
@@ -494,7 +467,6 @@ test "at most three subagents run at once; the fourth waits its turn" {
     }
     try testing.expectEqual(max_live, rig.pool.live());
 
-    // All three slots are parked inside their model call, so the fourth cannot start.
     const fourth = try rig.pool.spawn("job3", "Summarize the news.", null, 100);
     try testing.expectEqualStrings("queued", try rig.statusOf(fourth));
 
@@ -502,7 +474,6 @@ test "at most three subagents run at once; the fourth waits its turn" {
     rig.pool.join();
     try testing.expectEqual(@as(usize, 0), rig.pool.live());
 
-    // Once a slot frees, pump picks the waiting task up.
     for (&rig.fakes) |*f| f.i = 0;
     try rig.pool.pump(100);
     rig.pool.join();
@@ -539,8 +510,6 @@ test "stop halts a subagent between rounds and the task lands cancelled" {
     var rig: Rig = undefined;
     try rig.init(.{ &.{ called_recall, said_ok }, &.{}, &.{} });
     defer rig.deinit();
-    // The flag is raised during the first model call, so the worker is genuinely
-    // in flight rather than cancelled before it started.
     rig.fakes[0].trip = &rig.pool.state;
 
     const id = try rig.pool.spawn("slow", "Summarize the news.", null, 100);
@@ -556,11 +525,9 @@ test "stop halts a subagent between rounds and the task lands cancelled" {
 
 test "bounded research is taken at its word; a consequential goal is checked" {
     var rig: Rig = undefined;
-    // Slot 0 answers once (research). Slot 1 answers, then answers the check.
     try rig.init(.{ &.{said_ok}, &.{ said_ok, said_done }, &.{} });
     defer rig.deinit();
 
-    // Parked until both are placed, so each lands in a known slot.
     var held: std.atomic.Value(bool) = .init(true);
     rig.fakes[0].hold = &held;
     rig.fakes[1].hold = &held;
@@ -597,7 +564,6 @@ test "a subagent that fails its criterion spawns a follow-up, not a false succes
     }
     try testing.expect(follow != null);
 
-    // The follow-up hangs off the same root, and its own failure would not chain.
     var f = (try tasks.get(&rig.main_db, testing.allocator, follow.?)).?;
     defer f.deinit(testing.allocator);
     try testing.expectEqual(rig.pool.root_id, f.parent.?);
@@ -611,7 +577,6 @@ test "consequential goals are told apart from bounded research" {
     try testing.expect(consequential("Set up a routine for the morning brief."));
     try testing.expect(!consequential("Summarize the tide table for Chennai."));
     try testing.expect(!consequential("Compare the three phone plans."));
-    // "sender" and "booking.com" are not the verbs we are looking for.
     try testing.expect(!consequential("Find the sender of that newsletter."));
 }
 
@@ -628,7 +593,6 @@ test "the owner is answered while subagents keep running, and stop cancels them"
         _ = try rig.pool.spawn(try std.fmt.bufPrint(&buf, "job{d}", .{i}), "Summarize the news.", null, 100);
     }
 
-    // Three workers are parked mid-call and the owner still gets a reply.
     const answer = try rig.primary.turn("what is the weather");
     defer testing.allocator.free(answer);
     try testing.expectEqualStrings("finished", answer);
@@ -666,7 +630,6 @@ test "one task is called off without touching the other two" {
 
 test "a stop does not cancel every delegation that follows it" {
     var rig: Rig = undefined;
-    // Slot 0 serves the cancelled run and then the one after it.
     try rig.init(.{ &.{ called_recall, said_ok }, &.{said_ok}, &.{said_ok} });
     defer rig.deinit();
     rig.owner_fake.bodies = &.{};
@@ -675,7 +638,6 @@ test "a stop does not cancel every delegation that follows it" {
     rig.fakes[0].hold = &held;
     const doomed = try rig.pool.spawn("job0", "Summarize the news.", null, 100);
 
-    // The owner says stop while that one is parked inside its model call.
     const stopped = try rig.primary.turn("stop");
     defer testing.allocator.free(stopped);
     try testing.expect(std.mem.indexOf(u8, stopped, "Stopping 1") != null);
@@ -683,7 +645,6 @@ test "a stop does not cancel every delegation that follows it" {
     rig.pool.join();
     try testing.expectEqualStrings("cancelled", try rig.statusOf(doomed));
 
-    // The next piece of work must actually run: the flag was for that batch.
     const after = try rig.pool.spawn("job1", "Summarize the news.", null, 100);
     rig.pool.join();
     try testing.expectEqualStrings("done", try rig.statusOf(after));
@@ -707,7 +668,6 @@ test "a subagent with no allowlist is a researcher, not a free hand" {
 
 test "a verification that is cancelled leaves the task cancelled, not running" {
     var rig: Rig = undefined;
-    // The work answers; the check is cancelled before it can be made.
     try rig.init(.{ &.{said_ok}, &.{}, &.{} });
     defer rig.deinit();
     rig.fakes[0].trip = &rig.pool.state;
@@ -719,7 +679,6 @@ test "a verification that is cancelled leaves the task cancelled, not running" {
 
 test "a subagent that could act is never retried; research is re-queued with backoff" {
     var rig: Rig = undefined;
-    // No bodies at all: the very first model call errors.
     try rig.init(.{ &.{}, &.{}, &.{} });
     defer rig.deinit();
 
@@ -731,21 +690,18 @@ test "a subagent that could act is never retried; research is re-queued with bac
     held.store(false, .release);
     rig.pool.join();
 
-    // The send may already have gone out, so it stops and waits for the owner.
     var a = (try tasks.get(&rig.main_db, testing.allocator, acted)).?;
     defer a.deinit(testing.allocator);
     try testing.expectEqual(tasks.Status.failed, a.status);
     try testing.expect(std.mem.indexOf(u8, a.result.?, "do not retry") != null);
 
-    // Reading a page again is harmless, so it waits out a backoff instead.
     var r = (try tasks.get(&rig.main_db, testing.allocator, research)).?;
     defer r.deinit(testing.allocator);
     try testing.expectEqual(tasks.Status.queued, r.status);
     try testing.expectEqual(@as(i64, 1), r.tries);
-    // The worker stamps `due` from the real clock, so assert the shape, not the value.
+    // Real time makes the exact retry deadline nondeterministic.
     try testing.expect(r.due.? > 100);
 
-    // pump leaves it alone until the backoff has passed.
     try rig.pool.pump(r.due.? - 1);
     try testing.expectEqualStrings("queued", try rig.statusOf(research));
 }

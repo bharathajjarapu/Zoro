@@ -1,5 +1,4 @@
-//! Schedule expressions: `every 15m` intervals and five-field cron, resolved
-//! against a fixed-offset timezone. Knows nothing about routines or firing.
+//! Parses intervals and five-field cron with fixed-offset timezones.
 const std = @import("std");
 const testing = std.testing;
 
@@ -31,8 +30,8 @@ pub fn tzOffset(name: ?[]const u8) i32 {
     if (n[0] == '+' or n[0] == '-') return parseOffset(n) catch 0;
     if (std.mem.eql(u8, n, "Asia/Kolkata") or std.mem.eql(u8, n, "Asia/Calcutta")) return 330;
     if (std.mem.eql(u8, n, "Europe/London")) return 0;
-    if (std.mem.eql(u8, n, "America/New_York")) return -300; // ponytail: no DST
-    // ponytail: table of four zones; parse /usr/share/zoneinfo via std.tz when a fifth is needed.
+    if (std.mem.eql(u8, n, "America/New_York")) return -300;
+    // ponytail: fixed zones omit DST; use std.tz when needed.
     log.warn("unknown timezone {s}: scheduling in UTC", .{n});
     return 0;
 }
@@ -146,7 +145,7 @@ fn matchCron(c: Cron, unix: i64, off_min: i32) bool {
     const dow: u6 = @intCast(@mod(days + 4, 7));
     const dom_ok = c.dom & (@as(u64, 1) << @intCast(civil.day)) != 0;
     const dow_ok = c.dow & (@as(u64, 1) << dow) != 0;
-    // Vixie cron: two restricted day fields are OR'd, not AND'd.
+    // Vixie cron ORs two restricted day fields.
     if (!c.dom_any and !c.dow_any) return dom_ok or dow_ok;
     return dom_ok and dow_ok;
 }
@@ -186,8 +185,6 @@ test "interval and cron parse, including timezone" {
 
 test "two restricted day fields are OR'd, one restricted is AND'd" {
     const now: i64 = 1_754_006_400; // 2025-08-01 00:00 UTC, a Friday
-    // 1st of the month OR Monday: today (the 1st) matches even though it is not Monday.
     try testing.expectEqual(now + 9 * 3600, try nextRun(try parse("0 9 1 * 1"), now, "UTC"));
-    // Only the day-of-week restricted: the next Monday, three days out.
     try testing.expectEqual(now + 3 * 86400 + 9 * 3600, try nextRun(try parse("0 9 * * 1"), now, "UTC"));
 }

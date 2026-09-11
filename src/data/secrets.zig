@@ -3,13 +3,8 @@ const Db = @import("db.zig").Db;
 const testing = std.testing;
 const testkit = @import("../testing/testkit.zig");
 
-/// Accepted risk: the raw key reaches the LLM provider once, in the message
-/// that carries it. Intake is conversational; the scrub runs after storage.
-/// Treat any key handed over this way as disclosed to the provider.
-const intake_risk = "accepted risk: secret reaches the provider once before scrub";
-
+/// A submitted key reaches the LLM provider once before scrubbing.
 pub fn put(db: *Db, name: []const u8, value: []const u8, host: []const u8, now: i64) !void {
-    _ = intake_risk;
     var q = try db.prepare(
         \\INSERT INTO secrets(name, value, host, created) VALUES (?, ?, ?, ?)
         \\ON CONFLICT(name) DO UPDATE SET value = excluded.value, host = excluded.host

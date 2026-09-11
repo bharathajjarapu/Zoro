@@ -13,8 +13,7 @@ pub const Skill = struct {
     body: []const u8,
 };
 
-/// What a routine may do when the scheduler fires it. Unrecognised text falls
-/// back to the most restrictive tier, so a typo can never widen authority.
+/// Unknown authority falls back to `notify`.
 pub const Authority = enum {
     notify,
     safe,
@@ -28,7 +27,7 @@ pub const Authority = enum {
         return .notify;
     }
 
-    /// `notify` reads, analyses and messages the owner. It never mutates.
+    /// `notify` never mutates.
     pub fn readOnly(self: Authority) bool {
         return self == .notify;
     }
@@ -240,7 +239,6 @@ test "save then load round-trips, and the index is name plus description only" {
     defer testing.allocator.free(body);
     try testing.expectEqualStrings("Call fetch_url on wttr.in.", body);
 
-    // An arena, the way every production caller of `list` holds it.
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const entries = try list(arena.allocator(), io, dir);

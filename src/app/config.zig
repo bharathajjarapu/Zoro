@@ -3,10 +3,7 @@ const testing = std.testing;
 
 const log = std.log.scoped(.config);
 
-/// A bootstrap secret. Stored as pointer + length rather than a slice so that
-/// even `{any}` prints an address instead of the bytes; `{f}` prints
-/// `[redacted]`. Only `reveal()` hands over the bytes, so every real use of
-/// a secret is one grep away.
+/// Pointer storage prevents accidental secret formatting.
 pub const Secret = struct {
     ptr: [*]const u8,
     len: usize,
@@ -25,50 +22,47 @@ pub const Secret = struct {
     }
 };
 
-/// Bootstrap configuration.
 pub const Config = struct {
-    /// Owned `.env` bytes. Every string field below borrows from these or from
-    /// the process environment, so this is the only allocation to free.
+    /// Owned storage borrowed by parsed values.
     text: []u8 = &.{},
 
     telegram_token: ?Secret = null,
     owner_id: ?i64 = null,
     chat_id: ?i64 = null,
     api_key: ?Secret = null,
-    /// OpenAI-compatible base, no trailing slash. Default applied by callers.
+    /// Callers apply the default model endpoint.
     base_url: ?[]const u8 = null,
     model: ?[]const u8 = null,
-    /// Profile used when the owner sends a picture. Falls back to `model`.
+    /// Falls back to `model` for pictures.
     vision_model: ?[]const u8 = null,
     data_dir: []const u8 = "data",
-    /// The only directory the agent may read files from or attach.
+    /// Only this directory permits file access.
     workspace: []const u8 = "workspace",
     skills_dir: []const u8 = "skills",
 
-    /// Assigns one key. Later calls win, which is what gives the environment
-    /// precedence over the file.
+    /// Later values override earlier ones.
     fn set(self: *Config, key: []const u8, val: []const u8) void {
         if (val.len == 0) return;
         const eql = std.mem.eql;
-        if (eql(u8, key, "ZORO_TELEGRAM_TOKEN")) {
+        if (eql(u8, key, "TELEGRAM_TOKEN")) {
             self.telegram_token = .init(val);
-        } else if (eql(u8, key, "ZORO_OWNER_ID")) {
+        } else if (eql(u8, key, "OWNER_ID")) {
             self.owner_id = std.fmt.parseInt(i64, val, 10) catch blk: {
                 log.warn("{s} is not a number", .{key});
                 break :blk null;
             };
-        } else if (eql(u8, key, "ZORO_CHAT_ID")) {
+        } else if (eql(u8, key, "CHAT_ID")) {
             self.chat_id = std.fmt.parseInt(i64, val, 10) catch blk: {
                 log.warn("{s} is not a number", .{key});
                 break :blk null;
             };
-        } else if (eql(u8, key, "ZORO_API_KEY")) {
+        } else if (eql(u8, key, "LLM_API_KEY")) {
             self.api_key = .init(val);
-        } else if (eql(u8, key, "ZORO_BASE_URL")) {
+        } else if (eql(u8, key, "LLM_BASE_URL")) {
             self.base_url = val;
-        } else if (eql(u8, key, "ZORO_MODEL")) {
+        } else if (eql(u8, key, "LLM_MODEL")) {
             self.model = val;
-        } else if (eql(u8, key, "ZORO_VISION_MODEL")) {
+        } else if (eql(u8, key, "LLM_VISION_MODEL")) {
             self.vision_model = val;
         } else if (eql(u8, key, "ZORO_DATA_DIR")) {
             self.data_dir = val;
@@ -76,9 +70,8 @@ pub const Config = struct {
             self.workspace = val;
         } else if (eql(u8, key, "ZORO_SKILLS_DIR")) {
             self.skills_dir = val;
-        } else if (std.mem.startsWith(u8, key, "ZORO_")) {
-            // A typo would otherwise be silent. The key is safe to log; the
-            // value never is.
+        } else if (std.mem.startsWith(u8, key, "ZORO_") or std.mem.startsWith(u8, key, "LLM_")) {
+            // Log names only because values may be secrets.
             log.warn("unknown config key: {s}", .{key});
         }
     }
@@ -88,27 +81,23 @@ pub const Config = struct {
         self.* = undefined;
     }
 
-    /// Overlays the process environment. Called after `parse`, so a variable
-    /// set in the environment beats the same key in the file.
+    /// Environment values override file values.
     pub fn overlay(self: *Config, env: *const std.process.Environ.Map) void {
         var it = env.iterator();
         while (it.next()) |e| self.set(e.key_ptr.*, e.value_ptr.*);
     }
 };
 
-/// Reports a required key that is absent. The message names the key; a value
-/// is never logged, because some of them are secrets.
+/// Reports only the missing key name.
 pub fn missing(key: []const u8) error{MissingConfig} {
     log.err("missing required config: {s} — set it in .env or the environment", .{key});
     return error.MissingConfig;
 }
 
-/// The largest `.env` we will read. A config file is a handful of lines; this
-/// only exists so a wrong path cannot pull an arbitrary file into memory.
+/// Bounds accidental reads from a wrong path.
 const max_env_bytes = 64 * 1024;
 
-/// Reads `path` and parses it. A missing file yields an empty config: the
-/// environment alone may carry everything. Caller owns the result.
+/// Caller owns the result; a missing file yields empty config.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_env_bytes)) catch |err| switch (err) {
         error.FileNotFound => return .{},
@@ -121,7 +110,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
     return cfg;
 }
 
-/// Parses `.env` text. Unparsable lines are skipped; slices borrow from `text`.
+/// Parsed slices borrow from `text`.
 fn parse(text: []const u8) Config {
     var cfg: Config = .{};
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -140,12 +129,12 @@ fn parse(text: []const u8) Config {
 test "parse reads keys, skipping comments and blanks" {
     const cfg = parse(
         \\# bootstrap
-        \\ZORO_TELEGRAM_TOKEN = 123:abc
+        \\TELEGRAM_TOKEN = 123:abc
         \\
-        \\ZORO_OWNER_ID=42
-        \\ZORO_API_KEY = sk-test
-        \\ZORO_BASE_URL = https://api.example/v1
-        \\ZORO_MODEL = gpt-5
+        \\OWNER_ID=42
+        \\LLM_API_KEY = sk-test
+        \\LLM_BASE_URL = https://api.example/v1
+        \\LLM_MODEL = gpt-5
     );
     try testing.expectEqualStrings("123:abc", cfg.telegram_token.?.reveal());
     try testing.expectEqual(@as(i64, 42), cfg.owner_id.?);
@@ -154,20 +143,19 @@ test "parse reads keys, skipping comments and blanks" {
     try testing.expectEqualStrings("gpt-5", cfg.model.?);
 }
 
-test "parse reads ZORO_CHAT_ID" {
-    const cfg = parse("ZORO_CHAT_ID=99\n");
+test "parse reads CHAT_ID" {
+    const cfg = parse("CHAT_ID=99\n");
     try testing.expectEqual(@as(?i64, 99), cfg.chat_id);
 }
 
 test "a secret prints redacted, never its value" {
-    const cfg = parse("ZORO_TELEGRAM_TOKEN=123:abc");
+    const cfg = parse("TELEGRAM_TOKEN=123:abc");
     var buf: [64]u8 = undefined;
     const line = try std.fmt.bufPrint(&buf, "token={f}", .{cfg.telegram_token.?});
     try testing.expectEqualStrings("token=[redacted]", line);
     try testing.expect(std.mem.indexOf(u8, line, "123:abc") == null);
 
-    // `{any}` sidesteps `format` entirely, so the field layout has to be what
-    // keeps the bytes out of it. Verified: a slice field prints as bytes here.
+    // Pointer storage also hides bytes from `{any}`.
     const dumped = try std.fmt.bufPrint(&buf, "{any}", .{cfg.telegram_token.?});
     try testing.expect(std.mem.indexOf(u8, dumped, "123:abc") == null);
 }
@@ -175,14 +163,14 @@ test "a secret prints redacted, never its value" {
 test "the environment overrides the file" {
     var env: std.process.Environ.Map = .init(testing.allocator);
     defer env.deinit();
-    try env.put("ZORO_MODEL", "from-env");
-    try env.put("PATH", "/usr/bin"); // not ours: must be left alone
+    try env.put("LLM_MODEL", "from-env");
+    try env.put("PATH", "/usr/bin");
 
-    var cfg = parse("ZORO_MODEL=from-file\nZORO_OWNER_ID=42\nZORO_MDOEL=a-typo\n");
+    var cfg = parse("LLM_MODEL=from-file\nOWNER_ID=42\nLLM_MDOEL=a-typo\n");
     cfg.overlay(&env);
 
     try testing.expectEqualStrings("from-env", cfg.model.?);
-    try testing.expectEqual(@as(i64, 42), cfg.owner_id.?); // untouched by env
+    try testing.expectEqual(@as(i64, 42), cfg.owner_id.?);
 }
 
 test "load reads a file, and a missing file is not an error" {
@@ -194,7 +182,7 @@ test "load reads a file, and a missing file is not an error" {
 
     var buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/.env", .{tmp.sub_path});
-    try tmp.dir.writeFile(io, .{ .sub_path = ".env", .data = "ZORO_MODEL=gpt-5\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".env", .data = "LLM_MODEL=gpt-5\n" });
 
     var cfg = try load(testing.allocator, io, path);
     defer cfg.deinit(testing.allocator);

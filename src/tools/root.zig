@@ -35,9 +35,7 @@ pub const Def = struct {
     primary_only: bool = false,
 };
 
-/// The tools a restricted caller may use. `read_only` drops everything that
-/// mutates, `names` is a space-separated allowlist (null means no allowlist),
-/// and `primary_only` tools are never handed out. Caller frees the slice.
+/// Returns allowed non-primary tools. Caller frees.
 pub fn subset(gpa: std.mem.Allocator, all: []const Def, read_only: bool, names: ?[]const u8) ![]Def {
     var out: std.ArrayList(Def) = .empty;
     errdefer out.deinit(gpa);
@@ -120,7 +118,6 @@ fn runAsk(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     return try std.fmt.allocPrint(ctx.gpa, "pending #{d}: {s} — {s}", .{ id, parsed.value.tool, parsed.value.reason });
 }
 
-/// One line per tool. Adding a tool is its file plus a slot here.
 pub const builtins = [_]Def{
     memory.remember,
     memory.recall,
@@ -139,22 +136,19 @@ pub const builtins = [_]Def{
     worker.cancel_task,
 };
 
-/// Actions that exist only at the far end of an approval. They are never in
-/// `builtins`, so the model has no way to call one without the owner saying yes.
+/// Approval-only actions hidden from the model.
 pub const gated = [_]Def{
     routine.enable_routine,
     routine.run_routine,
 };
 
-/// Runs an action the owner just approved: gated tools first, then the caller's
-/// own list, so an approval can reach either.
+/// Runs an owner-approved action.
 pub fn callApproved(ctx: *Ctx, own: []const Def, name: []const u8, args: []const u8) ![]u8 {
     if (find(&gated, name) != null) return call(ctx, &gated, name, args);
     return call(ctx, own, name, args);
 }
 
-/// Looks up `name`, rejects bad args, runs, and caps the result. Errors become
-/// a string the model can act on — they never crash the loop.
+/// Runs a tool and returns bounded output or an error string.
 pub fn call(ctx: *Ctx, tools: []const Def, name: []const u8, args: []const u8) ![]u8 {
     const def = find(tools, name) orelse
         return std.fmt.allocPrint(ctx.gpa, "unknown tool: {s}", .{name});

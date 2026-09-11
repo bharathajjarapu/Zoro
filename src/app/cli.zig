@@ -11,7 +11,7 @@ const FakeHttp = testkit.FakeHttp;
 
 pub const max_prompt = 64 * 1024;
 
-/// Joins argv fragments into `buf` with spaces. Null if there are none.
+/// Joins arguments into `buf`; returns null when empty.
 pub fn takePrompt(buf: []u8, args: anytype) error{StreamTooLong}!?[]u8 {
     var n: usize = 0;
     while (args.next()) |part| {
@@ -27,7 +27,6 @@ pub fn takePrompt(buf: []u8, args: anytype) error{StreamTooLong}!?[]u8 {
     return if (n == 0) null else buf[0..n];
 }
 
-/// One turn, print the reply, return. Caller owns `prompt`.
 pub fn oneShot(a: *Agent, prompt: []const u8, out: *std.Io.Writer) !void {
     const reply = try a.turn(prompt);
     defer a.gpa.free(reply);
@@ -52,8 +51,7 @@ pub fn chat(a: *Agent, in: *std.Io.Reader, out: *std.Io.Writer, err_out: *std.Io
     }
 }
 
-/// Anything a routine or tool queued for the owner. The terminal prints it; the
-/// Telegram driver sends it. Neither is visible to `agent/root.zig`.
+/// Prints output queued outside the agent.
 fn drain(a: *Agent, out: *std.Io.Writer) !void {
     const items = try outbox.drain(a.db, a.gpa);
     defer outbox.free(a.gpa, items);
@@ -78,7 +76,6 @@ fn isQuit(s: []const u8) bool {
     return std.mem.eql(u8, s, ":q") or std.mem.eql(u8, s, ":quit");
 }
 
-/// Prints a day's diary. `date` is YYYY-MM-DD, `today`, `yesterday`, or null (today).
 pub fn printDiary(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -102,7 +99,6 @@ pub fn printDiary(
     try writeReply(out, text);
 }
 
-/// Prints BM25 hits as `ref  kind  score` per line.
 pub fn printMemory(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64, out: *std.Io.Writer) !void {
     const hits = try memory.search(db, gpa, query, now, 16);
     defer memory.freeHits(gpa, hits);
@@ -117,7 +113,6 @@ pub fn printMemory(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64,
     try out.flush();
 }
 
-/// Prints tasks with status, priority, and success criterion. Children are indented.
 pub fn printTasks(db: *Db, gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
     const items = try tasks.list(db, gpa);
     defer tasks.freeTasks(gpa, items);
@@ -126,8 +121,6 @@ pub fn printTasks(db: *Db, gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
     try writeReply(out, text);
 }
 
-/// Runtime state for every routine, including runs the scheduler declined to
-/// replay after downtime.
 pub fn printRoutines(db: *Db, out: *std.Io.Writer) !void {
     var q = try db.prepare(
         \\SELECT name, enabled, COALESCE(status, '-'), fails, skips,
@@ -286,7 +279,7 @@ test "memory prints ref, kind, and score per hit" {
     try printMemory(h.agent.db, testing.allocator, "mittens", 1000, &out.writer);
     try testing.expect(std.mem.indexOf(u8, out.written(), "pet") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "fact") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), ".") != null); // score
+    try testing.expect(std.mem.indexOf(u8, out.written(), ".") != null);
 }
 
 test "tasks lists parent and child with status, priority, and goal" {
@@ -306,8 +299,6 @@ test "tasks lists parent and child with status, priority, and goal" {
     try testing.expect(std.mem.indexOf(u8, out.written(), "notes written") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "  #") != null);
 }
-
-// ── test helpers ──────────────────────────────────────────────────────────
 
 const Harness = struct {
     tmp: testing.TmpDir,

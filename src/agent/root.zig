@@ -26,8 +26,7 @@ pub const system_prompt =
     \\help; otherwise just answer.
 ;
 
-/// Injected HTTP seam for the OpenAI-compatible chat call. Production uses
-/// `stdHttp`; tests use a fake that returns canned JSON.
+/// HTTP transport; tests inject canned responses.
 pub const Http = struct {
     ptr: *anyopaque,
     post_fn: *const fn (*anyopaque, std.mem.Allocator, Request) anyerror!Response,
@@ -36,7 +35,6 @@ pub const Http = struct {
         url: []const u8,
         auth: []const u8,
         body: []const u8,
-        /// Telegram wants multipart when a file rides along; everything else is JSON.
         content_type: []const u8 = "application/json",
     };
 
@@ -55,33 +53,25 @@ pub const Http = struct {
     }
 };
 
-/// A picture the owner sent, already downloaded and bounded by the channel.
-/// `data` is raw bytes; this file base64s them into the request and never
-/// stores them.
+/// A bounded image; raw bytes are never stored.
 pub const Image = struct {
     mime: []const u8,
     data: []const u8,
 };
 
-/// One turn's input. `turn` takes plain text; the Telegram driver uses
-/// `turnWith` when the owner sent a picture.
+/// Text with an optional image.
 pub const Input = struct {
     text: []const u8,
     image: ?Image = null,
 };
 
-/// A tool the loop can call. Defined in `tools/root.zig`; this alias keeps call
-/// sites in this file short.
 pub const Tool = tools.Def;
 
-/// Shared cancellation for delegated work. `worker.zig` owns the threads; the
-/// agent only raises the flag and reads the count, which is why this file
-/// still knows nothing about workers.
+/// Shared worker cancellation state.
 pub const Workers = struct {
     stop: std.atomic.Value(bool) = .init(false),
     live: std.atomic.Value(usize) = .init(0),
-    /// One task's flag chains to the pool's, so "stop" halts everything while a
-    /// single task can still be called off on its own.
+    /// Chains task cancellation to pool cancellation.
     parent: ?*const Workers = null,
 
     pub fn cancelled(self: *const Workers) bool {
@@ -94,15 +84,13 @@ pub const Workers = struct {
     }
 };
 
-/// What one run of the loop is allowed to spend. The owner's turn takes the
-/// defaults; a subagent is handed a smaller one.
+/// Limits one model loop.
 pub const Budget = struct {
     tools: []const Tool,
     rounds: usize = max_rounds,
     system: []const u8 = system_prompt,
     cancel: ?*const Workers = null,
-    /// Overrides the agent's model for this run — a picture needs the vision
-    /// profile. Null keeps the default.
+    /// Overrides the default model.
     model: ?[]const u8 = null,
 };
 
@@ -124,8 +112,7 @@ pub const Agent = struct {
     limiter: web.Limiter = .{},
     /// Null means nothing runs in the background.
     workers: ?*Workers = null,
-    /// Set once delegation is wired up. `Workers` above is what this file
-    /// actually touches; the pool is only carried through to the tools.
+    /// Passed through to delegation tools.
     pool: ?*worker.Pool = null,
 
     /// Caller owns the returned reply.
@@ -133,7 +120,7 @@ pub const Agent = struct {
         return self.turnWith(.{ .text = input });
     }
 
-    /// The one seam, widened by exactly one optional field. Caller owns the reply.
+    /// Caller owns the reply.
     pub fn turnWith(self: *Agent, in: Input) ![]u8 {
         const input = in.text;
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
@@ -158,8 +145,7 @@ pub const Agent = struct {
         var messages: std.ArrayList(Msg) = .empty;
         try messages.append(arena, .{ .role = "system", .content = try withContext(arena, self, input, now) });
         try loadHistory(self.db, arena, &messages);
-        // loadHistory already includes the user row we just wrote; the picture
-        // rides along on it and is never persisted.
+        // Attach the image to the stored caption without persisting its bytes.
         if (in.image) |img| messages.items[messages.items.len - 1].image = img;
 
         const reply = try drive(self, arena, &messages, .{
@@ -171,9 +157,7 @@ pub const Agent = struct {
         return reply;
     }
 
-    /// One turn with no history: the system prompt and `input`, nothing else,
-    /// and not a byte written to `messages`. That absence is exactly what
-    /// "fresh context" means for a subagent. Caller owns the reply.
+    /// Runs without history or transcript writes. Caller owns the reply.
     pub fn isolated(self: *Agent, input: []const u8, b: Budget) ![]u8 {
         var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_inst.deinit();
@@ -186,9 +170,7 @@ pub const Agent = struct {
     }
 };
 
-/// The model/tool loop, shared by the owner's turn and by every subagent.
-/// Persisting the conversation is the caller's job, which is what keeps a
-/// subagent out of the transcript.
+/// Runs the shared model and tool loop without persistence.
 fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), b: Budget) ![]u8 {
     const endpoint = try chatUrl(arena, self.base_url);
     const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{self.api_key.reveal()});
@@ -196,7 +178,6 @@ fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), 
     var round: usize = 0;
     while (true) {
         if (b.cancel) |w| if (w.cancelled()) return error.Cancelled;
-        // Cap before the next model call so we never spend one round too many.
         if (round >= b.rounds) {
             return std.fmt.allocPrint(
                 self.gpa,
@@ -244,8 +225,7 @@ fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), 
             const raw = try tools.call(&ctx, b.tools, call.name, call.arguments);
             defer self.gpa.free(raw);
             const owned = try arena.dupe(u8, raw);
-            // Tool rows stay in-memory for this turn. Persisting them without
-            // tool_call metadata would break history reload; diary ticket owns that.
+            // Plain persisted tool rows cannot reconstruct tool-call metadata.
             try messages.append(arena, .{
                 .role = "tool",
                 .content = owned,
@@ -256,8 +236,7 @@ fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), 
     }
 }
 
-/// Only the bare word cancels background work; "cancel" and "no" stay verdicts
-/// on a pending approval.
+/// Only bare "stop" cancels workers.
 fn isStop(input: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, input, &std.ascii.whitespace), "stop");
 }
@@ -332,8 +311,7 @@ fn insertMsg(db: *Db, role: []const u8, content: []const u8, created: i64) !void
     _ = try q.step();
 }
 
-/// Top-N BM25 hits for this message, compacted onto the system prompt.
-/// Empty search → the static prompt unchanged.
+/// Adds relevant state to the system prompt.
 fn withContext(arena: std.mem.Allocator, self: *Agent, query: []const u8, now: i64) ![]const u8 {
     const hits = try memory.searchAny(self.db, arena, query, now, max_memories);
     const skill_index = skills.list(arena, self.io, self.skills_dir) catch &.{};
@@ -373,9 +351,7 @@ fn withContext(arena: std.mem.Allocator, self: *Agent, query: []const u8, now: i
     return try buf.toOwnedSlice();
 }
 
-/// Loads the newest `max_history` user/assistant rows (oldest first). Tool
-/// rows stay in the DB for the diary but are skipped here — reconstructing
-/// tool_calls from plain content is not worth it until the diary needs them.
+/// Loads recent dialogue; plain tool rows lack replay metadata.
 fn loadHistory(db: *Db, arena: std.mem.Allocator, out: *std.ArrayList(Msg)) !void {
     var q = try db.prepare(
         \\SELECT role, content FROM (
@@ -464,8 +440,7 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try std.json.Stringify.encodeJsonString(s, .{}, w);
 }
 
-/// The OpenAI content-parts form: the caption stays with the picture, so the
-/// model reads both together.
+/// Writes OpenAI image content parts.
 fn writeParts(arena: std.mem.Allocator, w: *std.Io.Writer, text: []const u8, img: Image) !void {
     const enc = std.base64.standard.Encoder;
     const b64 = try arena.alloc(u8, enc.calcSize(img.data.len));
@@ -559,16 +534,6 @@ fn parseAssistant(gpa: std.mem.Allocator, body: []const u8) !Parsed {
     };
 }
 
-// ── test helpers ──────────────────────────────────────────────────────────
-
-fn openTmpDb(tmp: *testing.TmpDir, buf: []u8) !Db {
-    const path = try std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
-    var db = try Db.open(path);
-    errdefer db.close();
-    try db.migrate();
-    return db;
-}
-
 test "turn returns the stubbed assistant reply" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -578,7 +543,7 @@ test "turn returns the stubbed assistant reply" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hello back\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -608,7 +573,7 @@ test "turn persists user and assistant messages" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -658,14 +623,12 @@ test "tool loop stops at 32 rounds and reports the blocker" {
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
 
-    // 32 model responses that keep asking for tools: each runs one tool round,
-    // then the loop hits the cap before a 33rd completion.
     var bodies: [32][]const u8 = undefined;
     for (&bodies) |*b| b.* = tool_call_body;
 
     var fake: FakeHttp = .{ .bodies = &bodies };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -704,7 +667,7 @@ test "tool results truncate at 64 KiB" {
         .bodies = &.{ big_call, final },
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -748,7 +711,7 @@ test "turn injects a retrieved fact relevant to the message" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -782,7 +745,7 @@ test "turn does not inject an irrelevant memory" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -819,7 +782,7 @@ test "turn uses a fact from three turns ago without restating it" {
         .bodies = &.{ ok, ok, ok, ok },
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -858,7 +821,7 @@ test "turn keeps injected memory and history bounded as history grows" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -923,7 +886,7 @@ test "turn injects the skill index without the skill body" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -968,7 +931,7 @@ test "turn lists secret names but never their values" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -1013,7 +976,7 @@ test "yes runs the bound pending action and skips the model" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"should not run\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1046,7 +1009,7 @@ test "yes on an expired approval is refused and reported" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"no\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1077,7 +1040,7 @@ test "yes with two pending actions asks which" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"no\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1110,7 +1073,7 @@ test "a bare yes with nothing pending is an ordinary message" {
         .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"sure thing\"}}]}"},
     };
 
-    var db = try openTmpDb(&tmp, &buf);
+    var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1167,7 +1130,6 @@ test "a picture reaches the vision profile with its caption, and is not persiste
     try testing.expect(std.mem.indexOf(u8, sent, "data:image/jpeg;base64,/9j/") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "\"what is this\"") != null);
 
-    // The transcript keeps the caption; the bytes are never written to the database.
     var q = try db.prepare("SELECT content FROM messages WHERE role = 'user'");
     defer q.finalize();
     try testing.expect(try q.step());

@@ -1,6 +1,4 @@
-//! Shared test scaffolding. Only test blocks reference it, so it never reaches
-//! the binary. Everything here captures into fixed buffers rather than the
-//! allocator, so no test has to free the fake it used.
+//! Fixed-buffer test scaffolding.
 const std = @import("std");
 const agent = @import("../agent/root.zig");
 const Db = @import("../data/db.zig").Db;
@@ -8,23 +6,19 @@ const testing = std.testing;
 
 pub const max_calls = 32;
 
-/// Stands in for the model endpoint and for Telegram: both speak through
-/// `agent.Http`. Replies come from `bodies` in order; running out is an error,
-/// which is what makes "it should not have called again" testable.
+/// Returns canned HTTP responses in order.
 pub const FakeHttp = struct {
     bodies: []const []const u8 = &.{},
     /// Per-call status codes; falls back to `status` once exhausted.
     statuses: []const u16 = &.{},
     status: u16 = 200,
     i: usize = 0,
-    /// Raised on the first call, standing in for the owner saying "stop" while
-    /// a worker is mid-round.
+    /// Cancels workers on the first call.
     trip: ?*agent.Workers = null,
     /// Parks inside the call so a test can observe several in flight at once.
     hold: ?*std.atomic.Value(bool) = null,
 
-    /// One request body at a time — the largest carries a 64 KiB tool result —
-    /// and a short history of URLs, which is all any caller asks for.
+    /// Fixed request and URL capture.
     body: [192 * 1024]u8 = undefined,
     body_len: usize = 0,
     urls: [max_calls][160]u8 = undefined,

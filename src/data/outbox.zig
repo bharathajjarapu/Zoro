@@ -4,8 +4,7 @@ const tools = @import("../tools/root.zig");
 const testing = std.testing;
 const testkit = @import("../testing/testkit.zig");
 
-/// Nothing the agent queues may be larger than one Telegram message; the
-/// channel chunks anything longer.
+/// Maximum queued message size before channel chunking.
 pub const max_text: usize = 8 * 1024;
 /// Drained per turn. A runaway routine cannot flood the owner in one go.
 pub const max_drain: usize = 16;
@@ -25,8 +24,7 @@ pub const Item = struct {
     }
 };
 
-/// Queues one outbound item. `path` is workspace-relative and only meaningful
-/// for a photo or document.
+/// Queues output with an optional workspace-relative path.
 pub fn push(db: *Db, kind: Kind, path: ?[]const u8, body: []const u8, now: i64) !void {
     if (kind != .text and (path == null or !safeRelative(path.?))) return error.BadPath;
     const text = clamp(body);
@@ -73,8 +71,7 @@ pub fn free(gpa: std.mem.Allocator, items: []Item) void {
     gpa.free(items);
 }
 
-/// Trims to `max_text` on a UTF-8 boundary. A routine that produced an essay
-/// gets truncated, never a corrupt message and never a failed run.
+/// Trims to `max_text` on a UTF-8 boundary.
 fn clamp(text: []const u8) []const u8 {
     if (text.len <= max_text) return text;
     var end = max_text;
@@ -82,10 +79,7 @@ fn clamp(text: []const u8) []const u8 {
     return text[0..end];
 }
 
-/// Workspace-relative and nothing else: no absolute path, no `..`, no leading
-/// slash, and an allowlist of characters rather than a denylist — the name ends
-/// up inside a multipart header, where a quote or a newline would be an
-/// injection. The container mount is the outer boundary; this is the inner one.
+/// Accepts safe workspace-relative paths for multipart headers.
 pub fn safeRelative(path: []const u8) bool {
     if (path.len == 0 or path.len > 512) return false;
     if (path[0] == '/') return false;
@@ -158,7 +152,6 @@ test "safeRelative refuses escapes and absolutes" {
     try testing.expect(!safeRelative("out/../../etc"));
     try testing.expect(!safeRelative(""));
     try testing.expect(!safeRelative("./x"));
-    // The name lands in a multipart header; a quote or a newline would escape it.
     try testing.expect(!safeRelative("a\"b.png"));
     try testing.expect(!safeRelative("a\r\nb.png"));
     try testing.expect(!safeRelative("a b.png"));
@@ -198,7 +191,6 @@ test "an over-long message is trimmed on a codepoint boundary, not rejected" {
 
     const long = try testing.allocator.alloc(u8, max_text + 64);
     defer testing.allocator.free(long);
-    // "é" is two bytes, so a naive cut at max_text lands mid-codepoint.
     var i: usize = 0;
     while (i + 1 < long.len) : (i += 2) {
         long[i] = 0xC3;

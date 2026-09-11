@@ -11,12 +11,8 @@ const web = @import("../net/web.zig");
 const log = std.log.scoped(.telegram);
 
 pub const max_text = 64 * 1024;
-/// Conservative under Telegram's 4096-character cap so a chunk always fits.
 const max_message = 3900;
-/// Bound on anything we pull off the wire or push back up. Telegram allows
-/// more; a personal assistant does not need it, and the model pays per byte.
-/// Matched to `web.max_body`, which is the transport bound a download actually
-/// hits first — declaring a larger number here would just fail silently.
+/// Matches the HTTP download bound.
 pub const max_file = web.max_body;
 
 fn utf8ChunkEnd(text: []const u8, max_bytes: usize) usize {
@@ -43,10 +39,9 @@ pub const Update = struct {
     from_id: i64,
     chat_id: i64,
     chat_type: []u8,
-    /// The message text, the caption of an attachment, or a one-line
-    /// description of an attachment we will not download.
+    /// Text, caption, or attachment description.
     text: []u8,
-    /// Set only for a picture: the file to fetch and show the vision model.
+    /// Photo selected for the vision model.
     photo: ?[]u8 = null,
 
     pub fn deinit(self: *Update, gpa: std.mem.Allocator) void {
@@ -91,8 +86,7 @@ const RawFile = struct {
     file_size: ?i64 = null,
 };
 
-/// Telegram lists a photo smallest-first. The largest under the cap is the one
-/// worth showing the model.
+/// Selects the largest photo under the cap.
 fn largest(sizes: []const RawPhoto) ?RawPhoto {
     var best: ?RawPhoto = null;
     for (sizes) |p| {
@@ -102,8 +96,7 @@ fn largest(sizes: []const RawPhoto) ?RawPhoto {
     return best;
 }
 
-/// Anything that is not a picture becomes one line of metadata. It is never a
-/// failed turn, and never a download.
+/// Describes unsupported attachments without downloading them.
 fn describe(gpa: std.mem.Allocator, caption: []const u8, f: RawFile) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}{s}[attachment: {s}, {s}, {d} bytes — I can see its details but not its contents]", .{
         caption,
@@ -351,8 +344,7 @@ pub const Bot = struct {
         }
     }
 
-    /// A picture that will not download is still a turn: the owner gets an
-    /// answer about what we could see, never an error.
+    /// Failed image downloads still produce a text turn.
     fn answer(self: *Bot, u: Update) !void {
         var picture: ?[]u8 = null;
         defer if (picture) |p| self.gpa.free(p);
@@ -373,7 +365,7 @@ pub const Bot = struct {
         try self.send(reply);
     }
 
-    /// Sends whatever the agent, a routine or a tool queued for the owner.
+    /// Sends queued owner output.
     fn flush(self: *Bot) !void {
         const items = try outbox.drain(self.db, self.gpa);
         defer outbox.free(self.gpa, items);
@@ -386,7 +378,7 @@ pub const Bot = struct {
         }
     }
 
-    /// getFile then one plain GET against the file host, capped on the way in.
+    /// Downloads a Telegram file within the shared cap.
     fn download(self: *Bot, file_id: []const u8) ![]u8 {
         const get = self.fetch orelse return error.NoFetch;
         const req = try jsonBody(self.gpa, .{ .file_id = file_id });
@@ -473,7 +465,7 @@ pub const Bot = struct {
                 .content_type = content_type,
             });
             if (res.status == 429) {
-                // ponytail: cap at 60s; honour the header fully if a flood wait exceeds that
+                // ponytail: cap flood waits at 60 seconds.
                 const wait = @min(retryAfter(self.gpa, res.body) orelse 1, 60);
                 res.deinit(self.gpa);
                 tries += 1;
@@ -573,16 +565,14 @@ fn buildSendMessage(gpa: std.mem.Allocator, chat_id: i64, text: []const u8) ![]u
 }
 
 const boundary = "zoroFormBoundary7Nn2Kq";
-/// A caption is model-written text going into a form field. A boundary line
-/// begins with CRLF, so stripping every control byte makes one impossible to
-/// forge; the filename is safe by construction (`outbox.safeRelative`).
+/// Removes control bytes that could forge multipart boundaries.
 fn field(w: *std.Io.Writer, text: []const u8) !void {
     for (text) |c| {
         if (c >= 0x20 or c == '\t') try w.writeByte(c) else try w.writeByte(' ');
     }
 }
 
-/// Telegram's file upload form. Text fields first, the bytes last.
+/// Builds Telegram's multipart upload form.
 fn multipart(
     gpa: std.mem.Allocator,
     chat_id: i64,
@@ -615,8 +605,7 @@ fn baseName(path: []const u8) []const u8 {
     return path[cut + 1 ..];
 }
 
-/// Enough to tell the vision model what it is looking at. Telegram re-encodes
-/// photos to JPEG, so this is mostly a courtesy for the odd PNG.
+/// Sniffs common image types for the vision model.
 fn sniff(bytes: []const u8) []const u8 {
     if (std.mem.startsWith(u8, bytes, "\x89PNG")) return "image/png";
     if (std.mem.startsWith(u8, bytes, "GIF8")) return "image/gif";
@@ -950,7 +939,7 @@ test "run returns without polling when stop is already set" {
     try h.bot.run(&halt.yes);
 }
 
-/// The file host is a plain GET, so the download seam is `web.Get`, not `Http`.
+/// Fakes Telegram's file download endpoint.
 const FakeGet = struct {
     body: []const u8,
     status: u16 = 200,
@@ -994,7 +983,6 @@ test "a photo is downloaded and reaches the vision model with its caption" {
 
     try h.bot.pollOnce();
 
-    // The largest size is the one fetched, and the token never leaves the URL builder.
     try testing.expectEqual(@as(usize, 1), files.calls);
     try testing.expect(std.mem.endsWith(u8, files.url(), "/photos/x.png"));
     try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"big\"") != null or
@@ -1059,7 +1047,6 @@ test "a workspace file goes out as a photo with its caption" {
     try testing.expect(std.mem.indexOf(u8, sent, "yesterday's spend") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "\x89PNG-bytes") != null);
 
-    // Drained: a second flush sends nothing.
     try h.bot.flush();
     try testing.expectEqual(@as(usize, 1), h.tg.i);
 }

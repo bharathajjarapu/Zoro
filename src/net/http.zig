@@ -3,10 +3,8 @@ const agent = @import("../agent/root.zig");
 const web = @import("web.zig");
 const testing = std.testing;
 
-/// A response larger than this is refused rather than buffered.
 pub const max_body: usize = 2 * 1024 * 1024;
 
-/// Production HTTP client over `std.http.Client`.
 pub const StdHttp = struct {
     client: std.http.Client,
 
@@ -61,12 +59,10 @@ const CappedBody = struct {
     max: usize,
     overflow: bool = false,
     taken: bool = false,
-    /// `std.Io` streams into the writer's own buffer and asserts it has room
-    /// for at least one byte, so this cannot be empty.
+    /// Zig I/O requires non-empty writer storage.
     buf: [4096]u8 = undefined,
 
-    /// In place: the writer points at `buf`, which only has a stable address
-    /// once the struct is in its final home.
+    /// Initializes in place because the writer points into `self`.
     fn init(self: *CappedBody, gpa: std.mem.Allocator, max: usize) void {
         self.* = .{
             .body = .init(gpa),
@@ -81,7 +77,6 @@ const CappedBody = struct {
         self.* = undefined;
     }
 
-    /// Flushes whatever is still sitting in `buf` before handing the body over.
     fn take(self: *CappedBody) ![]u8 {
         if (self.writer.end != 0) {
             self.append(self.writer.buffered()) catch return error.ResponseTooLarge;
@@ -134,9 +129,6 @@ test "the response writer has room for std to stream into" {
     cap.init(testing.allocator, 64);
     defer cap.deinit();
 
-    // This is how `std.Io` fills a writer, and it asserts the buffer can hold
-    // at least one byte. A zero-length buffer panicked here on every real
-    // response, which no fake-backed test could reach.
     const room = try cap.writer.writableSliceGreedy(1);
     try testing.expect(room.len >= 1);
     @memcpy(room[0..5], "hello");
@@ -148,15 +140,12 @@ test "the response writer has room for std to stream into" {
 }
 
 test "a response past the cap is refused, whether it drains or not" {
-    // Small enough to sit in the writer's own buffer: the cap is enforced when
-    // the body is taken.
     var small: CappedBody = undefined;
     small.init(testing.allocator, 8);
     defer small.deinit();
     try small.writer.writeAll("far more than eight bytes");
     try testing.expectError(error.ResponseTooLarge, small.take());
 
-    // Larger than the writer's buffer, so it drains mid-stream and stops there.
     var big: CappedBody = undefined;
     big.init(testing.allocator, 8);
     defer big.deinit();

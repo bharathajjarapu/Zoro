@@ -85,8 +85,7 @@ pub fn hostOf(url: []const u8, buf: *[std.Io.net.HostName.max_len]u8) ![]const u
     return host.bytes;
 }
 
-/// Scheme, host denylist, and IP-literal checks. DNS is `guardResolved`.
-/// Returned host is valid only while `buf` is.
+/// Validates URL syntax; returned host borrows `buf`.
 pub fn guard(url: []const u8, buf: *[std.Io.net.HostName.max_len]u8) ![]const u8 {
     const uri = std.Uri.parse(url) catch return error.Blocked;
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.HttpsOnly;
@@ -227,10 +226,8 @@ fn blockedV6(bytes: [16]u8) bool {
         (@as(u16, bytes[12]) << 8) | bytes[13],
         (@as(u16, bytes[14]) << 8) | bytes[15],
     };
-    // ::1 loopback
     if (segs[0] == 0 and segs[1] == 0 and segs[2] == 0 and segs[3] == 0 and
         segs[4] == 0 and segs[5] == 0 and segs[6] == 0 and segs[7] == 1) return true;
-    // :: unspecified
     if (segs[0] == 0 and segs[1] == 0 and segs[2] == 0 and segs[3] == 0 and
         segs[4] == 0 and segs[5] == 0 and segs[6] == 0 and segs[7] == 0) return true;
     if (segs[0] & 0xff00 == 0xff00) return true; // multicast
@@ -410,9 +407,7 @@ fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[
     });
     defer req.deinit();
     try req.sendBodiless();
-    // ponytail: no request timeout. `Client.fetch` never passes one, and
-    // `connectTcpOptions.timeout` is ignored in 0.16.0, so a hung host stalls
-    // the turn that called it. Revisit when std wires that field up.
+    // ponytail: Zig 0.16 ignores request timeouts; revisit when supported.
     var response = try req.receiveHead(&.{});
 
     const status: u16 = @intFromEnum(response.head.status);

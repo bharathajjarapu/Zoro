@@ -4,8 +4,7 @@ const Db = @import("../data/db.zig").Db;
 
 const name_param = [_]tools.Param{.{ .name = "name", .description = "routine name" }};
 
-/// Owner-only, and never advertised to the model: the whole point of the
-/// mutating tier is that the agent cannot switch itself on.
+/// Owner-only; the model cannot enable mutations.
 pub const enable_routine: tools.Def = .{
     .name = "enable_routine",
     .description = "Activate a routine that is waiting for approval.",
@@ -14,8 +13,7 @@ pub const enable_routine: tools.Def = .{
     .run = runEnable,
 };
 
-/// One approved firing of a `critical` routine. The scheduler consumes the
-/// flag on the next tick, so approving twice does not queue two runs.
+/// Allows one approved critical run.
 pub const run_routine: tools.Def = .{
     .name = "run_routine",
     .description = "Let a critical routine execute once.",
