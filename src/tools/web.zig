@@ -1,27 +1,28 @@
 const std = @import("std");
 const tools = @import("root.zig");
 const web = @import("../net/web.zig");
-const secrets = @import("../data/secrets.zig");
-const Db = @import("../data/db.zig").Db;
 const testing = std.testing;
+const testkit = @import("../testing/testkit.zig");
 
 const Param = tools.Param;
 const Def = tools.Def;
 const Ctx = tools.Ctx;
 
+const search_url = "https://api.search.tinyfish.ai?query=";
+const fetch_endpoint = "https://api.fetch.tinyfish.ai";
 const url_param = [_]Param{.{ .name = "url", .description = "HTTPS URL to fetch" }};
 const query_param = [_]Param{.{ .name = "query", .description = "search query" }};
 
 pub const fetch_url: Def = .{
     .name = "fetch_url",
-    .description = "Fetch an HTTPS URL and return its text. No custom headers.",
+    .description = "Fetch an HTTPS URL as clean Markdown with TinyFish.",
     .params = &url_param,
     .run = runFetch,
 };
 
 pub const search: Def = .{
     .name = "search",
-    .description = "Search the web (DuckDuckGo).",
+    .description = "Search the live web with TinyFish.",
     .params = &query_param,
     .run = runSearch,
 };
@@ -32,101 +33,185 @@ const QueryArgs = struct { query: []const u8 };
 fn runFetch(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     const parsed = try std.json.parseFromSlice(UrlArgs, ctx.gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    return doFetch(ctx, parsed.value.url);
+    const url = std.mem.trim(u8, parsed.value.url, &std.ascii.whitespace);
+    if (url.len == 0 or url.len > 4096) return error.InvalidArgs;
+
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try web.guard(url, &host_buf);
+    try allow(ctx, host);
+
+    var body: std.Io.Writer.Allocating = .init(ctx.gpa);
+    defer body.deinit();
+    try body.writer.writeAll("{\"urls\":[");
+    try std.json.Stringify.encodeJsonString(url, .{}, &body.writer);
+    try body.writer.writeAll("],\"format\":\"markdown\"}");
+
+    const raw = try call(ctx, .POST, fetch_endpoint, body.written());
+    defer ctx.gpa.free(raw);
+    return fetchText(ctx.gpa, raw);
 }
 
 fn runSearch(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     const parsed = try std.json.parseFromSlice(QueryArgs, ctx.gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    const q = std.mem.trim(u8, parsed.value.query, &std.ascii.whitespace);
-    if (q.len == 0 or q.len > 512) return error.InvalidArgs;
+    const query = std.mem.trim(u8, parsed.value.query, &std.ascii.whitespace);
+    if (query.len == 0 or query.len > 512) return error.InvalidArgs;
+    try allow(ctx, "api.search.tinyfish.ai");
+
     var url_buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&url_buf);
-    try w.writeAll("https://api.duckduckgo.com/?q=");
-    try std.Uri.Component.percentEncode(&w, q, isUnreserved);
-    try w.writeAll("&format=json&no_html=1&no_redirect=1");
-    const body = try doFetch(ctx, w.buffered());
-    defer ctx.gpa.free(body);
-    return formatSearch(ctx.gpa, body);
+    try w.writeAll(search_url);
+    try std.Uri.Component.percentEncode(&w, query, isUnreserved);
+    return call(ctx, .GET, w.buffered(), null);
 }
 
-fn doFetch(ctx: *Ctx, url: []const u8) ![]u8 {
-    const get = ctx.fetch orelse return error.WebUnavailable;
+fn call(ctx: *Ctx, method: std.http.Method, url: []const u8, body: ?[]const u8) ![]u8 {
+    const api = ctx.web_api orelse return error.WebUnavailable;
+    const key = ctx.tinyfish_key orelse return error.WebUnavailable;
+    var res = try api.call(ctx.gpa, .{ .method = method, .url = url, .key = key, .body = body });
+    defer res.deinit(ctx.gpa);
+    if (res.status < 200 or res.status >= 300) {
+        return std.fmt.allocPrint(ctx.gpa, "TinyFish HTTP {d}", .{res.status});
+    }
+    const out = res.body;
+    res.body = &.{};
+    return out;
+}
+
+fn allow(ctx: *Ctx, host: []const u8) !void {
     const limiter = ctx.limiter orelse return error.WebUnavailable;
     const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
-    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = web.hostOf(url, &host_buf) catch null;
-    const auth = if (host) |h| secrets.valueFor(ctx.db, ctx.gpa, h) catch null else null;
-    defer if (auth) |a| ctx.gpa.free(a);
-    return web.fetch(ctx.gpa, ctx.io, get, limiter, now, url, auth) catch |err|
-        return std.fmt.allocPrint(ctx.gpa, "fetch failed: {s}", .{@errorName(err)});
+    if (!limiter.allow(host, now)) return error.RateLimited;
+}
+
+fn fetchText(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
+    const Reply = struct {
+        results: []const struct { text: []const u8 = "" } = &.{},
+    };
+    const parsed = std.json.parseFromSlice(Reply, gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return gpa.dupe(u8, body);
+    defer parsed.deinit();
+    if (parsed.value.results.len == 0 or parsed.value.results[0].text.len == 0) return gpa.dupe(u8, body);
+    return gpa.dupe(u8, parsed.value.results[0].text);
 }
 
 fn isUnreserved(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
 }
 
-fn formatSearch(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
-    const Parsed = struct {
-        AbstractText: ?[]const u8 = null,
-        AbstractURL: ?[]const u8 = null,
-        Heading: ?[]const u8 = null,
-        Answer: ?[]const u8 = null,
+const FakeApi = struct {
+    reply: []const u8,
+    status: u16 = 200,
+    called: bool = false,
+    method: std.http.Method = .GET,
+    key_ok: bool = false,
+    url: [2048]u8 = undefined,
+    url_len: usize = 0,
+    body: [8192]u8 = undefined,
+    body_len: usize = 0,
+
+    fn api(self: *FakeApi) web.Api {
+        return .{ .ptr = self, .call_fn = request };
+    }
+
+    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, req: web.Api.Request) anyerror!web.Hop {
+        const self: *FakeApi = @ptrCast(@alignCast(ptr));
+        self.called = true;
+        self.method = req.method;
+        self.key_ok = std.mem.eql(u8, req.key, "tf-test");
+        self.url_len = @min(req.url.len, self.url.len);
+        @memcpy(self.url[0..self.url_len], req.url[0..self.url_len]);
+        if (req.body) |body| {
+            self.body_len = @min(body.len, self.body.len);
+            @memcpy(self.body[0..self.body_len], body[0..self.body_len]);
+        }
+        return .{ .status = self.status, .body = try gpa.dupe(u8, self.reply) };
+    }
+};
+
+fn ctxOf(db: *@import("../data/db.zig").Db, io: std.Io, fake: *FakeApi, limiter: *web.Limiter) Ctx {
+    return .{
+        .gpa = testing.allocator,
+        .io = io,
+        .db = db,
+        .web_api = fake.api(),
+        .tinyfish_key = "tf-test",
+        .limiter = limiter,
     };
-    const tree = std.json.parseFromSlice(Parsed, gpa, body, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    }) catch return try gpa.dupe(u8, body);
-    defer tree.deinit();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    var any = false;
-    if (tree.value.Heading) |h| {
-        try out.writer.print("{s}\n", .{h});
-        any = true;
-    }
-    if (tree.value.Answer) |a| {
-        try out.writer.print("{s}\n", .{a});
-        any = true;
-    }
-    if (tree.value.AbstractText) |t| {
-        try out.writer.print("{s}\n", .{t});
-        any = true;
-    }
-    if (tree.value.AbstractURL) |u| {
-        try out.writer.print("{s}\n", .{u});
-        any = true;
-    }
-    if (!any) try out.writer.writeAll("no results\n");
-    return try out.toOwnedSlice();
 }
 
-fn boom(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8) anyerror!web.Hop {
-    return error.ShouldNotRun;
-}
-
-fn tmpPath(tmp: *testing.TmpDir, buf: []u8) ![:0]u8 {
-    return std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
-}
-
-test "fetch_url refuses a private address" {
+test "search calls TinyFish with an encoded query" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [128]u8 = undefined;
-    var db = try Db.open(try tmpPath(&tmp, &buf));
+    var path: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &path);
     defer db.close();
-    try db.migrate();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
+    var fake: FakeApi = .{ .reply = "{\"results\":[{\"title\":\"Zig\",\"snippet\":\"fast\",\"url\":\"https://ziglang.org\"}]}" };
     var limiter: web.Limiter = .{};
-    var ctx: Ctx = .{
-        .gpa = testing.allocator,
-        .io = threaded.io(),
-        .db = &db,
-        .fetch = .{ .ptr = undefined, .request_fn = boom },
-        .limiter = &limiter,
-    };
+    var ctx = ctxOf(&db, threaded.io(), &fake, &limiter);
+
+    const out = try tools.call(&ctx, &tools.builtins, "search", "{\"query\":\"zig 0.16?\"}");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(fake.reply, out);
+    try testing.expectEqual(std.http.Method.GET, fake.method);
+    try testing.expect(fake.key_ok);
+    try testing.expectEqualStrings("https://api.search.tinyfish.ai?query=zig%200.16%3F", fake.url[0..fake.url_len]);
+}
+
+test "fetch_url returns TinyFish Markdown" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &path);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var fake: FakeApi = .{ .reply = "{\"results\":[{\"text\":\"# Example\"}],\"errors\":[]}" };
+    var limiter: web.Limiter = .{};
+    var ctx = ctxOf(&db, threaded.io(), &fake, &limiter);
+
+    const out = try tools.call(&ctx, &tools.builtins, "fetch_url", "{\"url\":\"https://example.com/a?x=1\"}");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# Example", out);
+    try testing.expectEqual(std.http.Method.POST, fake.method);
+    try testing.expect(fake.key_ok);
+    try testing.expectEqualStrings(fetch_endpoint, fake.url[0..fake.url_len]);
+    try testing.expectEqualStrings("{\"urls\":[\"https://example.com/a?x=1\"],\"format\":\"markdown\"}", fake.body[0..fake.body_len]);
+}
+
+test "fetch_url rejects private hosts before TinyFish" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &path);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var fake: FakeApi = .{ .reply = "{}" };
+    var limiter: web.Limiter = .{};
+    var ctx = ctxOf(&db, threaded.io(), &fake, &limiter);
+
     const out = try tools.call(&ctx, &tools.builtins, "fetch_url", "{\"url\":\"https://127.0.0.1/\"}");
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "fetch failed") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Blocked") != null);
+    try testing.expect(!fake.called);
+}
+
+test "TinyFish HTTP failures keep their status" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &path);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var fake: FakeApi = .{ .reply = "{}", .status = 429 };
+    var limiter: web.Limiter = .{};
+    var ctx = ctxOf(&db, threaded.io(), &fake, &limiter);
+
+    const out = try tools.call(&ctx, &tools.builtins, "search", "{\"query\":\"zig\"}");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("TinyFish HTTP 429", out);
 }

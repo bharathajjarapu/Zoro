@@ -104,7 +104,8 @@ pub const Agent = struct {
     skills_dir: []const u8 = "skills",
     workspace: []const u8 = "workspace",
     diary_dir: []const u8 = "data/diary",
-    fetch: ?web.Get = null,
+    web_api: ?web.Api = null,
+    tinyfish_key: ?config.Secret = null,
     limiter: web.Limiter = .{},
     /// Null means nothing runs in the background.
     workers: ?*Workers = null,
@@ -211,7 +212,8 @@ fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), 
                 .db = self.db,
                 .skills_dir = self.skills_dir,
                 .workspace = self.workspace,
-                .fetch = self.fetch,
+                .web_api = self.web_api,
+                .tinyfish_key = if (self.tinyfish_key) |key| key.reveal() else null,
                 .limiter = &self.limiter,
                 .pool = self.pool,
             };
@@ -279,7 +281,8 @@ fn resolveApproval(self: *Agent, input: []const u8, now: i64, verdict: tasks.Dec
         .db = self.db,
         .skills_dir = self.skills_dir,
         .workspace = self.workspace,
-        .fetch = self.fetch,
+        .web_api = self.web_api,
+        .tinyfish_key = if (self.tinyfish_key) |key| key.reveal() else null,
         .limiter = &self.limiter,
         .pool = self.pool,
     };
@@ -388,7 +391,12 @@ fn buildRequest(arena: std.mem.Allocator, model: []const u8, messages: []const M
         try w.writeAll("{\"role\":");
         try writeJsonString(w, m.role);
         try w.writeAll(",\"content\":");
-        if (m.image) |img| try writeParts(arena, w, m.content, img) else try writeJsonString(w, m.content);
+        if (m.image) |img|
+            try writeParts(arena, w, m.content, img)
+        else if (m.tool_calls.len != 0 and m.content.len == 0)
+            try w.writeAll("null")
+        else
+            try writeJsonString(w, m.content);
         if (m.tool_calls.len != 0) {
             try w.writeAll(",\"tool_calls\":[");
             for (m.tool_calls, 0..) |tc, j| {
@@ -431,6 +439,18 @@ fn buildRequest(arena: std.mem.Allocator, model: []const u8, messages: []const M
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try std.json.Stringify.encodeJsonString(s, .{}, w);
+}
+
+test "tool calls without text serialize null content" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const messages = [_]Msg{.{
+        .role = "assistant",
+        .content = "",
+        .tool_calls = &.{.{ .id = "c1", .name = "echo", .arguments = "{}" }},
+    }};
+    const body = try buildRequest(arena.allocator(), "m", &messages, &.{});
+    try testing.expect(std.mem.indexOf(u8, body, "\"content\":null") != null);
 }
 
 /// Writes OpenAI image content parts.

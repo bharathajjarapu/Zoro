@@ -30,6 +30,7 @@ pub const Config = struct {
     owner_id: ?i64 = null,
     chat_id: ?i64 = null,
     api_key: ?Secret = null,
+    tinyfish_key: ?Secret = null,
     /// Callers apply the default model endpoint.
     base_url: ?[]const u8 = null,
     model: ?[]const u8 = null,
@@ -60,13 +61,15 @@ pub const Config = struct {
             self.base_url = val;
         } else if (eql(u8, key, "LLM_MODEL")) {
             self.model = val;
+        } else if (eql(u8, key, "TINYFISH_API_KEY")) {
+            self.tinyfish_key = .init(val);
         } else if (eql(u8, key, "ZORO_DATA_DIR")) {
             self.data_dir = val;
         } else if (eql(u8, key, "ZORO_WORKSPACE")) {
             self.workspace = val;
         } else if (eql(u8, key, "ZORO_SKILLS_DIR")) {
             self.skills_dir = val;
-        } else if (std.mem.startsWith(u8, key, "ZORO_") or std.mem.startsWith(u8, key, "LLM_")) {
+        } else if (std.mem.startsWith(u8, key, "ZORO_") or std.mem.startsWith(u8, key, "LLM_") or std.mem.startsWith(u8, key, "TINYFISH_")) {
             // Log names only because values may be secrets.
             log.warn("unknown config key: {s}", .{key});
         }
@@ -131,12 +134,14 @@ test "parse reads keys, skipping comments and blanks" {
         \\LLM_API_KEY = sk-test
         \\LLM_BASE_URL = https://api.example/v1
         \\LLM_MODEL = gpt-5
+        \\TINYFISH_API_KEY = tf-test
     );
     try testing.expectEqualStrings("123:abc", cfg.telegram_token.?.reveal());
     try testing.expectEqual(@as(i64, 42), cfg.owner_id.?);
     try testing.expectEqualStrings("sk-test", cfg.api_key.?.reveal());
     try testing.expectEqualStrings("https://api.example/v1", cfg.base_url.?);
     try testing.expectEqualStrings("gpt-5", cfg.model.?);
+    try testing.expectEqualStrings("tf-test", cfg.tinyfish_key.?.reveal());
 }
 
 test "parse reads CHAT_ID" {

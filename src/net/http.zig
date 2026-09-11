@@ -25,6 +25,10 @@ pub const StdHttp = struct {
         return web.fromClient(&self.client);
     }
 
+    pub fn webApi(self: *StdHttp) web.Api {
+        return .{ .ptr = self, .call_fn = webCall };
+    }
+
     fn post(ptr: *anyopaque, gpa: std.mem.Allocator, req: agent.Http.Request) anyerror!agent.Http.Response {
         const self: *StdHttp = @ptrCast(@alignCast(ptr));
         var cap: CappedBody = undefined;
@@ -49,6 +53,30 @@ pub const StdHttp = struct {
             .status = @intFromEnum(result.status),
             .body = try cap.take(),
         };
+    }
+
+    fn webCall(ptr: *anyopaque, gpa: std.mem.Allocator, req: web.Api.Request) anyerror!web.Hop {
+        const self: *StdHttp = @ptrCast(@alignCast(ptr));
+        var cap: CappedBody = undefined;
+        cap.init(gpa, max_body);
+        defer cap.deinit();
+        const key = [_]std.http.Header{.{ .name = "X-API-Key", .value = req.key }};
+        const result = self.client.fetch(.{
+            .location = .{ .url = req.url },
+            .method = req.method,
+            .payload = req.body,
+            .headers = .{
+                .content_type = if (req.body != null) .{ .override = "application/json" } else .omit,
+                .user_agent = .{ .override = "zoro/0.0" },
+            },
+            .extra_headers = &key,
+            .redirect_behavior = .unhandled,
+            .response_writer = &cap.writer,
+        }) catch |err| {
+            if (cap.overflow) return error.ResponseTooLarge;
+            return err;
+        };
+        return .{ .status = @intFromEnum(result.status), .body = try cap.take() };
     }
 };
 

@@ -5,6 +5,22 @@ pub const max_body: usize = 2 * 1024 * 1024;
 pub const per_host_per_min: usize = 10;
 const max_hops: u8 = 5;
 
+pub const Api = struct {
+    ptr: *anyopaque,
+    call_fn: *const fn (*anyopaque, std.mem.Allocator, Request) anyerror!Hop,
+
+    pub const Request = struct {
+        method: std.http.Method,
+        url: []const u8,
+        key: []const u8,
+        body: ?[]const u8 = null,
+    };
+
+    pub fn call(self: Api, gpa: std.mem.Allocator, req: Request) anyerror!Hop {
+        return self.call_fn(self.ptr, gpa, req);
+    }
+};
+
 pub const Get = struct {
     ptr: *anyopaque,
     request_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, ?[]const u8) anyerror!Hop,

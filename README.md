@@ -13,6 +13,7 @@ Written in Zig 0.16 with exactly one vendored C dependency (SQLite).
 - A Telegram bot token from [@BotFather](https://t.me/BotFather), your numeric
   Telegram user id, and the chat id of your private chat with the bot.
 - An OpenAI-compatible endpoint and key.
+- A TinyFish API key for web search and fetching.
 
 Nothing else. No package manager, no runtime downloads.
 
@@ -36,6 +37,7 @@ file, so secrets can stay out of it entirely.
 |---|---|---|
 | `LLM_API_KEY` | yes | Key for the OpenAI-compatible endpoint |
 | `LLM_MODEL` | yes | Model name, e.g. `gpt-4.1-mini` |
+| `TINYFISH_API_KEY` | web tools | Key for TinyFish Search and Fetch |
 | `TELEGRAM_TOKEN` | daemon only | Bot token from BotFather |
 | `OWNER_ID` | daemon only | Your numeric Telegram user id |
 | `CHAT_ID` | daemon only | The private chat id to serve |

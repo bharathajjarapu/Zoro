@@ -19,7 +19,8 @@ pub const Ctx = struct {
     db: *Db,
     skills_dir: []const u8 = "skills",
     workspace: []const u8 = "workspace",
-    fetch: ?web.Get = null,
+    web_api: ?web.Api = null,
+    tinyfish_key: ?[]const u8 = null,
     limiter: ?*web.Limiter = null,
     pool: ?*worker.Pool = null,
 };

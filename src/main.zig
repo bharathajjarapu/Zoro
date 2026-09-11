@@ -316,7 +316,8 @@ fn makeAgent(p: std.process.Init, cfg: config.Config, db: *Db, client: *http.Std
         .workspace = cfg.workspace,
         .skills_dir = cfg.skills_dir,
         .diary_dir = diary,
-        .fetch = client.getter(),
+        .web_api = client.webApi(),
+        .tinyfish_key = cfg.tinyfish_key,
     };
 }
 
