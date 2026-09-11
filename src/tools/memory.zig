@@ -1,6 +1,6 @@
 const std = @import("std");
-const mem = @import("../memory.zig");
-const tools = @import("../tools.zig");
+const mem = @import("../data/memory.zig");
+const tools = @import("root.zig");
 
 const Param = tools.Param;
 const Def = tools.Def;
@@ -94,7 +94,7 @@ fn runForget(ctx: *Ctx, args: []const u8) anyerror![]u8 {
 }
 
 const testing = std.testing;
-const Db = @import("../db.zig").Db;
+const Db = @import("../data/db.zig").Db;
 
 fn tmpPath(tmp: *testing.TmpDir, buf: []u8) ![:0]u8 {
     return std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});

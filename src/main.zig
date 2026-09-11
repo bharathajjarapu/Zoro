@@ -1,14 +1,14 @@
 const std = @import("std");
 const c = @import("c");
-const config = @import("config.zig");
-const Db = @import("db.zig").Db;
-const agent = @import("agent.zig");
-const cli = @import("cli.zig");
-const telegram = @import("telegram.zig");
-const tools = @import("tools.zig");
-const scheduler = @import("scheduler.zig");
-const worker = @import("worker.zig");
-const http = @import("http.zig");
+const config = @import("app/config.zig");
+const Db = @import("data/db.zig").Db;
+const agent = @import("agent/root.zig");
+const cli = @import("app/cli.zig");
+const telegram = @import("channel/telegram.zig");
+const tools = @import("tools/root.zig");
+const scheduler = @import("automation/scheduler.zig");
+const worker = @import("agent/worker.zig");
+const http = @import("net/http.zig");
 
 const log = std.log.scoped(.zoro);
 
@@ -418,22 +418,22 @@ test "sqlite reports the pinned version" {
 }
 
 test {
-    _ = @import("db.zig");
-    _ = @import("config.zig");
-    _ = @import("agent.zig");
-    _ = @import("cli.zig");
-    _ = @import("telegram.zig");
-    _ = @import("memory.zig");
-    _ = @import("tools.zig");
-    _ = @import("skills.zig");
-    _ = @import("web.zig");
-    _ = @import("secrets.zig");
-    _ = @import("tasks.zig");
-    _ = @import("scheduler.zig");
-    _ = @import("cron.zig");
-    _ = @import("outbox.zig");
-    _ = @import("worker.zig");
-    _ = @import("http.zig");
+    _ = @import("data/db.zig");
+    _ = @import("app/config.zig");
+    _ = @import("agent/root.zig");
+    _ = @import("app/cli.zig");
+    _ = @import("channel/telegram.zig");
+    _ = @import("data/memory.zig");
+    _ = @import("tools/root.zig");
+    _ = @import("automation/skills.zig");
+    _ = @import("net/web.zig");
+    _ = @import("data/secrets.zig");
+    _ = @import("data/tasks.zig");
+    _ = @import("automation/scheduler.zig");
+    _ = @import("automation/cron.zig");
+    _ = @import("data/outbox.zig");
+    _ = @import("agent/worker.zig");
+    _ = @import("net/http.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {

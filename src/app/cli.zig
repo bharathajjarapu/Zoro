@@ -1,12 +1,12 @@
 const std = @import("std");
-const agent = @import("agent.zig");
-const memory = @import("memory.zig");
-const tasks = @import("tasks.zig");
-const outbox = @import("outbox.zig");
-const Db = @import("db.zig").Db;
+const agent = @import("../agent/root.zig");
+const memory = @import("../data/memory.zig");
+const tasks = @import("../data/tasks.zig");
+const outbox = @import("../data/outbox.zig");
+const Db = @import("../data/db.zig").Db;
 const Agent = agent.Agent;
 const testing = std.testing;
-const testkit = @import("testkit.zig");
+const testkit = @import("../testing/testkit.zig");
 const FakeHttp = testkit.FakeHttp;
 
 pub const max_prompt = 64 * 1024;
@@ -53,7 +53,7 @@ pub fn chat(a: *Agent, in: *std.Io.Reader, out: *std.Io.Writer, err_out: *std.Io
 }
 
 /// Anything a routine or tool queued for the owner. The terminal prints it; the
-/// Telegram driver sends it. Neither is visible to `agent.zig`.
+/// Telegram driver sends it. Neither is visible to `agent/root.zig`.
 fn drain(a: *Agent, out: *std.Io.Writer) !void {
     const items = try outbox.drain(a.db, a.gpa);
     defer outbox.free(a.gpa, items);

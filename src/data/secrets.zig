@@ -1,7 +1,7 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const testing = std.testing;
-const testkit = @import("testkit.zig");
+const testkit = @import("../testing/testkit.zig");
 
 /// Accepted risk: the raw key reaches the LLM provider once, in the message
 /// that carries it. Intake is conversational; the scrub runs after storage.

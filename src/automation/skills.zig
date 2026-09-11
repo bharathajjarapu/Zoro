@@ -1,5 +1,5 @@
 const std = @import("std");
-const tools = @import("tools.zig");
+const tools = @import("../tools/root.zig");
 const testing = std.testing;
 
 pub const Skill = struct {

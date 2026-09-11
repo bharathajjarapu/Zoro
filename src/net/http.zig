@@ -1,5 +1,5 @@
 const std = @import("std");
-const agent = @import("agent.zig");
+const agent = @import("../agent/root.zig");
 const web = @import("web.zig");
 const testing = std.testing;
 

@@ -1,6 +1,6 @@
 const std = @import("std");
-const tools = @import("../tools.zig");
-const Db = @import("../db.zig").Db;
+const tools = @import("root.zig");
+const Db = @import("../data/db.zig").Db;
 
 const name_param = [_]tools.Param{.{ .name = "name", .description = "routine name" }};
 

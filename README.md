@@ -155,19 +155,16 @@ three mounts.
 ## Layout
 
 ```
-src/          the product
-  agent.zig       context assembly and the bounded model/tool loop
-  http.zig        the HTTP client behind the one injected seam
-  cron.zig        schedule expressions, independent of what fires them
-  worker.zig      subagents: slots, budgets, cancellation, verification
-  scheduler.zig   tick loop, cron and intervals, authority, missed runs
-  telegram.zig    long poll, owner auth, chunking, media
-  memory.zig      facts, diary, BM25 retrieval, nightly compaction
-  tasks.zig       tasks, approvals, routine state
-  outbox.zig      queued messages and attachments for the owner
-  testkit.zig     shared test scaffolding; never reaches the binary
-  schema.sql      fresh-install DDL
-  migrations/     one file per upgrade step, append-only
+src/              the product
+  main.zig        process entry point and composition root
+  app/            configuration and terminal commands
+  agent/          model loop and fresh-context workers
+  channel/        Telegram polling, auth, media, and delivery
+  data/           SQLite, memory, tasks, secrets, and outbox
+  net/            bounded HTTP and guarded web fetching
+  automation/     skills, schedules, and routine execution
+  tools/          tool registry and implementations
+  testing/        shared test support; never reaches the binary
 vendor/sqlite3/   pinned, checksummed amalgamation
 docs/             ARCHITECTURE.md is the source of truth for design
 ```
@@ -177,7 +174,8 @@ docs/             ARCHITECTURE.md is the source of truth for design
 Two limits from `docs/ARCHITECTURE.md` are designed but not enforced:
 
 - **The daily spend cap.** No ticket covers metering. Every model call, image
-  turns included, goes through one path in `agent.zig`, so it lands in one place.
+  turns included, goes through one path in `src/agent/root.zig`, so it lands in
+  one place.
 - **The 10 s web request timeout.** Unreachable in Zig 0.16 — `std.http.Client`
   ignores the timeout field it accepts. A hung host stalls that turn and the
   poll loop with it. The 2 MB body cap and per-host rate limit still apply.

@@ -1,10 +1,10 @@
 const std = @import("std");
-const agent = @import("agent.zig");
-const Db = @import("db.zig").Db;
-const tasks = @import("tasks.zig");
-const tools = @import("tools.zig");
+const agent = @import("root.zig");
+const Db = @import("../data/db.zig").Db;
+const tasks = @import("../data/tasks.zig");
+const tools = @import("../tools/root.zig");
 const testing = std.testing;
-const testkit = @import("testkit.zig");
+const testkit = @import("../testing/testkit.zig");
 const FakeHttp = testkit.FakeHttp;
 
 const log = std.log.scoped(.worker);

@@ -3,7 +3,7 @@ const Db = @import("db.zig").Db;
 const Stmt = @import("db.zig").Stmt;
 const secrets = @import("secrets.zig");
 const testing = std.testing;
-const testkit = @import("testkit.zig");
+const testkit = @import("../testing/testkit.zig");
 
 pub const Source = enum {
     owner,

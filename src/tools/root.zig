@@ -1,8 +1,8 @@
 const std = @import("std");
-const Db = @import("db.zig").Db;
-const web = @import("web.zig");
+const Db = @import("../data/db.zig").Db;
+const web = @import("../net/web.zig");
 const testing = std.testing;
-const testkit = @import("testkit.zig");
+const testkit = @import("../testing/testkit.zig");
 
 pub const max_result: usize = 64 * 1024;
 const trunc_mark = "\n[truncated]";
@@ -58,7 +58,7 @@ fn listed(list: []const u8, name: []const u8) bool {
     return false;
 }
 
-const secrets = @import("secrets.zig");
+const secrets = @import("../data/secrets.zig");
 const secret_params = [_]Param{
     .{ .name = "name", .description = "short name, e.g. weather_api_key" },
     .{ .name = "value", .description = "the secret itself" },
@@ -82,13 +82,13 @@ fn runStoreSecret(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     return try std.fmt.allocPrint(ctx.gpa, "stored {s} for {s}", .{ parsed.value.name, parsed.value.host });
 }
 
-pub const memory = @import("tools/memory.zig");
-const skills = @import("skills.zig");
-const web_tools = @import("tools/web.zig");
-const tasks = @import("tasks.zig");
-const outbox = @import("outbox.zig");
-const routine = @import("tools/routine.zig");
-const worker = @import("worker.zig");
+pub const memory = @import("memory.zig");
+const skills = @import("../automation/skills.zig");
+const web_tools = @import("web.zig");
+const tasks = @import("../data/tasks.zig");
+const outbox = @import("../data/outbox.zig");
+const routine = @import("routine.zig");
+const worker = @import("../agent/worker.zig");
 
 const ask_params = [_]Param{
     .{ .name = "tool", .description = "tool to run if approved" },

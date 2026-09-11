@@ -2,8 +2,8 @@
 //! the binary. Everything here captures into fixed buffers rather than the
 //! allocator, so no test has to free the fake it used.
 const std = @import("std");
-const agent = @import("agent.zig");
-const Db = @import("db.zig").Db;
+const agent = @import("../agent/root.zig");
+const Db = @import("../data/db.zig").Db;
 const testing = std.testing;
 
 pub const max_calls = 32;

@@ -1,15 +1,15 @@
 const std = @import("std");
-const config = @import("config.zig");
-const Db = @import("db.zig").Db;
-const memory = @import("memory.zig");
-const skills = @import("skills.zig");
-const tools = @import("tools.zig");
-const web = @import("web.zig");
-const secrets = @import("secrets.zig");
-const tasks = @import("tasks.zig");
+const config = @import("../app/config.zig");
+const Db = @import("../data/db.zig").Db;
+const memory = @import("../data/memory.zig");
+const skills = @import("../automation/skills.zig");
+const tools = @import("../tools/root.zig");
+const web = @import("../net/web.zig");
+const secrets = @import("../data/secrets.zig");
+const tasks = @import("../data/tasks.zig");
 const worker = @import("worker.zig");
 const testing = std.testing;
-const testkit = @import("testkit.zig");
+const testkit = @import("../testing/testkit.zig");
 const FakeHttp = testkit.FakeHttp;
 
 const log = std.log.scoped(.agent);
@@ -70,7 +70,7 @@ pub const Input = struct {
     image: ?Image = null,
 };
 
-/// A tool the loop can call. Defined in `tools.zig`; this alias keeps call
+/// A tool the loop can call. Defined in `tools/root.zig`; this alias keeps call
 /// sites in this file short.
 pub const Tool = tools.Def;
 
@@ -731,7 +731,7 @@ test "tool results truncate at 64 KiB" {
 }
 
 test "agent module stays free of channel imports" {
-    const src = @embedFile("agent.zig");
+    const src = @embedFile("root.zig");
     // Char arrays so the forbidden tokens are not present as literals in this file.
     const a = [_]u8{ 't', 'e', 'l', 'e', 'g', 'r', 'a', 'm', '.', 'z', 'i', 'g' };
     const b = [_]u8{ '@', 'i', 'm', 'p', 'o', 'r', 't', '(', '"', 't', 'e', 'l', 'e', 'g', 'r', 'a', 'm' };

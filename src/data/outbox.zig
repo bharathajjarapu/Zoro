@@ -1,8 +1,8 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
-const tools = @import("tools.zig");
+const tools = @import("../tools/root.zig");
 const testing = std.testing;
-const testkit = @import("testkit.zig");
+const testkit = @import("../testing/testkit.zig");
 
 /// Nothing the agent queues may be larger than one Telegram message; the
 /// channel chunks anything longer.

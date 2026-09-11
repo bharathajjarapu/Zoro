@@ -1,7 +1,7 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const testing = std.testing;
-const testkit = @import("testkit.zig");
+const testkit = @import("../testing/testkit.zig");
 
 /// Attempts per task: one try plus one retry, matching the delegation limit in
 /// docs/ARCHITECTURE.md. This is the only retry policy in the codebase.

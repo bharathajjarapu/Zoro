@@ -1,12 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
-const testkit = @import("testkit.zig");
+const testkit = @import("../testing/testkit.zig");
 const FakeHttp = testkit.FakeHttp;
-const agent = @import("agent.zig");
-const config = @import("config.zig");
-const Db = @import("db.zig").Db;
-const outbox = @import("outbox.zig");
-const web = @import("web.zig");
+const agent = @import("../agent/root.zig");
+const config = @import("../app/config.zig");
+const Db = @import("../data/db.zig").Db;
+const outbox = @import("../data/outbox.zig");
+const web = @import("../net/web.zig");
 
 const log = std.log.scoped(.telegram);
 

@@ -1,8 +1,8 @@
 const std = @import("std");
-const tools = @import("../tools.zig");
-const web = @import("../web.zig");
-const secrets = @import("../secrets.zig");
-const Db = @import("../db.zig").Db;
+const tools = @import("root.zig");
+const web = @import("../net/web.zig");
+const secrets = @import("../data/secrets.zig");
+const Db = @import("../data/db.zig").Db;
 const testing = std.testing;
 
 const Param = tools.Param;
