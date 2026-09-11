@@ -165,12 +165,11 @@ src/              the product
   tools/          tool registry and implementations
   testing/        shared test support; never reaches the binary
 vendor/sqlite3/   pinned, checksummed amalgamation
-docs/             ARCHITECTURE.md is the source of truth for design
 ```
 
 ## Not built yet
 
-Two limits from `docs/ARCHITECTURE.md` are designed but not enforced:
+Two designed limits are not enforced:
 
 - **The daily spend cap.** No ticket covers metering. Every model call, image
   turns included, goes through one path in `src/agent/root.zig`, so it lands in
