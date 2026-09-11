@@ -90,8 +90,6 @@ pub const Budget = struct {
     rounds: usize = max_rounds,
     system: []const u8 = system_prompt,
     cancel: ?*const Workers = null,
-    /// Overrides the default model.
-    model: ?[]const u8 = null,
 };
 
 pub const Agent = struct {
@@ -106,8 +104,6 @@ pub const Agent = struct {
     skills_dir: []const u8 = "skills",
     workspace: []const u8 = "workspace",
     diary_dir: []const u8 = "data/diary",
-    /// Model profile used when the owner sends a picture. Falls back to `model`.
-    vision_model: ?[]const u8 = null,
     fetch: ?web.Get = null,
     limiter: web.Limiter = .{},
     /// Null means nothing runs in the background.
@@ -148,10 +144,7 @@ pub const Agent = struct {
         // Attach the image to the stored caption without persisting its bytes.
         if (in.image) |img| messages.items[messages.items.len - 1].image = img;
 
-        const reply = try drive(self, arena, &messages, .{
-            .tools = self.tools,
-            .model = if (in.image != null) self.vision_model else null,
-        });
+        const reply = try drive(self, arena, &messages, .{ .tools = self.tools });
         errdefer self.gpa.free(reply);
         try insertMsg(self.db, "assistant", reply, now);
         return reply;
@@ -186,7 +179,7 @@ fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), 
             );
         }
 
-        const body = try buildRequest(arena, b.model orelse self.model, messages.items, b.tools);
+        const body = try buildRequest(arena, self.model, messages.items, b.tools);
         var res = try self.http.post(self.gpa, .{
             .url = endpoint,
             .auth = auth,
@@ -1094,7 +1087,7 @@ test "a bare yes with nothing pending is an ordinary message" {
     try testing.expectEqual(@as(usize, 1), fake.i);
 }
 
-test "a picture reaches the vision profile with its caption, and is not persisted" {
+test "a picture reaches the base model with its caption, and is not persisted" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
@@ -1114,8 +1107,7 @@ test "a picture reaches the vision profile with its caption, and is not persiste
         .http = fake.http(),
         .api_key = .init("k"),
         .base_url = "https://api.openai.com/v1",
-        .model = "text-only",
-        .vision_model = "sees-things",
+        .model = "base-model",
     };
 
     const reply = try a.turnWith(.{
@@ -1126,7 +1118,7 @@ test "a picture reaches the vision profile with its caption, and is not persiste
     try testing.expectEqualStrings("a cat", reply);
 
     const sent = fake.sent();
-    try testing.expect(std.mem.indexOf(u8, sent, "\"sees-things\"") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "\"base-model\"") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "data:image/jpeg;base64,/9j/") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "\"what is this\"") != null);
 

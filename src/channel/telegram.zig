@@ -41,7 +41,7 @@ pub const Update = struct {
     chat_type: []u8,
     /// Text, caption, or attachment description.
     text: []u8,
-    /// Photo selected for the vision model.
+    /// Photo selected for the model.
     photo: ?[]u8 = null,
 
     pub fn deinit(self: *Update, gpa: std.mem.Allocator) void {
@@ -605,7 +605,7 @@ fn baseName(path: []const u8) []const u8 {
     return path[cut + 1 ..];
 }
 
-/// Sniffs common image types for the vision model.
+/// Sniffs common image types for the model.
 fn sniff(bytes: []const u8) []const u8 {
     if (std.mem.startsWith(u8, bytes, "\x89PNG")) return "image/png";
     if (std.mem.startsWith(u8, bytes, "GIF8")) return "image/gif";
@@ -966,7 +966,7 @@ const FakeGet = struct {
 
 const ok_json = "{\"ok\":true,\"result\":{}}";
 
-test "a photo is downloaded and reaches the vision model with its caption" {
+test "a photo is downloaded and reaches the base model with its caption" {
     var h: Harness = undefined;
     try h.init(&.{
         \\{"ok":true,"result":[{"update_id":5,"message":{"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"caption":"what plant is this","photo":[{"file_id":"small","file_size":100},{"file_id":"big","file_size":900}]}}]}
@@ -979,8 +979,6 @@ test "a photo is downloaded and reaches the vision model with its caption" {
 
     var files: FakeGet = .{ .body = "\x89PNG\r\n\x1a\n" };
     h.bot.fetch = files.get();
-    h.agent.vision_model = "sees-things";
-
     try h.bot.pollOnce();
 
     try testing.expectEqual(@as(usize, 1), files.calls);
@@ -989,7 +987,7 @@ test "a photo is downloaded and reaches the vision model with its caption" {
         std.mem.indexOf(u8, h.tg.url(2), "getFile") != null);
 
     const asked = h.llm.sent();
-    try testing.expect(std.mem.indexOf(u8, asked, "\"sees-things\"") != null);
+    try testing.expect(std.mem.indexOf(u8, asked, "\"m\"") != null);
     try testing.expect(std.mem.indexOf(u8, asked, "data:image/png;base64,") != null);
     try testing.expect(std.mem.indexOf(u8, asked, "what plant is this") != null);
 }

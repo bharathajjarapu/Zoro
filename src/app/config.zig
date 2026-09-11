@@ -33,8 +33,6 @@ pub const Config = struct {
     /// Callers apply the default model endpoint.
     base_url: ?[]const u8 = null,
     model: ?[]const u8 = null,
-    /// Falls back to `model` for pictures.
-    vision_model: ?[]const u8 = null,
     data_dir: []const u8 = "data",
     /// Only this directory permits file access.
     workspace: []const u8 = "workspace",
@@ -62,8 +60,6 @@ pub const Config = struct {
             self.base_url = val;
         } else if (eql(u8, key, "LLM_MODEL")) {
             self.model = val;
-        } else if (eql(u8, key, "LLM_VISION_MODEL")) {
-            self.vision_model = val;
         } else if (eql(u8, key, "ZORO_DATA_DIR")) {
             self.data_dir = val;
         } else if (eql(u8, key, "ZORO_WORKSPACE")) {

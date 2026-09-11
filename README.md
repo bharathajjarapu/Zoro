@@ -40,7 +40,6 @@ file, so secrets can stay out of it entirely.
 | `OWNER_ID` | daemon only | Your numeric Telegram user id |
 | `CHAT_ID` | daemon only | The private chat id to serve |
 | `LLM_BASE_URL` | no | Defaults to `https://api.openai.com/v1` |
-| `LLM_VISION_MODEL` | no | Profile used when you send a picture; defaults to `LLM_MODEL` |
 | `ZORO_DATA_DIR` | no | Database, diary and lock file. Default `data` |
 | `ZORO_SKILLS_DIR` | no | Where `SKILL.md` files live. Default `skills` |
 | `ZORO_WORKSPACE` | no | The only directory files may be read from or attached. Default `workspace` |

@@ -304,7 +304,6 @@ fn diaryDir(p: std.process.Init, cfg: config.Config) ![]const u8 {
 
 /// Requires checked API key and model values.
 fn makeAgent(p: std.process.Init, cfg: config.Config, db: *Db, client: *http.StdHttp, diary: []const u8) agent.Agent {
-    const model = cfg.model.?;
     return .{
         .gpa = p.gpa,
         .io = p.io,
@@ -312,8 +311,7 @@ fn makeAgent(p: std.process.Init, cfg: config.Config, db: *Db, client: *http.Std
         .http = client.http(),
         .api_key = cfg.api_key.?,
         .base_url = cfg.base_url orelse agent.default_base_url,
-        .model = model,
-        .vision_model = cfg.vision_model orelse model,
+        .model = cfg.model.?,
         .tools = &tools.builtins,
         .workspace = cfg.workspace,
         .skills_dir = cfg.skills_dir,
