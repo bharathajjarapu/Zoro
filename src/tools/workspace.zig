@@ -16,31 +16,31 @@ const delete = workspace.delete;
 const checkExisting = workspace.checkExisting;
 const openFile = workspace.openFile;
 
-const path_param = [_]tools.Param{.{ .name = "path", .description = "workspace-relative file path" }};
+const path_param = [_]tools.Param{.{ .name = "path", .description = "workspace path" }};
 const write_params = [_]tools.Param{
-    .{ .name = "path", .description = "workspace-relative file path" },
-    .{ .name = "content", .description = "UTF-8 file content" },
+    .{ .name = "path", .description = "workspace path" },
+    .{ .name = "content", .description = "UTF-8 content" },
 };
 const edit_params = [_]tools.Param{
-    .{ .name = "path", .description = "workspace-relative file path" },
-    .{ .name = "old", .description = "exact text occurring once" },
-    .{ .name = "new", .description = "replacement text" },
+    .{ .name = "path", .description = "workspace path" },
+    .{ .name = "old", .description = "unique exact text" },
+    .{ .name = "new", .description = "replacement" },
 };
 const download_params = [_]tools.Param{
     .{ .name = "url", .description = "HTTPS URL" },
-    .{ .name = "path", .description = "workspace-relative destination" },
+    .{ .name = "path", .description = "workspace path" },
 };
 
 pub const read_file: tools.Def = .{
     .name = "read_file",
-    .description = "Read a bounded UTF-8 file from the workspace.",
+    .description = "Read workspace text.",
     .params = &path_param,
     .run = runRead,
 };
 
 pub const write_file: tools.Def = .{
     .name = "write_file",
-    .description = "Atomically write a UTF-8 file in the workspace.",
+    .description = "Write workspace text.",
     .params = &write_params,
     .mutates = true,
     .primary_only = true,
@@ -49,7 +49,7 @@ pub const write_file: tools.Def = .{
 
 pub const edit_file: tools.Def = .{
     .name = "edit_file",
-    .description = "Replace one exact unique match in a workspace file.",
+    .description = "Edit one unique match.",
     .params = &edit_params,
     .mutates = true,
     .primary_only = true,
@@ -58,7 +58,7 @@ pub const edit_file: tools.Def = .{
 
 pub const download_file: tools.Def = .{
     .name = "download_file",
-    .description = "Download an HTTPS URL into the workspace.",
+    .description = "Download into workspace.",
     .params = &download_params,
     .mutates = true,
     .primary_only = true,
@@ -67,7 +67,7 @@ pub const download_file: tools.Def = .{
 
 pub const delete_file: tools.Def = .{
     .name = "delete_file",
-    .description = "Request approval to delete one workspace file.",
+    .description = "Request file deletion.",
     .params = &path_param,
     .mutates = true,
     .primary_only = true,
@@ -76,7 +76,7 @@ pub const delete_file: tools.Def = .{
 
 pub const delete_approved: tools.Def = .{
     .name = "delete_file",
-    .description = "Delete one owner-approved workspace file.",
+    .description = "Delete approved file.",
     .params = &path_param,
     .mutates = true,
     .primary_only = true,
@@ -184,7 +184,7 @@ const FakeGet = struct {
         return .{ .ptr = self, .request_fn = request };
     }
 
-    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: ?std.Io.net.IpAddress) anyerror!web.Hop {
+    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: ?std.Io.net.IpAddress, _: usize) anyerror!web.Hop {
         const self: *FakeGet = @ptrCast(@alignCast(ptr));
         self.called = true;
         return .{ .status = self.status, .body = try gpa.dupe(u8, self.body) };

@@ -190,12 +190,12 @@ test "schema creates every table and is idempotent" {
     var q = try db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'chunks_%' ORDER BY name");
     defer q.finalize();
     const want = [_][]const u8{
-        "approvals",       "approvals_status", "chunks",             "diary",
-        "facts",           "kv",               "learning_proposals", "learning_proposals_status",
-        "messages",        "messages_created", "outbox",             "outbox_ready",
-        "outbox_status",   "routines",         "routines_next",      "secrets",
-        "sticker_aliases", "sticker_cache",    "sticker_learning",   "tasks",
-        "tasks_parent",    "tasks_status",     "telegram_updates",   "telegram_updates_status",
+        "approvals",    "approvals_status",      "chunks",             "diary",
+        "facts",        "kv",                    "learning_proposals", "learning_proposals_status",
+        "messages",     "messages_conversation", "messages_created",   "outbox",
+        "outbox_ready", "outbox_status",         "routines",           "routines_next",
+        "secrets",      "sticker_aliases",       "sticker_learning",   "tasks",
+        "tasks_parent", "tasks_status",          "telegram_updates",   "telegram_updates_status",
     };
 
     // Compare inside the loop: a column slice dies at the next step().

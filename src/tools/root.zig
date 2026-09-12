@@ -5,7 +5,7 @@ const web = @import("../net/web.zig");
 const testing = std.testing;
 const testkit = @import("../testing/testkit.zig");
 
-pub const max_result: usize = 64 * 1024;
+pub const max_result: usize = 16 * 1024;
 const trunc_mark = "\n[truncated]";
 
 pub const Param = struct {
@@ -31,6 +31,7 @@ pub const Ctx = struct {
     shell_mode: ShellMode = .ask,
     source_message: ?i64 = null,
     approval_out: ?*?i64 = null,
+    delivery_out: ?*bool = null,
     cancel: ?*const std.atomic.Value(bool) = null,
     cancel_parent: ?*const std.atomic.Value(bool) = null,
 
@@ -75,14 +76,14 @@ fn listed(list: []const u8, name: []const u8) bool {
 
 const secrets = @import("../data/secrets.zig");
 const secret_params = [_]Param{
-    .{ .name = "name", .description = "short name, e.g. weather_api_key" },
-    .{ .name = "value", .description = "the secret itself" },
-    .{ .name = "host", .description = "the one HTTPS host this secret may be sent to" },
+    .{ .name = "name", .description = "secret name" },
+    .{ .name = "value", .description = "secret value" },
+    .{ .name = "host", .description = "allowed HTTPS host" },
 };
 
 pub const store_secret: Def = .{
     .name = "store_secret",
-    .description = "Store an API key. The value is scrubbed from the transcript; only the name remains visible.",
+    .description = "Store a host-bound secret.",
     .params = &secret_params,
     .mutates = true,
     .run = runStoreSecret,
@@ -109,15 +110,15 @@ const shell = @import("shell.zig");
 const learning = @import("learning.zig");
 
 const ask_params = [_]Param{
-    .{ .name = "tool", .description = "tool to run if approved" },
-    .{ .name = "args", .description = "exact JSON arguments bound to the approval" },
-    .{ .name = "reason", .description = "plain-language explanation for the owner" },
-    .{ .name = "target", .description = "what the action touches", .required = false },
+    .{ .name = "tool", .description = "tool name" },
+    .{ .name = "args", .description = "exact JSON arguments" },
+    .{ .name = "reason", .description = "approval reason" },
+    .{ .name = "target", .description = "affected target", .required = false },
 };
 
 pub const request_permission: Def = .{
     .name = "request_permission",
-    .description = "Record a pending action. The owner must approve this exact tool and arguments in chat.",
+    .description = "Ask approval for one action.",
     .params = &ask_params,
     .mutates = true,
     .run = runAsk,

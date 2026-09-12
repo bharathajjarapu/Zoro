@@ -7,20 +7,20 @@ const Def = tools.Def;
 const Ctx = tools.Ctx;
 
 const kv = [_]Param{
-    .{ .name = "key", .description = "short name for this fact" },
-    .{ .name = "value", .description = "the fact itself" },
+    .{ .name = "key", .description = "short fact name" },
+    .{ .name = "value", .description = "fact" },
 };
-const key_only = [_]Param{.{ .name = "key", .description = "fact key to forget" }};
-const query = [_]Param{.{ .name = "query", .description = "what to search for" }};
+const key_only = [_]Param{.{ .name = "key", .description = "fact name" }};
+const query = [_]Param{.{ .name = "query", .description = "search text" }};
 const alias = [_]Param{
-    .{ .name = "word", .description = "the owner's shorthand, e.g. vet" },
-    .{ .name = "meaning", .description = "what it stands for, e.g. veterinarian" },
+    .{ .name = "word", .description = "owner shorthand" },
+    .{ .name = "meaning", .description = "expanded meaning" },
 };
 
 /// Adds retrieval synonyms that stemming cannot infer.
 pub const remember_alias: Def = .{
     .name = "remember_alias",
-    .description = "Record that a word the owner uses means something else, so searching either finds both.",
+    .description = "Teach a search synonym.",
     .params = &alias,
     .mutates = true,
     .run = runAlias,
@@ -37,7 +37,7 @@ fn runAlias(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
 
 pub const remember: Def = .{
     .name = "remember",
-    .description = "Save a durable fact about the owner. Use a short key.",
+    .description = "Save an owner fact.",
     .params = &kv,
     .mutates = true,
     .run = runRemember,
@@ -45,14 +45,14 @@ pub const remember: Def = .{
 
 pub const recall: Def = .{
     .name = "recall",
-    .description = "Search saved facts and diary entries.",
+    .description = "Search memory and diary.",
     .params = &query,
     .run = runRecall,
 };
 
 pub const forget: Def = .{
     .name = "forget",
-    .description = "Delete a saved fact by key.",
+    .description = "Forget one fact.",
     .params = &key_only,
     .mutates = true,
     .run = runForget,

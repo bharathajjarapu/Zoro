@@ -10,20 +10,20 @@ const file_param = [_]tools.Param{.{ .name = "file", .description = "soul, ident
 const proposal_param = [_]tools.Param{
     .{ .name = "file", .description = "soul, identity, user, or memory" },
     .{ .name = "content", .description = "replacement Markdown" },
-    .{ .name = "evidence", .description = "direct owner request or correction" },
-    .{ .name = "reason", .description = "why this change is useful" },
+    .{ .name = "evidence", .description = "owner request quote" },
+    .{ .name = "reason", .description = "change reason" },
 };
 const skill_param = [_]tools.Param{
-    .{ .name = "content", .description = "full SKILL.md including frontmatter" },
-    .{ .name = "evidence", .description = "completed owner workflow or correction" },
-    .{ .name = "reason", .description = "why this workflow should be reusable" },
+    .{ .name = "content", .description = "complete SKILL.md" },
+    .{ .name = "evidence", .description = "owner evidence" },
+    .{ .name = "reason", .description = "reuse reason" },
 };
 const id_param = [_]tools.Param{.{ .name = "id", .description = "proposal id" }};
 const mode_param = [_]tools.Param{.{ .name = "mode", .description = "off, propose, or auto" }};
 
 pub const character_inspect: tools.Def = .{
     .name = "character_inspect",
-    .description = "Inspect bounded owner character files.",
+    .description = "Read one character file.",
     .params = &file_param,
     .primary_only = true,
     .run = runCharacterInspect,
@@ -31,7 +31,7 @@ pub const character_inspect: tools.Def = .{
 
 pub const character_propose: tools.Def = .{
     .name = "character_propose",
-    .description = "Propose an owner character-file update for review.",
+    .description = "Propose a character change.",
     .params = &proposal_param,
     .mutates = true,
     .primary_only = true,
@@ -40,7 +40,7 @@ pub const character_propose: tools.Def = .{
 
 pub const learning_inspect: tools.Def = .{
     .name = "learning_inspect",
-    .description = "Inspect a proposal or list recent proposals.",
+    .description = "Inspect learning proposals.",
     .params = &.{.{ .name = "id", .description = "proposal id", .required = false }},
     .primary_only = true,
     .run = runLearningInspect,
@@ -48,7 +48,7 @@ pub const learning_inspect: tools.Def = .{
 
 pub const learning_propose: tools.Def = .{
     .name = "learning_propose",
-    .description = "Propose a reusable SKILL.md workflow for owner review.",
+    .description = "Propose a reusable skill.",
     .params = &skill_param,
     .mutates = true,
     .primary_only = true,
@@ -57,7 +57,7 @@ pub const learning_propose: tools.Def = .{
 
 pub const learning_apply: tools.Def = .{
     .name = "learning_apply",
-    .description = "Apply an approved skill proposal when its target is unchanged.",
+    .description = "Apply an approved skill.",
     .params = &id_param,
     .mutates = true,
     .primary_only = true,
@@ -66,7 +66,7 @@ pub const learning_apply: tools.Def = .{
 
 pub const learning_reject: tools.Def = .{
     .name = "learning_reject",
-    .description = "Reject a pending learning proposal.",
+    .description = "Reject a proposal.",
     .params = &id_param,
     .mutates = true,
     .primary_only = true,
@@ -75,7 +75,7 @@ pub const learning_reject: tools.Def = .{
 
 pub const learning_quarantine: tools.Def = .{
     .name = "learning_quarantine",
-    .description = "Quarantine a pending learning proposal for later review.",
+    .description = "Quarantine a proposal.",
     .params = &id_param,
     .mutates = true,
     .primary_only = true,
@@ -84,7 +84,7 @@ pub const learning_quarantine: tools.Def = .{
 
 pub const learning_rollback: tools.Def = .{
     .name = "learning_rollback",
-    .description = "Restore the prior version of an applied skill proposal.",
+    .description = "Roll back a skill.",
     .params = &id_param,
     .mutates = true,
     .primary_only = true,
@@ -93,7 +93,7 @@ pub const learning_rollback: tools.Def = .{
 
 pub const learning_set_mode: tools.Def = .{
     .name = "learning_set_mode",
-    .description = "Set learning mode: off, propose, or auto.",
+    .description = "Set learning mode.",
     .params = &mode_param,
     .mutates = true,
     .primary_only = true,
@@ -103,7 +103,7 @@ pub const learning_set_mode: tools.Def = .{
 /// Register only in `tools.gated`; it writes owner identity.
 pub const apply_identity: tools.Def = .{
     .name = "apply_identity",
-    .description = "Apply an approved owner character proposal.",
+    .description = "Apply approved character.",
     .params = &id_param,
     .mutates = true,
     .primary_only = true,
@@ -113,7 +113,7 @@ pub const apply_identity: tools.Def = .{
 /// Register only in `tools.gated`; it restores owner identity.
 pub const rollback_identity: tools.Def = .{
     .name = "rollback_identity",
-    .description = "Restore an applied owner character proposal.",
+    .description = "Roll back character.",
     .params = &id_param,
     .mutates = true,
     .primary_only = true,
@@ -123,7 +123,7 @@ pub const rollback_identity: tools.Def = .{
 /// Register only in `tools.gated`; it deletes one fixed owner file.
 pub const reset_identity: tools.Def = .{
     .name = "reset_identity",
-    .description = "Reset one owner character file.",
+    .description = "Reset one character file.",
     .params = &file_param,
     .mutates = true,
     .primary_only = true,

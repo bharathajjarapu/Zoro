@@ -2,7 +2,7 @@ const std = @import("std");
 const workspace = @import("../app/workspace.zig");
 
 pub const max_file: usize = 16 * 1024;
-pub const max_total: usize = 48 * 1024;
+pub const max_total: usize = 12 * 1024;
 const trunc_mark = "\n[truncated]";
 
 pub const File = enum { soul, identity, user, memory };

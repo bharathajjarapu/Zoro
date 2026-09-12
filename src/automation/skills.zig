@@ -34,16 +34,6 @@ pub const Authority = enum {
     }
 };
 
-pub const Entry = struct {
-    name: []u8,
-    description: []u8,
-
-    fn deinit(self: Entry, gpa: std.mem.Allocator) void {
-        gpa.free(self.name);
-        gpa.free(self.description);
-    }
-};
-
 /// Slices borrow from `text`.
 pub fn parse(text: []const u8) !Skill {
     var rest = std.mem.trim(u8, text, "\r\n");
@@ -94,29 +84,29 @@ pub fn validateLearned(text: []const u8) !Skill {
     return skill;
 }
 
-pub fn list(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![]Entry {
+pub fn list(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![][]u8 {
     var root = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return &.{},
         else => return err,
     };
     defer root.close(io);
 
-    var out: std.ArrayList(Entry) = .empty;
+    var out: std.ArrayList([]u8) = .empty;
     errdefer {
-        for (out.items) |e| e.deinit(gpa);
+        for (out.items) |name| gpa.free(name);
         out.deinit(gpa);
     }
 
     var it = root.iterate();
     while (try it.next(io)) |ent| {
-        if (ent.kind != .directory) continue;
-        const text = readSkill(gpa, io, dir, ent.name) catch continue;
-        defer gpa.free(text);
-        const skill = parse(text) catch continue;
-        try out.append(gpa, .{
-            .name = try gpa.dupe(u8, skill.name),
-            .description = try gpa.dupe(u8, skill.description),
-        });
+        if (ent.kind != .directory or !validName(ent.name)) continue;
+        {
+            var skill_dir = root.openDir(io, ent.name, .{}) catch continue;
+            defer skill_dir.close(io);
+            const file = skill_dir.openFile(io, "SKILL.md", .{}) catch continue;
+            file.close(io);
+        }
+        try out.append(gpa, try gpa.dupe(u8, ent.name));
     }
     return out.toOwnedSlice(gpa);
 }
@@ -183,18 +173,18 @@ pub fn validName(name: []const u8) bool {
 }
 
 const name_param = [_]tools.Param{.{ .name = "name", .description = "skill name" }};
-const content_param = [_]tools.Param{.{ .name = "content", .description = "full SKILL.md including frontmatter" }};
+const content_param = [_]tools.Param{.{ .name = "content", .description = "complete SKILL.md" }};
 
 pub const load_skill: tools.Def = .{
     .name = "load_skill",
-    .description = "Load a skill's instructions by name.",
+    .description = "Load one skill.",
     .params = &name_param,
     .run = runLoad,
 };
 
 pub const save_skill: tools.Def = .{
     .name = "save_skill",
-    .description = "Propose a SKILL.md change for owner review.",
+    .description = "Propose a learned skill.",
     .params = &content_param,
     .mutates = true,
     .run = runSave,
@@ -259,7 +249,7 @@ test "learned skills cannot grant runtime authority" {
     _ = try validateLearned("---\nname: note\ndescription: Safe workflow\n---\nRemember it.");
 }
 
-test "save then load round-trips, and the index is name plus description only" {
+test "save then load round-trips, and the index contains names only" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -286,8 +276,7 @@ test "save then load round-trips, and the index is name plus description only" {
     defer arena.deinit();
     const entries = try list(arena.allocator(), io, dir);
     try testing.expectEqual(@as(usize, 1), entries.len);
-    try testing.expectEqualStrings("weather", entries[0].name);
-    try testing.expectEqualStrings("Look up the forecast", entries[0].description);
+    try testing.expectEqualStrings("weather", entries[0]);
 }
 
 test "save rejects a path-like name" {

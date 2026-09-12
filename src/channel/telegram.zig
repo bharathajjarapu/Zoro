@@ -4,32 +4,35 @@ const testing = std.testing;
 const testkit = @import("../testing/testkit.zig");
 const FakeHttp = testkit.FakeHttp;
 const agent = @import("../agent/root.zig");
+const tools = @import("../tools/root.zig");
 const config = @import("../app/config.zig");
 const Db = @import("../data/db.zig").Db;
 const outbox = @import("../data/outbox.zig");
 const tasks = @import("../data/tasks.zig");
 const web = @import("../net/web.zig");
 const workspace = @import("../app/workspace.zig");
-const wire = @import("telegram_wire.zig");
+const updates = @import("update.zig");
 
 const log = std.log.scoped(.telegram);
 
 const max_message = 3900;
 const max_callback = 64;
 const sticker_ttl: i64 = 5 * 60;
+const max_model_image: usize = 4 * 1024 * 1024;
+const max_album: usize = workspace.max_transfer;
 const request_timeout_ms: i64 = if (builtin.is_test) 50 else 60_000;
 
-pub const max_text = wire.max_text;
-pub const max_file = wire.max_file;
-pub const Kind = wire.Kind;
-pub const Batch = wire.Batch;
-pub const Update = wire.Update;
-pub const parseUpdates = wire.parseUpdates;
-const utf8ChunkEnd = wire.utf8ChunkEnd;
+pub const max_text = updates.max_text;
+pub const max_file = updates.max_file;
+pub const Kind = updates.Kind;
+pub const Batch = updates.Batch;
+pub const Update = updates.Update;
+pub const parseUpdates = updates.parseUpdates;
+const utf8ChunkEnd = updates.utf8ChunkEnd;
 
 fn loadPending(db: *Db, gpa: std.mem.Allocator, owner_id: i64, chat_id: i64) ![]Update {
     var q = try db.prepare(
-        \\SELECT id, text, message_id, reply_id, reply_text, kind, file_id, file_name, mime,
+        \\SELECT id, text, message_id, reply_id, reply_text, kind, file_id, preview_id, file_name, mime,
         \\       file_size, file_unique_id, emoji, sticker_type, callback_id,
         \\       callback_data, latitude, longitude, owner_text
         \\FROM telegram_updates WHERE status = 'pending' ORDER BY id
@@ -62,17 +65,18 @@ fn loadPending(db: *Db, gpa: std.mem.Allocator, owner_id: i64, chat_id: i64) ![]
         errdefer u.deinit(gpa);
         const file_id = if (q.isNull(6)) null else try gpa.dupe(u8, q.text(6));
         if (kind == .photo) u.photo = file_id else u.file_id = file_id;
-        u.file_name = if (q.isNull(7)) null else try gpa.dupe(u8, q.text(7));
-        u.mime = if (q.isNull(8)) null else try gpa.dupe(u8, q.text(8));
-        u.file_size = if (q.isNull(9)) null else q.int(9);
-        u.unique_id = if (q.isNull(10)) null else try gpa.dupe(u8, q.text(10));
-        u.emoji = if (q.isNull(11)) null else try gpa.dupe(u8, q.text(11));
-        u.sticker_type = if (q.isNull(12)) null else try gpa.dupe(u8, q.text(12));
-        u.callback_id = if (q.isNull(13)) null else try gpa.dupe(u8, q.text(13));
-        u.callback_data = if (q.isNull(14)) null else try gpa.dupe(u8, q.text(14));
-        u.latitude = if (q.isNull(15)) null else q.float(15);
-        u.longitude = if (q.isNull(16)) null else q.float(16);
-        u.owner_text = if (q.isNull(17)) null else try gpa.dupe(u8, q.text(17));
+        u.preview_id = if (q.isNull(7)) null else try gpa.dupe(u8, q.text(7));
+        u.file_name = if (q.isNull(8)) null else try gpa.dupe(u8, q.text(8));
+        u.mime = if (q.isNull(9)) null else try gpa.dupe(u8, q.text(9));
+        u.file_size = if (q.isNull(10)) null else q.int(10);
+        u.unique_id = if (q.isNull(11)) null else try gpa.dupe(u8, q.text(11));
+        u.emoji = if (q.isNull(12)) null else try gpa.dupe(u8, q.text(12));
+        u.sticker_type = if (q.isNull(13)) null else try gpa.dupe(u8, q.text(13));
+        u.callback_id = if (q.isNull(14)) null else try gpa.dupe(u8, q.text(14));
+        u.callback_data = if (q.isNull(15)) null else try gpa.dupe(u8, q.text(15));
+        u.latitude = if (q.isNull(16)) null else q.float(16);
+        u.longitude = if (q.isNull(17)) null else q.float(17);
+        u.owner_text = if (q.isNull(18)) null else try gpa.dupe(u8, q.text(18));
         try items.append(gpa, u);
     }
     return items.toOwnedSlice(gpa);
@@ -83,12 +87,6 @@ fn freeUpdates(gpa: std.mem.Allocator, items: []Update) void {
     gpa.free(items);
 }
 
-fn validAlias(alias: []const u8) bool {
-    if (alias.len == 0 or alias.len > 32) return false;
-    for (alias) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
-    return true;
-}
-
 fn commandPrompt(text: []const u8) []const u8 {
     const cmd = std.mem.sliceTo(text, ' ');
     if (std.mem.eql(u8, cmd, "/status")) return "Report current task, routine, and delivery status briefly.";
@@ -97,7 +95,7 @@ fn commandPrompt(text: []const u8) []const u8 {
     if (std.mem.eql(u8, cmd, "/memory") or std.mem.eql(u8, cmd, "/diary")) return text;
     if (std.mem.eql(u8, cmd, "/skills")) return "List available skills.";
     if (std.mem.eql(u8, cmd, "/character")) return "Summarize your current character files.";
-    if (std.mem.eql(u8, cmd, "/learning")) return "Report the learning mode and pending proposals.";
+    if (std.mem.eql(u8, cmd, "/learn")) return "Report the learning mode and pending proposals.";
     if (std.mem.eql(u8, cmd, "/stop")) return "stop";
     return text;
 }
@@ -148,28 +146,6 @@ fn listStickers(db: *Db, gpa: std.mem.Allocator) ![]u8 {
     while (try q.step()) try out.writer.print("{s}{s}{s}\n", .{ q.text(0), if (q.isNull(1)) "" else " ", q.text(1) });
     if (out.written().len == 0) try out.writer.writeAll("No learned stickers.");
     return out.toOwnedSlice();
-}
-
-fn cachedSticker(db: *Db, gpa: std.mem.Allocator, unique_id: []const u8) !?[]u8 {
-    if (unique_id.len == 0) return null;
-    var q = try db.prepare("SELECT description FROM sticker_cache WHERE unique_id = ?");
-    defer q.finalize();
-    try q.bind(1, unique_id);
-    if (!try q.step()) return null;
-    return try gpa.dupe(u8, q.text(0));
-}
-
-fn storeSticker(db: *Db, unique_id: []const u8, description: []const u8, now: i64) !void {
-    if (unique_id.len == 0) return;
-    var q = try db.prepare(
-        \\INSERT INTO sticker_cache(unique_id, description, updated) VALUES (?, ?, ?)
-        \\ON CONFLICT(unique_id) DO UPDATE SET description = excluded.description, updated = excluded.updated
-    );
-    defer q.finalize();
-    try q.bind(1, unique_id);
-    try q.bind(2, description);
-    try q.bind(3, now);
-    _ = try q.step();
 }
 
 fn safeName(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -242,9 +218,9 @@ fn accept(db: *Db, u: Update, now: i64) !bool {
     var q = try db.prepare(
         \\INSERT OR IGNORE INTO telegram_updates(
         \\ id, status, text, created, updated, message_id, reply_id, reply_text, kind,
-        \\ file_id, file_name, mime, file_size, file_unique_id, emoji,
+        \\ file_id, preview_id, file_name, mime, file_size, file_unique_id, emoji,
         \\ sticker_type, callback_id, callback_data, latitude, longitude, owner_text)
-        \\VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        \\VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     );
     defer q.finalize();
     try q.bind(1, u.update_id);
@@ -256,17 +232,18 @@ fn accept(db: *Db, u: Update, now: i64) !bool {
     try q.bind(7, u.reply_text);
     try q.bind(8, @tagName(u.kind));
     try q.bind(9, u.photo orelse u.file_id);
-    try q.bind(10, u.file_name);
-    try q.bind(11, u.mime);
-    try q.bind(12, u.file_size);
-    try q.bind(13, u.unique_id);
-    try q.bind(14, u.emoji);
-    try q.bind(15, u.sticker_type);
-    try q.bind(16, u.callback_id);
-    try q.bind(17, u.callback_data);
-    try q.bind(18, u.latitude);
-    try q.bind(19, u.longitude);
-    try q.bind(20, u.owner_text);
+    try q.bind(10, u.preview_id);
+    try q.bind(11, u.file_name);
+    try q.bind(12, u.mime);
+    try q.bind(13, u.file_size);
+    try q.bind(14, u.unique_id);
+    try q.bind(15, u.emoji);
+    try q.bind(16, u.sticker_type);
+    try q.bind(17, u.callback_id);
+    try q.bind(18, u.callback_data);
+    try q.bind(19, u.latitude);
+    try q.bind(20, u.longitude);
+    try q.bind(21, u.owner_text);
     _ = try q.step();
     const fresh = cChanges(db) == 1;
     try saveOffset(db, u.update_id + 1);
@@ -386,7 +363,7 @@ pub const Bot = struct {
         if (u.kind == .callback) return self.handleCallback(u);
         if (u.kind == .reaction) return;
         if (try self.handleCommand(u)) return;
-        if (self.live_http == null) self.typing("typing") catch |err| log.warn("typing: {t}", .{err});
+        if (self.live_http == null) self.sendActivity(self.http, "typing") catch |err| log.warn("typing: {t}", .{err});
         try self.answer(u);
     }
 
@@ -434,12 +411,7 @@ pub const Bot = struct {
     fn handleCommand(self: *Bot, u: Update) !bool {
         const text = std.mem.trim(u8, u.text, &std.ascii.whitespace);
         if (std.mem.eql(u8, text, "/help")) {
-            try self.queueReply(u.message_id, "Use /status, /tasks, /routines, /memory, /diary, /skills, /character, /learning, /stickers, /stop, or /new.");
-            return true;
-        }
-        if (std.mem.eql(u8, text, "/new")) {
-            try self.db.exec("DELETE FROM messages;");
-            try self.queueReply(u.message_id, "Started a new conversation.");
+            try self.queueReply(u.message_id, "Use /status, /tasks, /routines, /memory, /diary, /skills, /character, /learn, /compact, /clear, /stickers, /stop, or /new.");
             return true;
         }
         if (std.mem.eql(u8, text, "/stop")) {
@@ -449,7 +421,7 @@ pub const Bot = struct {
         const learn = "/learn sticker ";
         if (std.mem.startsWith(u8, text, learn)) {
             const alias = std.mem.trim(u8, text[learn.len..], &std.ascii.whitespace);
-            if (!validAlias(alias)) {
+            if (!outbox.safeAlias(alias)) {
                 try self.queueReply(u.message_id, "Use /learn sticker followed by one short alias.");
                 return true;
             }
@@ -467,7 +439,10 @@ pub const Bot = struct {
         const send_prefix = "/sticker ";
         if (std.mem.startsWith(u8, text, send_prefix)) {
             const alias = std.mem.trim(u8, text[send_prefix.len..], &std.ascii.whitespace);
-            if (!validAlias(alias)) try self.queueReply(u.message_id, "Unknown sticker alias.") else try outbox.pushReply(self.db, .sticker, alias, "", u.message_id, std.Io.Timestamp.now(self.io, .real).toSeconds());
+            if (!outbox.safeAlias(alias) or !try outbox.stickerExists(self.db, alias))
+                try self.queueReply(u.message_id, "Unknown sticker alias.")
+            else
+                try outbox.pushReply(self.db, .sticker, alias, "", u.message_id, std.Io.Timestamp.now(self.io, .real).toSeconds());
             return true;
         }
         return false;
@@ -485,31 +460,55 @@ pub const Bot = struct {
             u.longitude.?,
         });
         if (u.kind == .sticker) {
-            if (try takeStickerLearning(self.db, self.gpa, u, std.Io.Timestamp.now(self.io, .real).toSeconds())) |alias| {
-                defer self.gpa.free(alias);
-            }
-            if (std.mem.eql(u8, u.sticker_type orelse "", "static")) {
-                if (try cachedSticker(self.db, self.gpa, u.unique_id orelse "")) |cached| return cached;
-                if (self.download(u.file_id.?)) |bytes| {
-                    picture.* = bytes;
-                    mime.* = sniff(bytes);
+            const learned = try takeStickerLearning(self.db, self.gpa, u, std.Io.Timestamp.now(self.io, .real).toSeconds());
+            defer if (learned) |alias| self.gpa.free(alias);
+            const image_id = if (std.mem.eql(u8, u.sticker_type orelse "", "static")) u.file_id else u.preview_id;
+            if (image_id) |id| {
+                if (self.download(id)) |bytes| {
+                    if (bytes.len <= max_model_image) {
+                        picture.* = bytes;
+                        mime.* = sniff(bytes);
+                    } else self.gpa.free(bytes);
                 } else |_| {}
             }
-            return std.fmt.allocPrint(self.gpa, "[sticker: {s}, {s}]", .{ u.emoji orelse "no emoji", u.sticker_type orelse "unknown" });
+            return std.fmt.allocPrint(self.gpa, "[sticker: {s}, {s}{s}{s}]", .{
+                u.emoji orelse "no emoji",
+                u.sticker_type orelse "unknown",
+                if (learned != null) ", learned as " else "",
+                learned orelse "",
+            });
         }
+
+        if ((u.file_size orelse 0) > max_file) return std.fmt.allocPrint(self.gpa, "{s}{s}[{s}: too large to download, {d} bytes]", .{
+            u.text, if (u.text.len == 0) "" else "\n", @tagName(u.kind), u.file_size.?,
+        });
 
         const bytes = self.download(u.file_id.?) catch |err| return std.fmt.allocPrint(
             self.gpa,
             "{s}{s}[{s}: download failed ({s})]",
             .{ u.text, if (u.text.len == 0) "" else "\n", @tagName(u.kind), @errorName(err) },
         );
-        defer self.gpa.free(bytes);
+        var keep_bytes = false;
+        defer if (!keep_bytes) self.gpa.free(bytes);
         const name = try safeName(self.gpa, u.file_name orelse @tagName(u.kind));
         defer self.gpa.free(name);
         var rel_buf: [workspace.max_path]u8 = undefined;
         const rel = try std.fmt.bufPrint(&rel_buf, "{s}/{d}-{s}", .{ self.inbox, u.update_id, name });
         try self.ensureInbox();
-        try workspace.write(self.io, self.workspace, rel, bytes);
+        try workspace.writeBounded(self.io, self.workspace, rel, bytes, max_file);
+        const detected = imageMime(bytes);
+        if (bytes.len <= max_model_image and (detected != null or std.mem.startsWith(u8, u.mime orelse "", "image/"))) {
+            picture.* = bytes;
+            mime.* = detected orelse u.mime.?;
+            keep_bytes = true;
+        } else if (u.preview_id) |preview_id| {
+            if (self.download(preview_id)) |preview| {
+                if (preview.len <= max_model_image) {
+                    picture.* = preview;
+                    mime.* = sniff(preview);
+                } else self.gpa.free(preview);
+            } else |_| {}
+        }
         const note = switch (u.kind) {
             .voice => "Voice transcription is unavailable; the original file is saved.",
             .audio, .video, .animation => "This media is saved, but its contents were not interpreted.",
@@ -536,6 +535,7 @@ pub const Bot = struct {
         defer q.finalize();
         try q.bind(1, alias);
         if (!try q.step()) return error.UnknownSticker;
+        self.sendActivity(self.live_http, "choose_sticker") catch |err| log.warn("sticker action: {t}", .{err});
         const req = try buildFileId(self.gpa, self.chat_id, "sticker", q.text(0), reply_id);
         defer self.gpa.free(req);
         const body = try self.call("sendSticker", req);
@@ -562,16 +562,33 @@ pub const Bot = struct {
         var picture: ?[]u8 = null;
         defer if (picture) |p| self.gpa.free(p);
         var mime: []const u8 = "image/jpeg";
+        var prompt: ?[]u8 = null;
+        defer if (prompt) |s| self.gpa.free(s);
 
         if (u.photo) |file_id| {
             if (self.download(file_id)) |bytes| {
-                picture = bytes;
-                mime = sniff(bytes);
-            } else |err| log.warn("photo {s}: {t}", .{ file_id, err });
+                var keep_bytes = false;
+                defer if (!keep_bytes) self.gpa.free(bytes);
+                const rel = try std.fmt.allocPrint(self.gpa, "{s}/{d}-photo.jpg", .{ self.inbox, u.update_id });
+                defer self.gpa.free(rel);
+                try self.ensureInbox();
+                try workspace.writeBounded(self.io, self.workspace, rel, bytes, max_file);
+                prompt = try std.fmt.allocPrint(self.gpa, "{s}{s}[photo in inbox: {s}, {d} bytes]", .{
+                    u.text, if (u.text.len == 0) "" else "\n", rel, bytes.len,
+                });
+                if (bytes.len <= max_model_image) {
+                    picture = bytes;
+                    mime = sniff(bytes);
+                    keep_bytes = true;
+                }
+            } else |err| {
+                log.warn("photo {s}: {t}", .{ file_id, err });
+                prompt = try std.fmt.allocPrint(self.gpa, "{s}{s}[photo download failed: {s}]", .{
+                    u.text, if (u.text.len == 0) "" else "\n", @errorName(err),
+                });
+            }
         }
 
-        var prompt: ?[]u8 = null;
-        defer if (prompt) |s| self.gpa.free(s);
         if (u.kind != .photo and u.kind != .text) prompt = try self.context(u, &picture, &mime);
         const input = commandPrompt(u.text);
         if (u.reply_text) |quoted| {
@@ -595,6 +612,7 @@ pub const Bot = struct {
             .owner_text = u.owner_text,
             .image = if (picture) |p| .{ .mime = mime, .data = p } else null,
         }, &cancel);
+        cancel.stop.store(true, .release);
         done.store(true, .release);
         if (activity_thread) |thread| thread.join();
         if (stop_update.load(.acquire) != 0) try recordStop(self.db, stop_update.load(.acquire), std.Io.Timestamp.now(self.io, .real).toSeconds());
@@ -605,14 +623,12 @@ pub const Bot = struct {
         };
         defer self.gpa.free(reply);
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
-        if (u.kind == .sticker and std.mem.eql(u8, u.sticker_type orelse "", "static") and picture != null)
-            try storeSticker(self.db, u.unique_id orelse "", reply, now);
         const approval_id = self.agent.last_approval;
         var id_buf: [32]u8 = undefined;
         if (approval_id) |pending_id| {
             const id = try std.fmt.bufPrint(&id_buf, "{d}", .{pending_id});
             try outbox.pushReply(self.db, .approval, id, reply, u.message_id, now);
-        } else {
+        } else if (reply.len != 0) {
             try outbox.push(self.db, .text, null, reply, now);
         }
     }
@@ -652,7 +668,7 @@ pub const Bot = struct {
     fn failDelivery(self: *Bot, id: i64, err: anyerror) !void {
         if (retryableDelivery(err)) {
             try outbox.retry(self.db, id, @errorName(err));
-        } else if (err == error.TelegramRejected or err == error.TelegramApiError or err == error.InvalidTelegramResponse or
+        } else if (err == error.TelegramRejected or err == error.TelegramApiError or err == error.InvalidTelegramResponse or err == error.UnknownSticker or
             err == error.FileNotFound or err == error.BadPath or err == error.FileTooLarge)
         {
             try outbox.failed(self.db, id, @errorName(err));
@@ -666,20 +682,25 @@ pub const Bot = struct {
         if (items.len < 2 or items.len > 10) return error.BadAlbum;
         var files: [10][]u8 = undefined;
         var n: usize = 0;
+        var total: usize = 0;
         defer for (files[0..n]) |bytes| self.gpa.free(bytes);
         for (items) |item| {
-            files[n] = try workspace.readBytes(self.gpa, self.io, self.workspace, item.path.?, max_file);
+            const bytes = try workspace.readBytes(self.gpa, self.io, self.workspace, item.path.?, max_file);
+            total = addAlbumSize(total, bytes.len) catch |err| {
+                self.gpa.free(bytes);
+                return err;
+            };
+            files[n] = bytes;
             n += 1;
         }
         const body = try albumBody(self.gpa, self.chat_id, items, files[0..n]);
         defer self.gpa.free(body);
-        self.sendActivity(actionFor(items[0].kind)) catch |err| log.warn("upload action: {t}", .{err});
+        self.sendActivity(self.live_http, actionFor(items[0].kind)) catch |err| log.warn("upload action: {t}", .{err});
         const reply = try self.post("sendMediaGroup", body, "multipart/form-data; boundary=" ++ boundary);
         defer self.gpa.free(reply);
         try ensureOk(self.gpa, reply);
     }
 
-    /// Downloads a Telegram file within the shared cap.
     fn download(self: *Bot, file_id: []const u8) ![]u8 {
         const get = self.fetch orelse return error.NoFetch;
         const req = try jsonBody(self.gpa, .{ .file_id = file_id });
@@ -701,7 +722,7 @@ pub const Bot = struct {
 
         const url = try std.fmt.allocPrint(self.gpa, "{s}{s}/{s}", .{ file_base, self.token.reveal(), path });
         defer self.gpa.free(url);
-        var hop = try get.request(self.gpa, url, null, null);
+        var hop = try get.request(self.gpa, url, null, null, max_file);
         errdefer hop.deinit(self.gpa);
         if (hop.status != 200) return error.TelegramHttp;
         if (hop.body.len > max_file) return error.FileTooLarge;
@@ -728,22 +749,14 @@ pub const Bot = struct {
             .animation => "sendAnimation",
             else => return error.BadMediaKind,
         };
-        self.sendActivity(actionFor(kind)) catch |err| log.warn("upload action: {t}", .{err});
+        self.sendActivity(self.live_http, actionFor(kind)) catch |err| log.warn("upload action: {t}", .{err});
         const reply = try self.post(method, body, "multipart/form-data; boundary=" ++ boundary);
         defer self.gpa.free(reply);
         try ensureOk(self.gpa, reply);
     }
 
-    fn typing(self: *Bot, action: []const u8) !void {
-        const req = try buildChatAction(self.gpa, self.chat_id, action);
-        defer self.gpa.free(req);
-        const body = try self.call("sendChatAction", req);
-        defer self.gpa.free(body);
-        try ensureOk(self.gpa, body);
-    }
-
-    fn sendActivity(self: *Bot, action: []const u8) !void {
-        const http = self.live_http orelse return;
+    fn sendActivity(self: *Bot, selected: ?agent.Http, action: []const u8) !void {
+        const http = selected orelse return;
         const req = try buildChatAction(self.gpa, self.chat_id, action);
         defer self.gpa.free(req);
         const body = try self.callWith(http, "sendChatAction", req);
@@ -816,29 +829,30 @@ fn activity(
     offset: i64,
 ) void {
     const http = self.live_http orelse return;
+    var next_action: i64 = 0;
     while (!done.load(.acquire) and !cancel.cancelled()) {
         if (self.shutdown) |stop| if (stop()) {
             cancel.stop.store(true, .release);
             return;
         };
-        const action = buildChatAction(self.gpa, self.chat_id, "typing") catch {
-            std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
-            continue;
-        };
-        const action_reply = self.callWith(http, "sendChatAction", action) catch {
-            self.gpa.free(action);
-            std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
-            continue;
-        };
-        self.gpa.free(action);
-        self.gpa.free(action_reply);
+        const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        if (now >= next_action) {
+            self.sendActivity(http, "typing") catch {
+                if (done.load(.acquire) or cancel.cancelled()) return;
+                std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
+                continue;
+            };
+            next_action = now + 4_000;
+        }
 
         const req = buildCancelUpdates(self.gpa, offset) catch {
+            if (done.load(.acquire) or cancel.cancelled()) return;
             std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
             continue;
         };
         const body = self.callWith(http, "getUpdates", req) catch {
             self.gpa.free(req);
+            if (done.load(.acquire) or cancel.cancelled()) return;
             std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
             continue;
         };
@@ -874,7 +888,7 @@ fn actionFor(kind: outbox.Kind) []const u8 {
     return switch (kind) {
         .photo => "upload_photo",
         .video, .animation => "upload_video",
-        .audio, .voice => "upload_voice",
+        .voice => "upload_voice",
         else => "upload_document",
     };
 }
@@ -1080,7 +1094,7 @@ fn buildFileId(gpa: std.mem.Allocator, chat_id: i64, field_name: []const u8, fil
 }
 
 const commands_json =
-    \\{"commands":[{"command":"help","description":"Show help"},{"command":"status","description":"Show status"},{"command":"tasks","description":"List tasks"},{"command":"routines","description":"List routines"},{"command":"memory","description":"Search memory"},{"command":"diary","description":"Show diary"},{"command":"skills","description":"List skills"},{"command":"character","description":"Show character"},{"command":"learning","description":"Show learning"},{"command":"stickers","description":"List stickers"},{"command":"stop","description":"Stop work"},{"command":"new","description":"New conversation"}]}
+    \\{"commands":[{"command":"help","description":"Show help"},{"command":"status","description":"Show status"},{"command":"tasks","description":"List tasks"},{"command":"routines","description":"List routines"},{"command":"memory","description":"Search memory"},{"command":"diary","description":"Show diary"},{"command":"skills","description":"List skills"},{"command":"character","description":"Show character"},{"command":"learn","description":"Show learning"},{"command":"compact","description":"Compact conversation"},{"command":"clear","description":"Save and clear"},{"command":"stickers","description":"List stickers"},{"command":"stop","description":"Stop work"},{"command":"new","description":"New conversation"}]}
 ;
 
 fn escapeHtml(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -1141,6 +1155,16 @@ fn albumBody(gpa: std.mem.Allocator, chat_id: i64, items: []const outbox.Item, f
     return out.toOwnedSlice();
 }
 
+fn addAlbumSize(total: usize, n: usize) !usize {
+    if (n > max_album - total) return error.FileTooLarge;
+    return total + n;
+}
+
+test "album size is bounded before assembly" {
+    try testing.expectEqual(max_album, try addAlbumSize(max_album - 1, 1));
+    try testing.expectError(error.FileTooLarge, addAlbumSize(max_album - 1, 2));
+}
+
 /// Removes control bytes that could forge multipart boundaries.
 fn field(w: *std.Io.Writer, text: []const u8) !void {
     for (text) |c| {
@@ -1185,10 +1209,15 @@ fn baseName(path: []const u8) []const u8 {
 
 /// Sniffs common image types for the model.
 fn sniff(bytes: []const u8) []const u8 {
+    return imageMime(bytes) orelse "image/jpeg";
+}
+
+fn imageMime(bytes: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, bytes, "\x89PNG")) return "image/png";
     if (std.mem.startsWith(u8, bytes, "GIF8")) return "image/gif";
+    if (std.mem.startsWith(u8, bytes, "\xff\xd8\xff")) return "image/jpeg";
     if (bytes.len >= 12 and std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
-    return "image/jpeg";
+    return null;
 }
 
 fn buildGetUpdates(gpa: std.mem.Allocator, offset: ?i64) ![]u8 {
@@ -1568,7 +1597,7 @@ const FakeGet = struct {
         return self.seen[0..self.seen_len];
     }
 
-    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, target: []const u8, _: ?[]const u8, _: ?std.Io.net.IpAddress) anyerror!web.Hop {
+    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, target: []const u8, _: ?[]const u8, _: ?std.Io.net.IpAddress, _: usize) anyerror!web.Hop {
         const self: *FakeGet = @ptrCast(@alignCast(ptr));
         self.seen_len = @min(target.len, self.seen.len);
         @memcpy(self.seen[0..self.seen_len], target[0..self.seen_len]);
@@ -1592,6 +1621,8 @@ test "a photo is downloaded and reaches the base model with its caption" {
 
     var files: FakeGet = .{ .body = "\x89PNG\r\n\x1a\n" };
     h.bot.fetch = files.get();
+    var workspace_buf: [128]u8 = undefined;
+    h.bot.workspace = try h.workspace(&workspace_buf);
     try h.bot.pollOnce();
 
     try testing.expectEqual(@as(usize, 1), files.calls);
@@ -1603,6 +1634,9 @@ test "a photo is downloaded and reaches the base model with its caption" {
     try testing.expect(std.mem.indexOf(u8, asked, "\"m\"") != null);
     try testing.expect(std.mem.indexOf(u8, asked, "data:image/png;base64,") != null);
     try testing.expect(std.mem.indexOf(u8, asked, "what plant is this") != null);
+    const saved = try workspace.readBytes(testing.allocator, h.threaded.io(), h.bot.workspace, "inbox/5-photo.jpg", 8);
+    defer testing.allocator.free(saved);
+    try testing.expectEqualStrings("\x89PNG\r\n\x1a\n", saved);
 }
 
 test "a photo that will not download still gets an answer" {
@@ -1620,7 +1654,7 @@ test "a photo that will not download still gets an answer" {
     h.bot.fetch = files.get();
 
     try h.bot.pollOnce(); // the download fails; the turn happens anyway
-    try testing.expect(std.mem.indexOf(u8, h.llm.sent(), "a picture, no caption") != null);
+    try testing.expect(std.mem.indexOf(u8, h.llm.sent(), "photo download failed") != null);
     try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "I could not open it") != null);
 }
 
@@ -1668,6 +1702,28 @@ test "document bytes land in the configured inbox" {
     defer testing.allocator.free(saved);
     try testing.expectEqualStrings("hello", saved);
     try testing.expect(std.mem.indexOf(u8, h.llm.sent(), "in inbox: incoming/1-note.txt") != null);
+}
+
+test "an image document is saved and shown to the model" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        \\{"ok":true,"result":[{"update_id":2,"message":{"message_id":9,"from":{"id":42},"chat":{"id":42,"type":"private"},"document":{"file_id":"image","file_name":"scan.png","mime_type":"application/octet-stream","file_size":8}}}]}
+        ,
+        ok_json,
+        "{\"ok\":true,\"result\":{\"file_path\":\"documents/scan.png\",\"file_size\":8}}",
+        ok_json,
+    }, &.{"{\"choices\":[{\"message\":{\"content\":\"a scan\"}}]}"});
+    defer h.deinit();
+    var root_buf: [128]u8 = undefined;
+    h.bot.workspace = try h.workspace(&root_buf);
+    var files: FakeGet = .{ .body = "\x89PNG\r\n\x1a\n" };
+    h.bot.fetch = files.get();
+
+    try h.bot.pollOnce();
+    try testing.expect(std.mem.indexOf(u8, h.llm.sent(), "data:image/png;base64,") != null);
+    const saved = try workspace.readBytes(testing.allocator, h.threaded.io(), h.bot.workspace, "inbox/2-scan.png", 8);
+    defer testing.allocator.free(saved);
+    try testing.expectEqualStrings("\x89PNG\r\n\x1a\n", saved);
 }
 
 test "a workspace file goes out as a photo with its caption" {
@@ -1855,4 +1911,26 @@ test "sticker aliases are durable and listed" {
     const list = try listStickers(&db, testing.allocator);
     defer testing.allocator.free(list);
     try testing.expectEqualStrings("wave 👋\n", list);
+}
+
+test "sending a sticker does not add an emoji reply" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        \\{"ok":true,"result":[{"update_id":1,"message":{"message_id":2,"from":{"id":42},"chat":{"id":42,"type":"private"},"text":"Send pro"}}]}
+        ,
+        ok_json,
+        ok_json,
+        ok_json,
+    }, &.{
+        \\{"choices":[{"message":{"tool_calls":[{"id":"c1","type":"function","function":{"name":"send_sticker","arguments":"{\"alias\":\"pro\"}"}}]}}]}
+        ,
+        "{\"choices\":[{\"message\":{\"content\":\"😎\"}}]}",
+    });
+    defer h.deinit();
+    h.agent.tools = &tools.builtins;
+    try h.db.exec("INSERT INTO sticker_aliases(alias, file_id, unique_id, updated) VALUES ('pro', 'file', 'stable', 1)");
+
+    try h.bot.pollOnce();
+    try testing.expectEqual(@as(usize, 3), h.tg.i);
+    try testing.expect(std.mem.endsWith(u8, h.tg.sentUrl(), "/sendSticker"));
 }

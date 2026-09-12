@@ -28,10 +28,10 @@ pub const Api = struct {
 
 pub const Get = struct {
     ptr: *anyopaque,
-    request_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, ?[]const u8, ?std.Io.net.IpAddress) anyerror!Hop,
+    request_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, ?[]const u8, ?std.Io.net.IpAddress, usize) anyerror!Hop,
 
-    pub fn request(self: Get, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8, address: ?std.Io.net.IpAddress) anyerror!Hop {
-        return self.request_fn(self.ptr, gpa, url, auth, address);
+    pub fn request(self: Get, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8, address: ?std.Io.net.IpAddress, limit: usize) anyerror!Hop {
+        return self.request_fn(self.ptr, gpa, url, auth, address, limit);
     }
 };
 
@@ -346,7 +346,7 @@ fn fetchInner(
         const address = try resolveAddress(io, host, uri.port orelse 443);
         if (!limiter.allow(host, now)) return error.RateLimited;
 
-        var res = try get.request(gpa, current, header, address);
+        var res = try get.request(gpa, current, header, address, max_body);
         header = null; // never forward a secret across a redirect
         errdefer res.deinit(gpa);
 
@@ -607,7 +607,7 @@ test "one deadline covers every redirect hop" {
             return .{ .ptr = self, .request_fn = request };
         }
 
-        fn request(ptr: *anyopaque, gpa: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: ?std.Io.net.IpAddress) anyerror!Hop {
+        fn request(ptr: *anyopaque, gpa: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: ?std.Io.net.IpAddress, _: usize) anyerror!Hop {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try (std.Io.Clock.Duration{ .raw = .fromMilliseconds(8), .clock = .awake }).sleep(self.io);
             self.hops += 1;
@@ -690,7 +690,7 @@ const FakeGet = struct {
         return .{ .ptr = self, .request_fn = request };
     }
 
-    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8, address: ?std.Io.net.IpAddress) anyerror!Hop {
+    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8, address: ?std.Io.net.IpAddress, _: usize) anyerror!Hop {
         const self: *FakeGet = @ptrCast(@alignCast(ptr));
         self.hop += 1;
         self.pinned = address != null;
@@ -740,7 +740,7 @@ pub fn pinnedConnection(client: *std.http.Client, uri: std.Uri, addr: std.Io.net
     });
 }
 
-fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8, address: ?std.Io.net.IpAddress) anyerror!Hop {
+fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8, address: ?std.Io.net.IpAddress, limit: usize) anyerror!Hop {
     const client: *std.http.Client = @ptrCast(@alignCast(ptr));
     const uri = std.Uri.parse(url) catch return error.BadUrl;
 
@@ -779,7 +779,7 @@ fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[
     errdefer if (location) |l| gpa.free(l);
 
     const reader = response.reader(&.{});
-    const body = reader.allocRemaining(gpa, .limited(max_body)) catch |err| switch (err) {
+    const body = reader.allocRemaining(gpa, .limited(limit)) catch |err| switch (err) {
         error.StreamTooLong => return error.ResponseTooLarge,
         else => return err,
     };

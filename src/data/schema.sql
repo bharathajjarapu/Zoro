@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS messages (
   owner_text TEXT
 );
 CREATE INDEX IF NOT EXISTS messages_created ON messages(created);
+CREATE INDEX IF NOT EXISTS messages_conversation ON messages(ref, id);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY,
@@ -113,6 +114,7 @@ CREATE TABLE IF NOT EXISTS telegram_updates (
   reply_text TEXT,
   kind TEXT NOT NULL DEFAULT 'text',
   file_id TEXT,
+  preview_id TEXT,
   file_name TEXT,
   mime TEXT,
   file_size INTEGER,
@@ -158,10 +160,4 @@ CREATE TABLE IF NOT EXISTS sticker_learning (
   alias TEXT NOT NULL,
   created INTEGER NOT NULL,
   expires INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS sticker_cache (
-  unique_id TEXT PRIMARY KEY,
-  description TEXT NOT NULL,
-  updated INTEGER NOT NULL
 );

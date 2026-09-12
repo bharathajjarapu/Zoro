@@ -10,19 +10,19 @@ const Ctx = tools.Ctx;
 
 const search_url = "https://api.search.tinyfish.ai?query=";
 const fetch_endpoint = "https://api.fetch.tinyfish.ai";
-const url_param = [_]Param{.{ .name = "url", .description = "HTTPS URL to fetch" }};
+const url_param = [_]Param{.{ .name = "url", .description = "HTTPS URL" }};
 const query_param = [_]Param{.{ .name = "query", .description = "search query" }};
 
 pub const fetch_url: Def = .{
     .name = "fetch_url",
-    .description = "Fetch an HTTPS URL as clean Markdown with TinyFish.",
+    .description = "Fetch a page as Markdown.",
     .params = &url_param,
     .run = runFetch,
 };
 
 pub const search: Def = .{
     .name = "search",
-    .description = "Search the live web with TinyFish.",
+    .description = "Search the web.",
     .params = &query_param,
     .run = runSearch,
 };

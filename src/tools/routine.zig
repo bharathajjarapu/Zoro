@@ -7,7 +7,7 @@ const name_param = [_]tools.Param{.{ .name = "name", .description = "routine nam
 /// Owner-only; the model cannot enable mutations.
 pub const enable_routine: tools.Def = .{
     .name = "enable_routine",
-    .description = "Activate a routine that is waiting for approval.",
+    .description = "Enable an approved routine.",
     .params = &name_param,
     .mutates = true,
     .run = runEnable,
@@ -16,7 +16,7 @@ pub const enable_routine: tools.Def = .{
 /// Allows one approved critical run.
 pub const run_routine: tools.Def = .{
     .name = "run_routine",
-    .description = "Let a critical routine execute once.",
+    .description = "Run an approved routine.",
     .params = &name_param,
     .mutates = true,
     .run = runNow,

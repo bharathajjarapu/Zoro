@@ -14,13 +14,13 @@ const max_runtime = std.Io.Clock.Duration{
 
 const argv_param = [_]tools.Param{.{
     .name = "argv",
-    .description = "simple JSON argument array",
+    .description = "command arguments",
     .kind = .array,
 }};
 
 pub const run: tools.Def = .{
     .name = "shell",
-    .description = "Run a bounded approved command in the workspace.",
+    .description = "Run a workspace command.",
     .params = &argv_param,
     .mutates = true,
     .primary_only = true,
@@ -29,7 +29,7 @@ pub const run: tools.Def = .{
 
 pub const run_approved: tools.Def = .{
     .name = "shell",
-    .description = "Run one exact owner-approved workspace command.",
+    .description = "Run an approved command.",
     .params = &argv_param,
     .mutates = true,
     .primary_only = true,

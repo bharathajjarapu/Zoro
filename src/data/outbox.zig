@@ -187,26 +187,26 @@ pub fn safeRelative(path: []const u8) bool {
 }
 
 const notify_params = [_]tools.Param{
-    .{ .name = "text", .description = "message to deliver to the owner" },
+    .{ .name = "text", .description = "message" },
 };
 
 pub const notify_owner: tools.Def = .{
     .name = "notify_owner",
-    .description = "Queue a message for the owner. Use this from a routine; a normal reply reaches them already.",
+    .description = "Queue an owner message.",
     .params = &notify_params,
     .primary_only = true,
     .run = runNotify,
 };
 
 const attach_params = [_]tools.Param{
-    .{ .name = "path", .description = "workspace-relative file path" },
-    .{ .name = "caption", .description = "text sent with the file", .required = false },
-    .{ .name = "as", .description = "photo or document (default document)", .required = false },
+    .{ .name = "path", .description = "workspace path" },
+    .{ .name = "caption", .description = "caption", .required = false },
+    .{ .name = "as", .description = "photo, document, audio, voice, video, or animation", .required = false },
 };
 
 pub const attach_file: tools.Def = .{
     .name = "attach_file",
-    .description = "Send a file from the workspace to the owner as a photo or document.",
+    .description = "Send a workspace file now.",
     .params = &attach_params,
     .primary_only = true,
     .run = runAttach,
@@ -218,7 +218,7 @@ const sticker_params = [_]tools.Param{
 
 pub const send_sticker: tools.Def = .{
     .name = "send_sticker",
-    .description = "Send one learned Telegram sticker to the owner.",
+    .description = "Send a learned sticker.",
     .params = &sticker_params,
     .primary_only = true,
     .run = runSticker,
@@ -231,6 +231,7 @@ fn runNotify(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
     push(ctx.db, .text, null, parsed.value.text, now) catch |err|
         return std.fmt.allocPrint(ctx.gpa, "not queued: {s}", .{@errorName(err)});
+    if (ctx.delivery_out) |out| out.* = true;
     return ctx.gpa.dupe(u8, "queued for the owner");
 }
 
@@ -243,11 +244,13 @@ fn runAttach(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     const parsed = try std.json.parseFromSlice(Args, ctx.gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const a = parsed.value;
-    const kind: Kind = if (a.as) |s| (std.meta.stringToEnum(Kind, s) orelse .document) else .document;
-    try workspace.checkFile(ctx.io, ctx.workspace, a.path, workspace.max_write);
+    const kind: Kind = if (a.as) |s| std.meta.stringToEnum(Kind, s) orelse return error.BadMediaKind else .document;
+    if (kind == .text or kind == .approval or kind == .sticker) return error.BadMediaKind;
+    try workspace.checkFile(ctx.io, ctx.workspace, a.path, workspace.max_transfer);
     const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
-    push(ctx.db, if (kind == .text or kind == .approval or kind == .sticker) .document else kind, a.path, a.caption orelse "", now) catch |err|
+    push(ctx.db, kind, a.path, a.caption orelse "", now) catch |err|
         return std.fmt.allocPrint(ctx.gpa, "not queued: {s}", .{@errorName(err)});
+    if (ctx.delivery_out) |out| out.* = true;
     return std.fmt.allocPrint(ctx.gpa, "queued {s}", .{a.path});
 }
 
@@ -256,12 +259,29 @@ fn runSticker(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     const parsed = try std.json.parseFromSlice(Args, ctx.gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     if (!safeAlias(parsed.value.alias)) return ctx.gpa.dupe(u8, "invalid sticker alias");
+    if (!try stickerExists(ctx.db, parsed.value.alias)) return ctx.gpa.dupe(u8, "unknown sticker alias");
+    if (try stickerQueued(ctx.db, parsed.value.alias)) return ctx.gpa.dupe(u8, "sticker already queued");
     push(ctx.db, .sticker, parsed.value.alias, "", std.Io.Timestamp.now(ctx.io, .real).toSeconds()) catch |err|
         return std.fmt.allocPrint(ctx.gpa, "not queued: {s}", .{@errorName(err)});
+    if (ctx.delivery_out) |out| out.* = true;
     return ctx.gpa.dupe(u8, "sticker queued");
 }
 
-fn safeAlias(alias: []const u8) bool {
+pub fn stickerExists(db: *Db, alias: []const u8) !bool {
+    var q = try db.prepare("SELECT 1 FROM sticker_aliases WHERE alias = ?");
+    defer q.finalize();
+    try q.bind(1, alias);
+    return q.step();
+}
+
+fn stickerQueued(db: *Db, alias: []const u8) !bool {
+    var q = try db.prepare("SELECT 1 FROM outbox WHERE kind = 'sticker' AND path = ? AND status = 'queued'");
+    defer q.finalize();
+    try q.bind(1, alias);
+    return q.step();
+}
+
+pub fn safeAlias(alias: []const u8) bool {
     if (alias.len == 0 or alias.len > 32) return false;
     for (alias) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
     return true;
@@ -314,6 +334,46 @@ test "claimed output remains until delivery is confirmed" {
     const final = try claim(&db, testing.allocator, 203);
     defer free(testing.allocator, final);
     try testing.expectEqual(@as(usize, 0), final.len);
+}
+
+test "unknown stickers never enter the outbox" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &buf);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx: tools.Ctx = .{ .gpa = testing.allocator, .io = threaded.io(), .db = &db };
+
+    const result = try tools.call(&ctx, &.{send_sticker}, "send_sticker", "{\"alias\":\"missing\"}");
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("unknown sticker alias", result);
+    var q = try db.prepare("SELECT count(*) FROM outbox");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqual(@as(i64, 0), q.int(0));
+}
+
+test "the same pending sticker is queued once" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &buf);
+    defer db.close();
+    try db.exec("INSERT INTO sticker_aliases(alias, file_id, unique_id, updated) VALUES ('pro', 'file', 'stable', 1)");
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx: tools.Ctx = .{ .gpa = testing.allocator, .io = threaded.io(), .db = &db };
+
+    for (0..2) |_| {
+        const result = try tools.call(&ctx, &.{send_sticker}, "send_sticker", "{\"alias\":\"pro\"}");
+        testing.allocator.free(result);
+    }
+    var q = try db.prepare("SELECT count(*) FROM outbox WHERE kind = 'sticker' AND status = 'queued'");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqual(@as(i64, 1), q.int(0));
 }
 
 test "restart preserves an interrupted send as uncertain" {

@@ -4,6 +4,7 @@ const web = @import("../net/web.zig");
 pub const max_path: usize = 512;
 pub const max_read: usize = 64 * 1024;
 pub const max_write: usize = web.max_body;
+pub const max_transfer: usize = 20 * 1024 * 1024;
 pub const trunc_mark = "\n[truncated]";
 
 const Parent = struct {
@@ -151,7 +152,11 @@ pub fn readLimited(gpa: std.mem.Allocator, io: std.Io, root: []const u8, path: [
 }
 
 pub fn write(io: std.Io, root: []const u8, path: []const u8, content: []const u8) !void {
-    if (content.len > max_write) return error.FileTooLarge;
+    return writeBounded(io, root, path, content, max_write);
+}
+
+pub fn writeBounded(io: std.Io, root: []const u8, path: []const u8, content: []const u8, limit: usize) !void {
+    if (content.len > limit) return error.FileTooLarge;
     const parent = try openParent(io, root, path);
     defer parent.close(io);
     var atomic = try parent.dir.createFileAtomic(io, parent.name, .{ .replace = true });

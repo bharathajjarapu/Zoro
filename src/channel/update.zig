@@ -1,9 +1,9 @@
 const std = @import("std");
 const testing = std.testing;
-const web = @import("../net/web.zig");
+const workspace = @import("../app/workspace.zig");
 
 pub const max_text = 64 * 1024;
-pub const max_file = web.max_body;
+pub const max_file = workspace.max_transfer;
 const max_callback = 64;
 
 pub const Kind = enum {
@@ -53,6 +53,7 @@ pub const Update = struct {
     owner_text: ?[]u8 = null,
     /// Photo selected for the model.
     photo: ?[]u8 = null,
+    preview_id: ?[]u8 = null,
     file_id: ?[]u8 = null,
     file_name: ?[]u8 = null,
     mime: ?[]u8 = null,
@@ -70,6 +71,7 @@ pub const Update = struct {
         gpa.free(self.text);
         if (self.owner_text) |s| gpa.free(s);
         if (self.photo) |p| gpa.free(p);
+        if (self.preview_id) |p| gpa.free(p);
         if (self.reply_text) |s| gpa.free(s);
         if (self.file_id) |s| gpa.free(s);
         if (self.file_name) |s| gpa.free(s);
@@ -116,6 +118,8 @@ const RawMessage = struct {
 const RawPhoto = struct {
     file_id: []const u8 = "",
     file_size: ?i64 = null,
+    width: i64 = 0,
+    height: i64 = 0,
 };
 
 const RawFile = struct {
@@ -123,6 +127,7 @@ const RawFile = struct {
     file_name: ?[]const u8 = null,
     mime_type: ?[]const u8 = null,
     file_size: ?i64 = null,
+    thumbnail: ?RawPhoto = null,
 };
 
 const RawSticker = struct {
@@ -132,6 +137,7 @@ const RawSticker = struct {
     emoji: ?[]const u8 = null,
     is_animated: bool = false,
     is_video: bool = false,
+    thumbnail: ?RawPhoto = null,
 };
 
 const RawReply = struct {
@@ -157,7 +163,9 @@ fn largest(sizes: []const RawPhoto) ?RawPhoto {
     var best: ?RawPhoto = null;
     for (sizes) |p| {
         if (p.file_id.len == 0 or (p.file_size orelse 0) > max_file) continue;
-        if (best == null or (p.file_size orelse 0) > (best.?.file_size orelse 0)) best = p;
+        const area = @as(i128, @max(p.width, 0)) * @as(i128, @max(p.height, 0));
+        const best_area = if (best) |b| @as(i128, @max(b.width, 0)) * @as(i128, @max(b.height, 0)) else -1;
+        if (best == null or area > best_area or (area == best_area and (p.file_size orelse 0) > (best.?.file_size orelse 0))) best = p;
     }
     return best;
 }
@@ -281,7 +289,7 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
             file = f;
             kind = .animation;
         }
-        if (file) |f| if (f.file_id.len == 0 or (f.file_size orelse 0) > max_file) {
+        if (file) |f| if (f.file_id.len == 0) {
             file = null;
             kind = .text;
         };
@@ -326,9 +334,12 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
             u.file_name = if (f.file_name) |s| try gpa.dupe(u8, s) else null;
             u.mime = if (f.mime_type) |s| try gpa.dupe(u8, s) else null;
             u.file_size = f.file_size;
+            if (f.thumbnail) |p| {
+                if (p.file_id.len != 0) u.preview_id = try gpa.dupe(u8, p.file_id);
+            }
         }
         if (sticker) |s| {
-            if (s.file_id.len == 0 or (s.file_size orelse 0) > max_file) {
+            if (s.file_id.len == 0) {
                 u.deinit(gpa);
                 continue;
             }
@@ -337,6 +348,9 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
             u.emoji = if (s.emoji) |emoji| try gpa.dupe(u8, emoji) else null;
             u.file_size = s.file_size;
             u.sticker_type = try gpa.dupe(u8, if (s.is_video) "video" else if (s.is_animated) "animated" else "static");
+            if (s.thumbnail) |p| {
+                if (p.file_id.len != 0) u.preview_id = try gpa.dupe(u8, p.file_id);
+            }
         }
         if (msg.location) |loc| {
             u.latitude = loc.latitude;
@@ -390,6 +404,25 @@ test "utf8ChunkEnd does not split a multi-byte character" {
     try testing.expectEqual(text.len, utf8ChunkEnd(text, 32));
     try testing.expectEqual(@as(usize, 0), utf8ChunkEnd("€", 1));
     try testing.expectEqual(@as(usize, 0), utf8ChunkEnd("€", 0));
+}
+
+test "photo selection uses dimensions when size is absent" {
+    const body =
+        \\{"ok":true,"result":[{"update_id":1,"message":{"from":{"id":1},"chat":{"id":1,"type":"private"},"photo":[{"file_id":"small","width":90,"height":90},{"file_id":"large","width":1280,"height":720}]}}]}
+    ;
+    var batch = try parseUpdates(testing.allocator, body);
+    defer batch.deinit(testing.allocator);
+    try testing.expectEqualStrings("large", batch.items[0].photo.?);
+}
+
+test "animated sticker keeps its image preview" {
+    const body =
+        \\{"ok":true,"result":[{"update_id":1,"message":{"from":{"id":1},"chat":{"id":1,"type":"private"},"sticker":{"file_id":"video","file_unique_id":"same","is_video":true,"thumbnail":{"file_id":"preview","width":128,"height":128}}}}]}
+    ;
+    var batch = try parseUpdates(testing.allocator, body);
+    defer batch.deinit(testing.allocator);
+    try testing.expectEqualStrings("video", batch.items[0].sticker_type.?);
+    try testing.expectEqualStrings("preview", batch.items[0].preview_id.?);
 }
 
 test "parseUpdates skips text over 64 KiB and still advances the offset" {

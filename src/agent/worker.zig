@@ -303,14 +303,14 @@ fn setResult(db: *Db, id: i64, text: []const u8) !void {
 }
 
 const delegate_params = [_]tools.Param{
-    .{ .name = "summary", .description = "short label for the work" },
-    .{ .name = "goal", .description = "the success criterion, in one or two sentences" },
-    .{ .name = "tools", .description = "space-separated tool names the subagent may use; omit for a read-only researcher", .required = false },
+    .{ .name = "summary", .description = "short task name" },
+    .{ .name = "goal", .description = "success criterion" },
+    .{ .name = "tools", .description = "allowed tool names", .required = false },
 };
 
 pub const delegate: tools.Def = .{
     .name = "delegate",
-    .description = "Hand independent work to a subagent with a fresh context. Up to three run at once.",
+    .description = "Delegate independent work.",
     .params = &delegate_params,
     .mutates = true,
     .primary_only = true,
@@ -319,7 +319,7 @@ pub const delegate: tools.Def = .{
 
 pub const check_tasks: tools.Def = .{
     .name = "check_tasks",
-    .description = "Report every delegated task with its status and result. Synthesize these yourself; the owner never sees them.",
+    .description = "Check delegated work.",
     .params = &.{},
     // Sibling goals belong only in the primary context.
     .primary_only = true,
@@ -336,13 +336,11 @@ fn runDelegate(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     return std.fmt.allocPrint(ctx.gpa, "task #{d} filed: {s}. Three run at once; check_tasks shows where it got to.", .{ id, parsed.value.summary });
 }
 
-const cancel_params = [_]tools.Param{
-    .{ .name = "id", .description = "task number from check_tasks" },
-};
+const cancel_params = [_]tools.Param{.{ .name = "id", .description = "task id" }};
 
 pub const cancel_task: tools.Def = .{
     .name = "cancel_task",
-    .description = "Call off one delegated task. Use this to redirect work instead of stopping everything.",
+    .description = "Cancel one delegated task.",
     .params = &cancel_params,
     .mutates = true,
     .primary_only = true,

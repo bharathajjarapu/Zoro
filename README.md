@@ -91,6 +91,27 @@ user or chat is dropped without a reply.
 Inspection commands run while the daemon is running: the single-process lock
 covers the Telegram poller, not the database.
 
+Conversation context is bounded by rows and bytes. Zoro compacts older turns
+automatically while keeping the recent exchange. `/compact` does this on demand.
+`/clear` and `/new` save the summary as searchable memory and start fresh.
+
+Telegram commands:
+
+| Command | What it does |
+|---|---|
+| `/help` | Show available commands |
+| `/status` | Show work and delivery status |
+| `/tasks`, `/routines` | List delegated work or routines |
+| `/memory`, `/diary` | Search memory or read the diary |
+| `/skills`, `/character` | Inspect skills or character |
+| `/learn` | Show learning mode and proposals |
+| `/compact` | Summarize older conversation turns |
+| `/clear`, `/new` | Save the summary and start fresh |
+| `/learn sticker <alias>` | Teach the next sticker for five minutes |
+| `/stickers` | List learned sticker aliases |
+| `/sticker <alias>` | Send a learned sticker |
+| `/stop` | Cancel current work |
+
 ## Skills and routines
 
 A skill is a directory under the skills dir holding a `SKILL.md`:
@@ -108,7 +129,9 @@ allowed-tools: fetch_url recall notify_owner
 Plain English instructions the agent follows when this runs.
 ```
 
-Only the name and description are always in context; the body loads on demand.
+Only up to 32 skill names are always in context. Bodies load on demand and
+descriptions stay on disk. Tool schemas use short descriptions to reduce model
+input.
 `save_skill` creates a reviewable proposal. Learned skills cannot add tools,
 models, schedules, or authority. Applying or rolling back a proposal requires
 an exact owner approval. The agent cannot gain new capabilities without a
@@ -173,21 +196,32 @@ a clean environment, and kills the process group on timeout or cancellation.
 
 Telegram uses long polling for one private owner chat. Accepted updates and
 outgoing messages are durable. Internal work and recovery state stays out of
-the chat. It supports natural typing indicators, `/stop`, conservative HTML,
-bounded message splitting, callbacks, native media sends, guarded incoming
-files, locations, stickers, and BotFather commands.
-Static sticker images and ordinary photos use the configured base model's image
-input. Voice and other media are saved; transcription requires an explicitly
-supported model path.
+the chat. It shows typing during model work and the matching upload or sticker
+action during delivery. It supports `/stop`, conservative HTML, bounded message
+splitting, callbacks, replies, native media sends, guarded incoming files,
+locations, stickers, and BotFather commands. Successful tool-driven delivery
+suppresses a redundant companion message.
+
+The chat defaults to English and follows the owner's language or explicit
+request. Photos, image documents, static stickers, and available media previews
+use the configured model's image input. Incoming photos and files up to 20 MiB
+are saved in the workspace inbox; text files are also passed as text. Voice,
+audio, video, and animation files are preserved, but understanding their
+contents requires a supported transcription or video path. Outgoing albums are
+capped at 20 MiB.
+
+Teach a sticker with `/learn sticker <alias>`, then send the sticker within five
+minutes. The agent can use that alias later without sending an extra emoji or
+duplicate pending sticker.
 
 ## Layout
 
 ```
 src/              the product
   main.zig        process entry point and composition root
-  app/            configuration and terminal commands
+  app/            configuration and workspace paths
   agent/          model loop and fresh-context workers
-  channel/        Telegram polling, auth, media, and delivery
+  channel/        CLI and Telegram drivers
   data/           SQLite, memory, tasks, secrets, and outbox
   net/            bounded HTTP and guarded web fetching
   automation/     skills, schedules, and routine execution
@@ -201,4 +235,6 @@ vendor/sqlite3/   pinned, checksummed amalgamation
 Web and model calls have total deadlines, bounded bodies, cancellation, SSRF
 checks, and shared rate limits. TinyFish remains the search and fetch service;
 its pricing and quotas can change. Zoro does not install packages or execute
-learned code. Daily model-spend metering is not implemented.
+learned code. Schema migrations are intentionally absent before production; use
+a fresh data directory after schema changes. Daily model-spend metering is not
+implemented.
