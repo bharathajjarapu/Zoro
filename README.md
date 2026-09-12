@@ -42,12 +42,18 @@ file, so secrets can stay out of it entirely.
 | `OWNER_ID` | daemon only | Your numeric Telegram user id |
 | `CHAT_ID` | daemon only | The private chat id to serve |
 | `LLM_BASE_URL` | no | Defaults to `https://api.openai.com/v1` |
-| `ZORO_DATA_DIR` | no | Database, diary and lock file. Default `data` |
-| `ZORO_SKILLS_DIR` | no | Where `SKILL.md` files live. Default `skills` |
-| `ZORO_WORKSPACE` | no | The only directory files may be read from or attached. Default `workspace` |
+| `ZORO_HOME` | no | Stable application root. Default `$XDG_DATA_HOME/zoro` or `$HOME/.local/share/zoro` |
+| `ZORO_ENV_FILE` | no | Runtime env file. Default `$ZORO_HOME/.env` |
+| `ZORO_DATA_DIR` | no | Database, diary and lock directory. Default `$ZORO_HOME/data` |
+| `ZORO_SKILLS_DIR` | no | Skill directory. Default `$ZORO_HOME/skills` |
+| `ZORO_WORKSPACE` | no | Guarded file root. Default `$ZORO_HOME/workspace` |
+| `ZORO_INBOX_DIR` | no | Telegram inbox inside the workspace |
+| `ZORO_TMP_DIR` | no | Temporary runtime files. Default `$ZORO_HOME/tmp` |
+| `ZORO_SHELL` | no | `deny`, `allowlist`, or `ask`. Default `ask` |
 
-An unrecognised `ZORO_*` or `LLM_*` key is logged as a warning rather than
-ignored, because a typo in a token name is otherwise silent.
+Relative path overrides resolve under `ZORO_HOME`; absolute overrides stay
+absolute. An unrecognised `ZORO_*` or `LLM_*` key logs its name only.
+Configuration values are never logged or embedded at build time.
 
 ## First run
 
@@ -79,6 +85,7 @@ user or chat is dropped without a reply.
 | `zoro memory "<query>"` | BM25 search; prints ref, kind, score |
 | `zoro tasks` | Tasks with status, priority, goal, and result |
 | `zoro routines` | Routines with status, failures, and skipped runs |
+| `zoro status` | Recovery state and pending, failed, and uncertain counts |
 | `zoro --version` | Zoro and SQLite versions |
 
 Inspection commands run while the daemon is running: the single-process lock
@@ -102,8 +109,10 @@ Plain English instructions the agent follows when this runs.
 ```
 
 Only the name and description are always in context; the body loads on demand.
-The agent writes its own skills with `save_skill` — that is the whole
-extensibility story. It cannot gain new *capabilities* without a rebuild.
+`save_skill` creates a reviewable proposal. Learned skills cannot add tools,
+models, schedules, or authority. Applying or rolling back a proposal requires
+an exact owner approval. The agent cannot gain new capabilities without a
+rebuild.
 
 **Authority is enforced, not advisory.** A `notify` routine is handed no tool
 that mutates anything. A `safe` or `critical` routine stays switched off until
@@ -124,10 +133,8 @@ no Telegram access; results go to the primary, which synthesizes and speaks with
 one voice.
 
 A subagent with no named tool list is read-only, so the default delegate is a
-researcher that cannot touch your files. Send `stop` to cancel everything in
-flight — it cancels that batch, not every batch after it. The primary can also call off a
-single task and redirect it while the others keep running, and your messages are
-answered immediately either way.
+researcher that cannot touch your files. Send `stop` to cancel work in flight.
+The primary can stop one task while the others continue.
 
 Consequential work is verified with a second model call before it is reported as
 done; bounded research is not, because paying twice for a summary is waste. A
@@ -136,22 +143,41 @@ false success.
 
 ## Container
 
-Rootless Podman on Debian Slim. The image carries a static binary, a CA bundle
-and nothing else — no package manager at runtime.
+Rootless Podman on Alpine. The image carries one musl binary, BusyBox `sh`,
+`apk`, and CA certificates.
 
 ```sh
 podman build -t zoro:latest -f Containerfile .
 podman run -d --name zoro \
   --userns=keep-id:uid=10001,gid=10001 \
   --cap-drop=ALL --security-opt=no-new-privileges \
-  -v ./data:/data:Z -v ./skills:/skills:Z -v ./workspace:/workspace:Z \
+  -v ./data:/data:Z -v ./workspace:/workspace:Z \
   --env-file .env \
   zoro:latest
 ```
 
-Image size: **87 MB** (`localhost/zoro:dev`, built 2026-08-21). Restarting
-preserves memory, tasks and routines; the agent can read nothing outside its
-three mounts.
+Restarting preserves memory, tasks, routines, learning proposals, and queued
+delivery. Runtime files stay under `/data`; agent-created files stay under the
+guarded `/workspace` mount.
+
+Add future command-line tools with `apk add --no-cache` in the Containerfile.
+The running agent is non-root and its shell policy cannot invoke `apk`.
+
+## Workspace and Telegram
+
+File tools use workspace-relative paths, reject traversal and symlinks, cap
+reads and downloads, and replace writes atomically. Identity files
+(`SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`) have a separate approved
+update path. The shell accepts JSON argument arrays, uses pinned executables and
+a clean environment, and kills the process group on timeout or cancellation.
+
+Telegram uses long polling for one private owner chat. Accepted updates and
+outgoing messages are durable. It supports replies, conservative HTML, bounded
+message splitting, callbacks, progress and stop controls, native media sends,
+guarded incoming files, locations, stickers, reactions, and BotFather commands.
+Static sticker images and ordinary photos use the configured base model's image
+input. Voice and other media are saved; transcription requires an explicitly
+supported model path.
 
 ## Layout
 
@@ -169,13 +195,9 @@ src/              the product
 vendor/sqlite3/   pinned, checksummed amalgamation
 ```
 
-## Not built yet
+## Limits
 
-Two designed limits are not enforced:
-
-- **The daily spend cap.** No ticket covers metering. Every model call, image
-  turns included, goes through one path in `src/agent/root.zig`, so it lands in
-  one place.
-- **The 10 s web request timeout.** Unreachable in Zig 0.16 — `std.http.Client`
-  ignores the timeout field it accepts. A hung host stalls that turn and the
-  poll loop with it. The 2 MB body cap and per-host rate limit still apply.
+Web and model calls have total deadlines, bounded bodies, cancellation, SSRF
+checks, and shared rate limits. TinyFish remains the search and fetch service;
+its pricing and quotas can change. Zoro does not install packages or execute
+learned code. Daily model-spend metering is not implemented.

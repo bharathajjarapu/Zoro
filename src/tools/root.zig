@@ -1,5 +1,6 @@
 const std = @import("std");
 const Db = @import("../data/db.zig").Db;
+const config = @import("../app/config.zig");
 const web = @import("../net/web.zig");
 const testing = std.testing;
 const testkit = @import("../testing/testkit.zig");
@@ -11,7 +12,10 @@ pub const Param = struct {
     name: []const u8,
     description: []const u8,
     required: bool = true,
+    kind: enum { string, array } = .string,
 };
+
+pub const ShellMode = config.ShellMode;
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -20,9 +24,21 @@ pub const Ctx = struct {
     skills_dir: []const u8 = "skills",
     workspace: []const u8 = "workspace",
     web_api: ?web.Api = null,
+    fetch: ?web.Get = null,
     tinyfish_key: ?[]const u8 = null,
     limiter: ?*web.Limiter = null,
     pool: ?*worker.Pool = null,
+    shell_mode: ShellMode = .ask,
+    source_message: ?i64 = null,
+    approval_out: ?*?i64 = null,
+    cancel: ?*const std.atomic.Value(bool) = null,
+    cancel_parent: ?*const std.atomic.Value(bool) = null,
+
+    pub fn cancelled(self: *const Ctx) bool {
+        if (self.cancel) |flag| if (flag.load(.acquire)) return true;
+        if (self.cancel_parent) |flag| if (flag.load(.acquire)) return true;
+        return false;
+    }
 };
 
 pub const Def = struct {
@@ -88,6 +104,9 @@ const tasks = @import("../data/tasks.zig");
 const outbox = @import("../data/outbox.zig");
 const routine = @import("routine.zig");
 const worker = @import("../agent/worker.zig");
+const workspace = @import("workspace.zig");
+const shell = @import("shell.zig");
+const learning = @import("learning.zig");
 
 const ask_params = [_]Param{
     .{ .name = "tool", .description = "tool to run if approved" },
@@ -116,6 +135,7 @@ fn runAsk(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     defer parsed.deinit();
     const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
     const id = try tasks.ask(ctx.db, parsed.value.tool, parsed.value.args, parsed.value.target, parsed.value.reason, null, now);
+    if (ctx.approval_out) |out| out.* = id;
     return try std.fmt.allocPrint(ctx.gpa, "pending #{d}: {s} — {s}", .{ id, parsed.value.tool, parsed.value.reason });
 }
 
@@ -128,10 +148,21 @@ pub const builtins = [_]Def{
     skills.save_skill,
     web_tools.fetch_url,
     web_tools.search,
+    workspace.read_file,
+    workspace.write_file,
+    workspace.edit_file,
+    workspace.download_file,
+    workspace.delete_file,
+    shell.run,
+    learning.character_inspect,
+    learning.character_propose,
+    learning.learning_inspect,
+    learning.learning_propose,
     store_secret,
     request_permission,
     outbox.notify_owner,
     outbox.attach_file,
+    outbox.send_sticker,
     worker.delegate,
     worker.check_tasks,
     worker.cancel_task,
@@ -141,12 +172,23 @@ pub const builtins = [_]Def{
 pub const gated = [_]Def{
     routine.enable_routine,
     routine.run_routine,
+    workspace.delete_approved,
+    shell.run_approved,
+    learning.learning_apply,
+    learning.learning_reject,
+    learning.learning_quarantine,
+    learning.learning_rollback,
+    learning.learning_set_mode,
+    learning.apply_identity,
+    learning.rollback_identity,
+    learning.reset_identity,
 };
 
 /// Runs an owner-approved action.
 pub fn callApproved(ctx: *Ctx, own: []const Def, name: []const u8, args: []const u8) ![]u8 {
-    if (find(&gated, name) != null) return call(ctx, &gated, name, args);
-    return call(ctx, own, name, args);
+    const def = find(&gated, name) orelse find(own, name) orelse return error.UnknownTool;
+    try validate(ctx.gpa, def, args);
+    return bound(ctx.gpa, try def.run(ctx, args));
 }
 
 /// Runs a tool and returns bounded output or an error string.
@@ -157,8 +199,10 @@ pub fn call(ctx: *Ctx, tools: []const Def, name: []const u8, args: []const u8) !
         error.OutOfMemory => return error.OutOfMemory,
         else => return std.fmt.allocPrint(ctx.gpa, "invalid arguments: {s}", .{@errorName(err)}),
     };
-    const raw = def.run(ctx, args) catch |err|
-        return std.fmt.allocPrint(ctx.gpa, "tool error: {s}", .{@errorName(err)});
+    const raw = def.run(ctx, args) catch |err| switch (err) {
+        error.Cancelled, error.OutOfMemory => return err,
+        else => return std.fmt.allocPrint(ctx.gpa, "tool error: {s}", .{@errorName(err)}),
+    };
     return bound(ctx.gpa, raw);
 }
 
@@ -167,8 +211,11 @@ pub fn writeSchema(w: *std.Io.Writer, def: Def) !void {
     for (def.params, 0..) |p, i| {
         if (i != 0) try w.writeByte(',');
         try std.json.Stringify.encodeJsonString(p.name, .{}, w);
-        try w.writeAll(":{\"type\":\"string\",\"description\":");
+        try w.writeAll(":{\"type\":\"");
+        try w.writeAll(@tagName(p.kind));
+        try w.writeAll("\",\"description\":");
         try std.json.Stringify.encodeJsonString(p.description, .{}, w);
+        if (p.kind == .array) try w.writeAll(",\"items\":{\"type\":\"string\"}");
         try w.writeByte('}');
     }
     try w.writeAll("},\"required\":[");
@@ -360,7 +407,7 @@ test "a read-only caller gets no mutating tool, and delegation is never handed o
     try testing.expect(find(list, "recall") != null);
     try testing.expect(find(list, "remember") == null);
     try testing.expect(find(list, "save_skill") == null);
-    try testing.expect(find(list, "notify_owner") != null);
+    try testing.expect(find(list, "notify_owner") == null);
 }
 
 test "an allowlist narrows to exactly the named tools" {

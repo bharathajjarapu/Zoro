@@ -2,10 +2,12 @@ const std = @import("std");
 const c = @import("c");
 const config = @import("app/config.zig");
 const Db = @import("data/db.zig").Db;
+const task_data = @import("data/tasks.zig");
 const agent = @import("agent/root.zig");
 const cli = @import("app/cli.zig");
 const telegram = @import("channel/telegram.zig");
 const tools = @import("tools/root.zig");
+const learning_tools = @import("tools/learning.zig");
 const scheduler = @import("automation/scheduler.zig");
 const worker = @import("agent/worker.zig");
 const http = @import("net/http.zig");
@@ -19,7 +21,7 @@ const version = "0.0.0";
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
         // Already reported in the owner's terms; a stack trace would only bury it.
-        error.MissingConfig, error.ChatHttp, error.TelegramApiError, error.TelegramHttp, error.InvalidTelegramToken => std.process.exit(1),
+        error.MissingConfig, error.ChatHttp, error.TelegramApiError, error.TelegramHttp, error.TelegramRejected, error.InvalidTelegramToken => std.process.exit(1),
         error.AlreadyRunning => std.process.exit(2),
         else => return err,
     };
@@ -39,6 +41,7 @@ fn run(init: std.process.Init) !void {
     if (eql(u8, cmd, "memory")) return cmdMemory(init, &args);
     if (eql(u8, cmd, "tasks")) return cmdTasks(init);
     if (eql(u8, cmd, "routines")) return cmdRoutines(init);
+    if (eql(u8, cmd, "status")) return cmdStatus(init);
 
     log.err("unknown command: {s}", .{cmd});
     try print(init.io, usage, .{});
@@ -54,15 +57,16 @@ const usage =
     \\  zoro memory QUERY  BM25 search; prints ref, kind, score
     \\  zoro tasks      list tasks with status, priority, and goal
     \\  zoro routines   list routines with status, failures, and skipped runs
+    \\  zoro status     report recovery state and counts
     \\  zoro --version  print the zoro and SQLite versions
     \\  zoro help       print this
     \\
 ;
 
 fn daemon(init: std.process.Init) !void {
-    var cfg = try config.load(init.gpa, init.io, ".env");
+    var cfg = try config.loadRuntime(init.gpa, init.io, init.environ_map);
     defer cfg.deinit(init.gpa);
-    cfg.overlay(init.environ_map);
+    try createRuntimeDirs(init.io, cfg);
 
     const token = cfg.telegram_token orelse return config.missing("TELEGRAM_TOKEN");
     const owner_id = cfg.owner_id orelse return config.missing("OWNER_ID");
@@ -81,21 +85,27 @@ fn daemon(init: std.process.Init) !void {
         return error.AlreadyRunning;
     };
     defer lock.close(init.io);
+    try task_data.recoverApprovals(&db, std.math.maxInt(i64));
+    try learning_tools.reconcile(&db, init.gpa, init.io, cfg.workspace, cfg.skills_dir, std.Io.Timestamp.now(init.io, .real).toSeconds());
 
     var client = http.StdHttp.init(init.gpa, init.io);
     defer client.deinit();
+    var live_client = http.StdHttp.init(init.gpa, init.io);
+    defer live_client.deinit();
 
+    var limiter: @import("net/web.zig").Limiter = .{};
     var crew: Crew = undefined;
-    try crew.init(init, cfg, &db);
+    try crew.init(init, cfg, &db, &limiter);
     defer crew.deinit();
 
-    var a = makeAgent(init, cfg, &db, &client, diary_dir);
+    var a = makeAgent(init, cfg, &db, &client, diary_dir, &limiter);
     a.workers = &crew.pool.state;
     a.pool = &crew.pool;
     var bot: telegram.Bot = .{
         .gpa = init.gpa,
         .io = init.io,
         .http = client.http(),
+        .live_http = live_client.http(),
         .db = &db,
         .agent = &a,
         .token = token,
@@ -103,6 +113,7 @@ fn daemon(init: std.process.Init) !void {
         .chat_id = chat_id,
         .fetch = client.getter(),
         .workspace = cfg.workspace,
+        .inbox = try cfg.inboxRelative(),
     };
 
     bot.getMe() catch |err| {
@@ -115,7 +126,7 @@ fn daemon(init: std.process.Init) !void {
     defer sched_db.close();
     var sched_http = http.StdHttp.init(init.gpa, init.io);
     defer sched_http.deinit();
-    var sched_agent = makeAgent(init, cfg, &sched_db, &sched_http, diary_dir);
+    var sched_agent = makeAgent(init, cfg, &sched_db, &sched_http, diary_dir, &limiter);
     const sched = try std.Thread.spawn(.{}, scheduler.loop, .{ &sched_agent, &stop.requested });
     defer sched.join();
 
@@ -201,6 +212,13 @@ fn cmdRoutines(init: std.process.Init) !void {
     try cli.printRoutines(&s.db, &out.interface);
 }
 
+fn cmdStatus(init: std.process.Init) !void {
+    var s: Store = undefined;
+    var out = try s.open(init);
+    defer s.deinit();
+    try cli.printStatus(&s.db, &out.interface);
+}
+
 /// Each worker owns its database and HTTP client.
 const Crew = struct {
     dbs: [worker.max_live]Db = undefined,
@@ -208,7 +226,7 @@ const Crew = struct {
     open: usize = 0,
     pool: worker.Pool = undefined,
 
-    fn init(self: *Crew, p: std.process.Init, cfg: config.Config, db: *Db) !void {
+    fn init(self: *Crew, p: std.process.Init, cfg: config.Config, db: *Db, limiter: *@import("net/web.zig").Limiter) !void {
         self.open = 0;
         errdefer self.closeOpen();
         const diary_dir = try diaryDir(p, cfg);
@@ -218,7 +236,7 @@ const Crew = struct {
             wdb.* = try openDb(p.io, cfg.data_dir);
             self.open += 1;
             h.* = http.StdHttp.init(p.gpa, p.io);
-            proto.* = makeAgent(p, cfg, wdb, h, diary_dir);
+            proto.* = makeAgent(p, cfg, wdb, h, diary_dir, limiter);
         }
         self.pool = worker.Pool.init(p.gpa, db, protos);
     }
@@ -239,23 +257,32 @@ const Crew = struct {
 
 const Terminal = struct {
     store: Store,
+    io: std.Io,
+    lock: std.Io.File,
     http: http.StdHttp,
     crew: Crew,
+    limiter: @import("net/web.zig").Limiter,
     agent: agent.Agent,
 
     fn init(self: *Terminal, p: std.process.Init) !void {
+        self.io = p.io;
         try self.store.init(p);
         errdefer self.store.deinit();
+        self.lock = try telegram.tryLock(p.io, self.store.cfg.data_dir) orelse return error.AlreadyRunning;
+        errdefer self.lock.close(p.io);
+        try task_data.recoverApprovals(&self.store.db, std.math.maxInt(i64));
+        try learning_tools.reconcile(&self.store.db, p.gpa, p.io, self.store.cfg.workspace, self.store.cfg.skills_dir, std.Io.Timestamp.now(p.io, .real).toSeconds());
         if (self.store.cfg.api_key == null) return config.missing("LLM_API_KEY");
         if (self.store.cfg.model == null) return config.missing("LLM_MODEL");
 
         self.http = http.StdHttp.init(p.gpa, p.io);
         errdefer self.http.deinit();
 
-        try self.crew.init(p, self.store.cfg, &self.store.db);
+        self.limiter = .{};
+        try self.crew.init(p, self.store.cfg, &self.store.db, &self.limiter);
         errdefer self.crew.deinit();
 
-        self.agent = makeAgent(p, self.store.cfg, &self.store.db, &self.http, try diaryDir(p, self.store.cfg));
+        self.agent = makeAgent(p, self.store.cfg, &self.store.db, &self.http, try diaryDir(p, self.store.cfg), &self.limiter);
         self.agent.workers = &self.crew.pool.state;
         self.agent.pool = &self.crew.pool;
     }
@@ -263,6 +290,7 @@ const Terminal = struct {
     fn deinit(self: *Terminal) void {
         self.crew.deinit();
         self.http.deinit();
+        self.lock.close(self.io);
         self.store.deinit();
         self.* = undefined;
     }
@@ -276,9 +304,9 @@ const Store = struct {
 
     fn init(self: *Store, p: std.process.Init) !void {
         self.gpa = p.gpa;
-        self.cfg = try config.load(p.gpa, p.io, ".env");
+        self.cfg = try config.loadRuntime(p.gpa, p.io, p.environ_map);
         errdefer self.cfg.deinit(self.gpa);
-        self.cfg.overlay(p.environ_map);
+        try createRuntimeDirs(p.io, self.cfg);
         self.db = try openDb(p.io, self.cfg.data_dir);
         errdefer self.db.close();
         try self.db.migrate();
@@ -303,7 +331,7 @@ fn diaryDir(p: std.process.Init, cfg: config.Config) ![]const u8 {
 }
 
 /// Requires checked API key and model values.
-fn makeAgent(p: std.process.Init, cfg: config.Config, db: *Db, client: *http.StdHttp, diary: []const u8) agent.Agent {
+fn makeAgent(p: std.process.Init, cfg: config.Config, db: *Db, client: *http.StdHttp, diary: []const u8, limiter: *@import("net/web.zig").Limiter) agent.Agent {
     return .{
         .gpa = p.gpa,
         .io = p.io,
@@ -317,8 +345,17 @@ fn makeAgent(p: std.process.Init, cfg: config.Config, db: *Db, client: *http.Std
         .skills_dir = cfg.skills_dir,
         .diary_dir = diary,
         .web_api = client.webApi(),
+        .fetch = client.getter(),
         .tinyfish_key = cfg.tinyfish_key,
+        .shared_limiter = limiter,
+        .shell_mode = cfg.shell_mode,
     };
+}
+
+fn createRuntimeDirs(io: std.Io, cfg: config.Config) !void {
+    for ([_][]const u8{ cfg.data_dir, cfg.workspace, cfg.skills_dir, cfg.tmp_dir }) |path| {
+        try std.Io.Dir.cwd().createDirPath(io, path);
+    }
 }
 
 fn openDb(io: std.Io, dir: []const u8) !Db {
@@ -420,6 +457,11 @@ test {
     _ = @import("data/outbox.zig");
     _ = @import("agent/worker.zig");
     _ = @import("net/http.zig");
+    _ = @import("app/workspace.zig");
+    _ = @import("data/identity.zig");
+    _ = @import("data/learning.zig");
+    _ = @import("tools/workspace.zig");
+    _ = @import("tools/shell.zig");
 }
 
 test "a signal asks for shutdown instead of killing the process" {

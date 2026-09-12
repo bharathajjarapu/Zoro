@@ -9,6 +9,11 @@ const steps = [_][:0]const u8{
     @embedFile("schema.sql"),
     @embedFile("migrations/002.sql"),
     @embedFile("migrations/003.sql"),
+    @embedFile("migrations/004.sql"),
+    @embedFile("migrations/005.sql"),
+    @embedFile("migrations/006.sql"),
+    @embedFile("migrations/007.sql"),
+    @embedFile("migrations/008.sql"),
 };
 
 /// A SQLite connection. One per thread; WAL lets several coexist on one file.
@@ -212,10 +217,12 @@ test "migrate creates every table and is idempotent" {
     var q = try db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'chunks_%' ORDER BY name");
     defer q.finalize();
     const want = [_][]const u8{
-        "approvals", "approvals_status", "chunks",        "diary",
-        "facts",     "kv",               "messages",      "messages_created",
-        "outbox",    "routines",         "routines_next", "secrets",
-        "tasks",     "tasks_parent",     "tasks_status",
+        "approvals",       "approvals_status", "chunks",             "diary",
+        "facts",           "kv",               "learning_proposals", "learning_proposals_status",
+        "messages",        "messages_created", "outbox",             "outbox_ready",
+        "outbox_status",   "routines",         "routines_next",      "secrets",
+        "sticker_aliases", "sticker_cache",    "sticker_learning",   "tasks",
+        "tasks_parent",    "tasks_status",     "telegram_updates",   "telegram_updates_status",
     };
 
     // Compare inside the loop: a column slice dies at the next step().

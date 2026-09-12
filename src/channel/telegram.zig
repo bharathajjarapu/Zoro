@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const testkit = @import("../testing/testkit.zig");
 const FakeHttp = testkit.FakeHttp;
@@ -6,223 +7,181 @@ const agent = @import("../agent/root.zig");
 const config = @import("../app/config.zig");
 const Db = @import("../data/db.zig").Db;
 const outbox = @import("../data/outbox.zig");
+const tasks = @import("../data/tasks.zig");
 const web = @import("../net/web.zig");
+const workspace = @import("../app/workspace.zig");
+const wire = @import("telegram_wire.zig");
 
 const log = std.log.scoped(.telegram);
 
-pub const max_text = 64 * 1024;
 const max_message = 3900;
-/// Matches the HTTP download bound.
-pub const max_file = web.max_body;
+const max_callback = 64;
+const sticker_ttl: i64 = 5 * 60;
+const request_timeout_ms: i64 = if (builtin.is_test) 50 else 60_000;
 
-fn utf8ChunkEnd(text: []const u8, max_bytes: usize) usize {
-    if (max_bytes == 0) return 0;
-    if (text.len <= max_bytes) return text.len;
-    var end = max_bytes;
-    while (end > 0 and (text[end] & 0xc0) == 0x80) : (end -= 1) {}
-    return end;
-}
+pub const max_text = wire.max_text;
+pub const max_file = wire.max_file;
+pub const Kind = wire.Kind;
+pub const Batch = wire.Batch;
+pub const Update = wire.Update;
+pub const parseUpdates = wire.parseUpdates;
+const utf8ChunkEnd = wire.utf8ChunkEnd;
 
-pub const Batch = struct {
-    items: []Update = &.{},
-    next_offset: ?i64 = null,
-
-    pub fn deinit(self: *Batch, gpa: std.mem.Allocator) void {
-        for (self.items) |*u| u.deinit(gpa);
-        gpa.free(self.items);
-        self.* = undefined;
-    }
-};
-
-pub const Update = struct {
-    update_id: i64,
-    from_id: i64,
-    chat_id: i64,
-    chat_type: []u8,
-    /// Text, caption, or attachment description.
-    text: []u8,
-    /// Photo selected for the model.
-    photo: ?[]u8 = null,
-
-    pub fn deinit(self: *Update, gpa: std.mem.Allocator) void {
-        gpa.free(self.chat_type);
-        gpa.free(self.text);
-        if (self.photo) |p| gpa.free(p);
-        self.* = undefined;
-    }
-};
-
-const GetUpdatesResponse = struct {
-    ok: bool = false,
-    result: []const RawUpdate = &.{},
-};
-
-const RawUpdate = struct {
-    update_id: i64,
-    message: ?RawMessage = null,
-};
-
-const RawMessage = struct {
-    from: ?RawUser = null,
-    chat: RawChat,
-    text: ?[]const u8 = null,
-    caption: ?[]const u8 = null,
-    photo: ?[]const RawPhoto = null,
-    document: ?RawFile = null,
-    audio: ?RawFile = null,
-    video: ?RawFile = null,
-    voice: ?RawFile = null,
-};
-
-const RawPhoto = struct {
-    file_id: []const u8 = "",
-    file_size: ?i64 = null,
-};
-
-const RawFile = struct {
-    file_id: []const u8 = "",
-    file_name: ?[]const u8 = null,
-    mime_type: ?[]const u8 = null,
-    file_size: ?i64 = null,
-};
-
-/// Selects the largest photo under the cap.
-fn largest(sizes: []const RawPhoto) ?RawPhoto {
-    var best: ?RawPhoto = null;
-    for (sizes) |p| {
-        if (p.file_id.len == 0 or (p.file_size orelse 0) > max_file) continue;
-        if (best == null or (p.file_size orelse 0) > (best.?.file_size orelse 0)) best = p;
-    }
-    return best;
-}
-
-/// Describes unsupported attachments without downloading them.
-fn describe(gpa: std.mem.Allocator, caption: []const u8, f: RawFile) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}{s}[attachment: {s}, {s}, {d} bytes — I can see its details but not its contents]", .{
-        caption,
-        if (caption.len == 0) "" else "\n",
-        f.file_name orelse "unnamed",
-        f.mime_type orelse "unknown type",
-        f.file_size orelse 0,
-    });
-}
-
-const RawChat = struct {
-    id: i64,
-    type: []const u8 = "",
-};
-
-const RawUser = struct {
-    id: i64 = 0,
-    is_bot: bool = false,
-};
-
-pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
-    const parsed = std.json.parseFromSlice(GetUpdatesResponse, gpa, body, .{
-        .ignore_unknown_fields = true,
-    }) catch return error.InvalidTelegramResponse;
-    defer parsed.deinit();
-    if (!parsed.value.ok) return error.TelegramApiError;
-
-    var items: std.ArrayList(Update) = .empty;
-    errdefer {
-        for (items.items) |*u| u.deinit(gpa);
-        items.deinit(gpa);
-    }
-
-    var next_offset: ?i64 = null;
-    for (parsed.value.result) |raw| {
-        if (raw.update_id < 0) return error.InvalidTelegramUpdate;
-        const candidate = raw.update_id + 1;
-        if (next_offset == null or candidate > next_offset.?) next_offset = candidate;
-
-        const msg = raw.message orelse continue;
-        const from = msg.from orelse continue;
-        if (from.is_bot) continue;
-
-        const caption = msg.text orelse msg.caption orelse "";
-        if (caption.len > max_text) continue;
-        const picture = if (msg.photo) |sizes| largest(sizes) else null;
-        const file = msg.document orelse msg.audio orelse msg.video orelse msg.voice;
-        if (caption.len == 0 and picture == null and file == null) continue;
-
-        const chat_type = try gpa.dupe(u8, msg.chat.type);
-        errdefer gpa.free(chat_type);
-        const owned_text = if (picture == null and file != null)
-            try describe(gpa, caption, file.?)
-        else
-            try gpa.dupe(u8, caption);
-        errdefer gpa.free(owned_text);
-        const photo_id = if (picture) |p| try gpa.dupe(u8, p.file_id) else null;
-        errdefer if (photo_id) |id| gpa.free(id);
-        try items.append(gpa, .{
-            .update_id = raw.update_id,
-            .from_id = from.id,
-            .chat_id = msg.chat.id,
-            .chat_type = chat_type,
-            .text = owned_text,
-            .photo = photo_id,
-        });
-    }
-
-    return .{
-        .items = try items.toOwnedSlice(gpa),
-        .next_offset = next_offset,
-    };
-}
-
-test "parseUpdates extracts a private text message from a fixture" {
-    const body =
-        \\{"ok":true,"result":[{"update_id":10,"message":{"message_id":1,"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"text":"hello"}}]}
-    ;
-    var batch = try parseUpdates(testing.allocator, body);
-    defer batch.deinit(testing.allocator);
-
-    try testing.expectEqual(@as(usize, 1), batch.items.len);
-    try testing.expectEqual(@as(i64, 10), batch.items[0].update_id);
-    try testing.expectEqual(@as(i64, 42), batch.items[0].from_id);
-    try testing.expectEqual(@as(i64, 42), batch.items[0].chat_id);
-    try testing.expectEqualStrings("private", batch.items[0].chat_type);
-    try testing.expectEqualStrings("hello", batch.items[0].text);
-    try testing.expectEqual(@as(i64, 11), batch.next_offset.?);
-}
-
-test "parseUpdates skips bots and non-text but still advances the offset" {
-    const body =
-        \\{"ok":true,"result":[
-        \\  {"update_id":1,"message":{"from":{"id":7,"is_bot":true},"chat":{"id":7,"type":"private"},"text":"bot"}},
-        \\  {"update_id":2,"callback_query":{"id":"x"}},
-        \\  {"update_id":3,"message":{"from":{"id":9,"is_bot":false},"chat":{"id":9,"type":"private"}}}
-        \\]}
-    ;
-    var batch = try parseUpdates(testing.allocator, body);
-    defer batch.deinit(testing.allocator);
-
-    try testing.expectEqual(@as(usize, 0), batch.items.len);
-    try testing.expectEqual(@as(i64, 4), batch.next_offset.?);
-}
-
-test "utf8ChunkEnd does not split a multi-byte character" {
-    const text = "ab€cd";
-    try testing.expectEqual(@as(usize, 2), utf8ChunkEnd(text, 4));
-    try testing.expectEqual(text.len, utf8ChunkEnd(text, 32));
-    try testing.expectEqual(@as(usize, 0), utf8ChunkEnd("€", 1));
-    try testing.expectEqual(@as(usize, 0), utf8ChunkEnd("€", 0));
-}
-
-test "parseUpdates skips text over 64 KiB and still advances the offset" {
-    const oversized = "a" ** (64 * 1024 + 1);
-    const body = try std.fmt.allocPrint(
-        testing.allocator,
-        "{{\"ok\":true,\"result\":[{{\"update_id\":1,\"message\":{{\"from\":{{\"id\":1,\"is_bot\":false}},\"chat\":{{\"id\":1,\"type\":\"private\"}},\"text\":\"{s}\"}}}}]}}",
-        .{oversized},
+fn loadPending(db: *Db, gpa: std.mem.Allocator, owner_id: i64, chat_id: i64) ![]Update {
+    var q = try db.prepare(
+        \\SELECT id, text, message_id, reply_id, reply_text, kind, file_id, file_name, mime,
+        \\       file_size, file_unique_id, emoji, sticker_type, callback_id,
+        \\       callback_data, latitude, longitude, owner_text
+        \\FROM telegram_updates WHERE status = 'pending' ORDER BY id
     );
-    defer testing.allocator.free(body);
+    defer q.finalize();
+    var items: std.ArrayList(Update) = .empty;
+    errdefer freeUpdates(gpa, items.items);
+    while (try q.step()) {
+        const kind = std.meta.stringToEnum(Kind, q.text(5)) orelse .text;
+        var u: Update = undefined;
+        {
+            const chat_type = try gpa.dupe(u8, "private");
+            errdefer gpa.free(chat_type);
+            const reply_text = if (q.isNull(4)) null else try gpa.dupe(u8, q.text(4));
+            errdefer if (reply_text) |text| gpa.free(text);
+            const text = try gpa.dupe(u8, q.text(1));
+            errdefer gpa.free(text);
+            u = .{
+                .update_id = q.int(0),
+                .from_id = owner_id,
+                .chat_id = chat_id,
+                .chat_type = chat_type,
+                .message_id = if (q.isNull(2)) 0 else q.int(2),
+                .reply_id = if (q.isNull(3)) null else q.int(3),
+                .reply_text = reply_text,
+                .kind = kind,
+                .text = text,
+            };
+        }
+        errdefer u.deinit(gpa);
+        const file_id = if (q.isNull(6)) null else try gpa.dupe(u8, q.text(6));
+        if (kind == .photo) u.photo = file_id else u.file_id = file_id;
+        u.file_name = if (q.isNull(7)) null else try gpa.dupe(u8, q.text(7));
+        u.mime = if (q.isNull(8)) null else try gpa.dupe(u8, q.text(8));
+        u.file_size = if (q.isNull(9)) null else q.int(9);
+        u.unique_id = if (q.isNull(10)) null else try gpa.dupe(u8, q.text(10));
+        u.emoji = if (q.isNull(11)) null else try gpa.dupe(u8, q.text(11));
+        u.sticker_type = if (q.isNull(12)) null else try gpa.dupe(u8, q.text(12));
+        u.callback_id = if (q.isNull(13)) null else try gpa.dupe(u8, q.text(13));
+        u.callback_data = if (q.isNull(14)) null else try gpa.dupe(u8, q.text(14));
+        u.latitude = if (q.isNull(15)) null else q.float(15);
+        u.longitude = if (q.isNull(16)) null else q.float(16);
+        u.owner_text = if (q.isNull(17)) null else try gpa.dupe(u8, q.text(17));
+        try items.append(gpa, u);
+    }
+    return items.toOwnedSlice(gpa);
+}
 
-    var batch = try parseUpdates(testing.allocator, body);
-    defer batch.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 0), batch.items.len);
-    try testing.expectEqual(@as(i64, 2), batch.next_offset.?);
+fn freeUpdates(gpa: std.mem.Allocator, items: []Update) void {
+    for (items) |*u| u.deinit(gpa);
+    gpa.free(items);
+}
+
+fn validAlias(alias: []const u8) bool {
+    if (alias.len == 0 or alias.len > 32) return false;
+    for (alias) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
+    return true;
+}
+
+fn commandPrompt(text: []const u8) []const u8 {
+    const cmd = std.mem.sliceTo(text, ' ');
+    if (std.mem.eql(u8, cmd, "/status")) return "Report current task, routine, and delivery status briefly.";
+    if (std.mem.eql(u8, cmd, "/tasks")) return "List my tasks.";
+    if (std.mem.eql(u8, cmd, "/routines")) return "List my routines.";
+    if (std.mem.eql(u8, cmd, "/memory") or std.mem.eql(u8, cmd, "/diary")) return text;
+    if (std.mem.eql(u8, cmd, "/skills")) return "List available skills.";
+    if (std.mem.eql(u8, cmd, "/character")) return "Summarize your current character files.";
+    if (std.mem.eql(u8, cmd, "/learning")) return "Report the learning mode and pending proposals.";
+    if (std.mem.eql(u8, cmd, "/stop")) return "stop";
+    return text;
+}
+
+fn beginStickerLearning(db: *Db, alias: []const u8, now: i64) !void {
+    var q = try db.prepare(
+        \\INSERT INTO sticker_learning(id, alias, created, expires) VALUES (1, ?, ?, ?)
+        \\ON CONFLICT(id) DO UPDATE SET alias = excluded.alias, created = excluded.created, expires = excluded.expires
+    );
+    defer q.finalize();
+    try q.bind(1, alias);
+    try q.bind(2, now);
+    try q.bind(3, now + sticker_ttl);
+    _ = try q.step();
+}
+
+fn takeStickerLearning(db: *Db, gpa: std.mem.Allocator, u: Update, now: i64) !?[]u8 {
+    var q = try db.prepare("SELECT alias, expires FROM sticker_learning WHERE id = 1");
+    defer q.finalize();
+    if (!try q.step()) return null;
+    if (q.int(1) <= now) {
+        try db.exec("DELETE FROM sticker_learning;");
+        return null;
+    }
+    const alias = try gpa.dupe(u8, q.text(0));
+    errdefer gpa.free(alias);
+    var put = try db.prepare(
+        \\INSERT INTO sticker_aliases(alias, file_id, unique_id, emoji, updated) VALUES (?, ?, ?, ?, ?)
+        \\ON CONFLICT(alias) DO UPDATE SET file_id = excluded.file_id, unique_id = excluded.unique_id,
+        \\emoji = excluded.emoji, updated = excluded.updated
+    );
+    defer put.finalize();
+    try put.bind(1, alias);
+    try put.bind(2, u.file_id.?);
+    try put.bind(3, u.unique_id orelse "");
+    try put.bind(4, u.emoji);
+    try put.bind(5, now);
+    _ = try put.step();
+    try db.exec("DELETE FROM sticker_learning;");
+    return alias;
+}
+
+fn listStickers(db: *Db, gpa: std.mem.Allocator) ![]u8 {
+    var q = try db.prepare("SELECT alias, emoji FROM sticker_aliases ORDER BY alias");
+    defer q.finalize();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    while (try q.step()) try out.writer.print("{s}{s}{s}\n", .{ q.text(0), if (q.isNull(1)) "" else " ", q.text(1) });
+    if (out.written().len == 0) try out.writer.writeAll("No learned stickers.");
+    return out.toOwnedSlice();
+}
+
+fn cachedSticker(db: *Db, gpa: std.mem.Allocator, unique_id: []const u8) !?[]u8 {
+    if (unique_id.len == 0) return null;
+    var q = try db.prepare("SELECT description FROM sticker_cache WHERE unique_id = ?");
+    defer q.finalize();
+    try q.bind(1, unique_id);
+    if (!try q.step()) return null;
+    return try gpa.dupe(u8, q.text(0));
+}
+
+fn storeSticker(db: *Db, unique_id: []const u8, description: []const u8, now: i64) !void {
+    if (unique_id.len == 0) return;
+    var q = try db.prepare(
+        \\INSERT INTO sticker_cache(unique_id, description, updated) VALUES (?, ?, ?)
+        \\ON CONFLICT(unique_id) DO UPDATE SET description = excluded.description, updated = excluded.updated
+    );
+    defer q.finalize();
+    try q.bind(1, unique_id);
+    try q.bind(2, description);
+    try q.bind(3, now);
+    _ = try q.step();
+}
+
+fn safeName(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const base = baseName(raw);
+    const n = @min(base.len, 96);
+    const out = try gpa.alloc(u8, if (n == 0) 4 else n);
+    if (n == 0) {
+        @memcpy(out, "file");
+        return out;
+    }
+    for (base[0..n], 0..) |c, i| out[i] = if (std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_') c else '_';
+    return out;
 }
 
 pub fn admit(u: Update, owner_id: i64, chat_id: i64) bool {
@@ -276,6 +235,59 @@ pub fn saveOffset(db: *Db, n: i64) !void {
     _ = try q.step();
 }
 
+/// Records owner work before Telegram's offset acknowledges it. False is a replay.
+fn accept(db: *Db, u: Update, now: i64) !bool {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    var q = try db.prepare(
+        \\INSERT OR IGNORE INTO telegram_updates(
+        \\ id, status, text, created, updated, message_id, reply_id, reply_text, kind,
+        \\ file_id, file_name, mime, file_size, file_unique_id, emoji,
+        \\ sticker_type, callback_id, callback_data, latitude, longitude, owner_text)
+        \\VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    );
+    defer q.finalize();
+    try q.bind(1, u.update_id);
+    try q.bind(2, u.text);
+    try q.bind(3, now);
+    try q.bind(4, now);
+    try q.bind(5, u.message_id);
+    try q.bind(6, u.reply_id);
+    try q.bind(7, u.reply_text);
+    try q.bind(8, @tagName(u.kind));
+    try q.bind(9, u.photo orelse u.file_id);
+    try q.bind(10, u.file_name);
+    try q.bind(11, u.mime);
+    try q.bind(12, u.file_size);
+    try q.bind(13, u.unique_id);
+    try q.bind(14, u.emoji);
+    try q.bind(15, u.sticker_type);
+    try q.bind(16, u.callback_id);
+    try q.bind(17, u.callback_data);
+    try q.bind(18, u.latitude);
+    try q.bind(19, u.longitude);
+    try q.bind(20, u.owner_text);
+    _ = try q.step();
+    const fresh = cChanges(db) == 1;
+    try saveOffset(db, u.update_id + 1);
+    try db.exec("COMMIT;");
+    return fresh;
+}
+
+fn updateStatus(db: *Db, id: i64, status: []const u8, now: i64) !void {
+    var q = try db.prepare("UPDATE telegram_updates SET status = ?, updated = ? WHERE id = ?");
+    defer q.finalize();
+    try q.bind(1, status);
+    try q.bind(2, now);
+    try q.bind(3, id);
+    _ = try q.step();
+}
+
+fn cChanges(db: *Db) i64 {
+    const c = @import("c");
+    return c.sqlite3_changes(db.ptr);
+}
+
 const api_base = "https://api.telegram.org/bot";
 const poll_timeout: u32 = 25;
 
@@ -299,6 +311,8 @@ pub const Bot = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     http: agent.Http,
+    /// Separate transport for activity and stop polling during a model call.
+    live_http: ?agent.Http = null,
     db: *Db,
     agent: *agent.Agent,
     token: config.Secret,
@@ -308,6 +322,12 @@ pub const Bot = struct {
     fetch: ?web.Get = null,
     /// The one directory an outbound attachment may come from.
     workspace: []const u8 = "workspace",
+    inbox: []const u8 = "inbox",
+    reactions: bool = true,
+    progress_id: ?i64 = null,
+    delivery_failed: bool = false,
+    cancel: ?*const std.atomic.Value(bool) = null,
+    shutdown: ?*const fn () bool = null,
 
     pub fn getMe(self: *Bot) !void {
         const body = try self.call("getMe", "{}");
@@ -325,23 +345,261 @@ pub const Bot = struct {
         defer batch.deinit(self.gpa);
 
         for (batch.items) |u| {
-            // Persist first so a crash during turn cannot replay.
-            try saveOffset(self.db, u.update_id + 1);
-            if (!admit(u, self.owner_id, self.chat_id)) continue;
-            self.typing() catch |err| log.warn("{t}", .{err});
-            try self.answer(u);
+            if (u.kind == .callback) self.answerCallback(u.callback_id.?, if (admit(u, self.owner_id, self.chat_id)) "" else "Not allowed") catch |err|
+                log.warn("callback answer: {t}", .{err});
+            if (!admit(u, self.owner_id, self.chat_id)) {
+                try saveOffset(self.db, u.update_id + 1);
+                continue;
+            }
+            const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+            if (!try accept(self.db, u, now)) continue;
+            try updateStatus(self.db, u.update_id, "processing", now);
+            self.process(u) catch |err| {
+                if (err == error.TurnCancelled) {
+                    try updateStatus(self.db, u.update_id, "cancelled", now);
+                    try self.flush();
+                    self.finishProgress("Stopped.") catch |finish_err| log.warn("progress: {t}", .{finish_err});
+                    continue;
+                }
+                try updateStatus(self.db, u.update_id, "failed", now);
+                return err;
+            };
+            try updateStatus(self.db, u.update_id, "completed", now);
             try self.flush();
+            self.finishProgress(if (self.delivery_failed) "Delivery failed." else "Done.") catch |err| log.warn("progress: {t}", .{err});
+            if (self.reactions and u.message_id != 0 and u.kind != .callback and u.kind != .reaction)
+                self.react(u.message_id, if (self.delivery_failed) "👎" else "👍") catch |err| log.warn("reaction: {t}", .{err});
         }
         if (batch.next_offset) |n| try saveOffset(self.db, n);
     }
 
     pub fn run(self: *Bot, stop: *const fn () bool) !void {
+        self.shutdown = stop;
+        defer self.shutdown = null;
+        try outbox.recover(self.db);
+        try self.recoverUpdates();
+        self.recoverProgress() catch |err| log.warn("progress recovery: {t}", .{err});
+        self.setCommands() catch |err| log.warn("commands: {t}", .{err});
         while (!stop()) {
+            self.flush() catch |err| log.warn("outbox: {t}", .{err});
             self.pollOnce() catch |err| {
+                if (err == error.Cancelled and stop()) break;
                 log.err("{t}", .{err});
                 std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
             };
         }
+    }
+
+    fn process(self: *Bot, u: Update) !void {
+        if (u.kind == .callback) return self.handleCallback(u);
+        if (u.kind == .reaction) return;
+        if (try self.handleCommand(u)) return;
+        if (self.live_http == null) self.typing("typing") catch |err| log.warn("typing: {t}", .{err});
+        try self.answer(u);
+    }
+
+    fn recoverUpdates(self: *Bot) !void {
+        try self.db.exec("UPDATE telegram_updates SET status = 'uncertain', updated = unixepoch() WHERE status = 'processing';");
+        if (cChanges(self.db) > 0) try outbox.push(
+            self.db,
+            .text,
+            null,
+            "A Telegram turn was interrupted. I did not repeat it because its effects are uncertain.",
+            std.Io.Timestamp.now(self.io, .real).toSeconds(),
+        );
+
+        const pending = try loadPending(self.db, self.gpa, self.owner_id, self.chat_id);
+        defer freeUpdates(self.gpa, pending);
+        for (pending) |u| {
+            const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+            try updateStatus(self.db, u.update_id, "processing", now);
+            self.process(u) catch {
+                try updateStatus(self.db, u.update_id, "failed", now);
+                continue;
+            };
+            try updateStatus(self.db, u.update_id, "completed", now);
+        }
+        try self.flush();
+    }
+
+    fn handleCallback(self: *Bot, u: Update) !void {
+        const data = u.callback_data orelse return;
+        if (data.len < 3 or data[1] != ':') return;
+        const id = std.fmt.parseInt(i64, data[2..], 10) catch return;
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+        switch (data[0]) {
+            'a', 'd' => {
+                const reply = try self.agent.resolveApprovalId(id, if (data[0] == 'a') .approve else .deny);
+                defer self.gpa.free(reply);
+                try outbox.pushReply(self.db, .text, null, reply, u.message_id, now);
+            },
+            's' => {
+                const stopped = if (self.agent.pool) |pool| pool.cancel(id) else false;
+                if (stopped) tasks.setStatus(self.db, id, .cancelled) catch {};
+                try outbox.pushReply(self.db, .text, null, if (stopped) "Stopping that task." else "That task is no longer running.", u.message_id, now);
+            },
+            'x' => try outbox.pushReply(self.db, .text, null, "That turn is no longer running.", u.message_id, now),
+            'r' => {
+                const queued = try outbox.retryDelivery(self.db, id);
+                try outbox.pushReply(self.db, .text, null, if (queued) "Queued one retry." else "That delivery cannot be retried.", u.message_id, now);
+            },
+            else => {},
+        }
+    }
+
+    fn handleCommand(self: *Bot, u: Update) !bool {
+        const text = std.mem.trim(u8, u.text, &std.ascii.whitespace);
+        if (std.mem.eql(u8, text, "/help")) {
+            try self.queueReply(u.message_id, "Use /status, /tasks, /routines, /memory, /diary, /skills, /character, /learning, /stickers, /stop, or /new.");
+            return true;
+        }
+        if (std.mem.eql(u8, text, "/new")) {
+            try self.db.exec("DELETE FROM messages;");
+            try self.queueReply(u.message_id, "Started a new conversation.");
+            return true;
+        }
+        const learn = "/learn sticker ";
+        if (std.mem.startsWith(u8, text, learn)) {
+            const alias = std.mem.trim(u8, text[learn.len..], &std.ascii.whitespace);
+            if (!validAlias(alias)) {
+                try self.queueReply(u.message_id, "Use /learn sticker followed by one short alias.");
+                return true;
+            }
+            const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+            try beginStickerLearning(self.db, alias, now);
+            try self.queueReply(u.message_id, "Send the sticker within five minutes.");
+            return true;
+        }
+        if (std.mem.eql(u8, text, "/stickers")) {
+            const list = try listStickers(self.db, self.gpa);
+            defer self.gpa.free(list);
+            try self.queueReply(u.message_id, list);
+            return true;
+        }
+        const send_prefix = "/sticker ";
+        if (std.mem.startsWith(u8, text, send_prefix)) {
+            const alias = std.mem.trim(u8, text[send_prefix.len..], &std.ascii.whitespace);
+            if (!validAlias(alias)) try self.queueReply(u.message_id, "Unknown sticker alias.") else try outbox.pushReply(self.db, .sticker, alias, "", u.message_id, std.Io.Timestamp.now(self.io, .real).toSeconds());
+            return true;
+        }
+        return false;
+    }
+
+    fn queueReply(self: *Bot, reply_id: i64, text: []const u8) !void {
+        try outbox.pushReply(self.db, .text, null, text, reply_id, std.Io.Timestamp.now(self.io, .real).toSeconds());
+    }
+
+    fn context(self: *Bot, u: Update, picture: *?[]u8, mime: *[]const u8) ![]u8 {
+        if (u.kind == .location) return std.fmt.allocPrint(self.gpa, "{s}{s}[location: {d:.6}, {d:.6}]", .{
+            u.text,
+            if (u.text.len == 0) "" else "\n",
+            u.latitude.?,
+            u.longitude.?,
+        });
+        if (u.kind == .sticker) {
+            if (try takeStickerLearning(self.db, self.gpa, u, std.Io.Timestamp.now(self.io, .real).toSeconds())) |alias| {
+                defer self.gpa.free(alias);
+            }
+            if (std.mem.eql(u8, u.sticker_type orelse "", "static")) {
+                if (try cachedSticker(self.db, self.gpa, u.unique_id orelse "")) |cached| return cached;
+                if (self.download(u.file_id.?)) |bytes| {
+                    picture.* = bytes;
+                    mime.* = sniff(bytes);
+                } else |_| {}
+            }
+            return std.fmt.allocPrint(self.gpa, "[sticker: {s}, {s}]", .{ u.emoji orelse "no emoji", u.sticker_type orelse "unknown" });
+        }
+
+        const bytes = self.download(u.file_id.?) catch |err| return std.fmt.allocPrint(
+            self.gpa,
+            "{s}{s}[{s}: download failed ({s})]",
+            .{ u.text, if (u.text.len == 0) "" else "\n", @tagName(u.kind), @errorName(err) },
+        );
+        defer self.gpa.free(bytes);
+        const name = try safeName(self.gpa, u.file_name orelse @tagName(u.kind));
+        defer self.gpa.free(name);
+        var rel_buf: [workspace.max_path]u8 = undefined;
+        const rel = try std.fmt.bufPrint(&rel_buf, "{s}/{d}-{s}", .{ self.inbox, u.update_id, name });
+        try self.ensureInbox();
+        try workspace.write(self.io, self.workspace, rel, bytes);
+        const note = switch (u.kind) {
+            .voice => "Voice transcription is unavailable; the original file is saved.",
+            .audio, .video, .animation => "This media is saved, but its contents were not interpreted.",
+            else => "The file is saved.",
+        };
+        if (std.mem.startsWith(u8, u.mime orelse "", "text/") and bytes.len <= max_text and std.unicode.utf8ValidateSlice(bytes)) {
+            return std.fmt.allocPrint(self.gpa, "{s}{s}[{s} in inbox: {s}, {s}, {d} bytes]\n{s}", .{
+                u.text,                  if (u.text.len == 0) "" else "\n", @tagName(u.kind), rel,
+                u.mime orelse "unknown", bytes.len,                         bytes,
+            });
+        }
+        return std.fmt.allocPrint(self.gpa, "{s}{s}[{s} in inbox: {s}, {s}, {d} bytes] {s}", .{
+            u.text,                  if (u.text.len == 0) "" else "\n", @tagName(u.kind), rel,
+            u.mime orelse "unknown", bytes.len,                         note,
+        });
+    }
+
+    fn ensureInbox(self: *Bot) !void {
+        try workspace.makeDir(self.io, self.workspace, self.inbox);
+    }
+
+    fn sendStickerAlias(self: *Bot, alias: []const u8, reply_id: ?i64) !void {
+        var q = try self.db.prepare("SELECT file_id FROM sticker_aliases WHERE alias = ?");
+        defer q.finalize();
+        try q.bind(1, alias);
+        if (!try q.step()) return error.UnknownSticker;
+        const req = try buildFileId(self.gpa, self.chat_id, "sticker", q.text(0), reply_id);
+        defer self.gpa.free(req);
+        const body = try self.call("sendSticker", req);
+        defer self.gpa.free(body);
+        try ensureOk(self.gpa, body);
+    }
+
+    fn answerCallback(self: *Bot, id: []const u8, text: []const u8) !void {
+        const req = try jsonBody(self.gpa, .{ .callback_query_id = id, .text = text });
+        defer self.gpa.free(req);
+        const body = try self.call("answerCallbackQuery", req);
+        defer self.gpa.free(body);
+        try ensureOk(self.gpa, body);
+    }
+
+    fn react(self: *Bot, message_id: i64, emoji: []const u8) !void {
+        const req = try buildReaction(self.gpa, self.chat_id, message_id, emoji);
+        defer self.gpa.free(req);
+        const body = try self.call("setMessageReaction", req);
+        defer self.gpa.free(body);
+        try ensureOk(self.gpa, body);
+    }
+
+    fn setCommands(self: *Bot) !void {
+        const body = try self.call("setMyCommands", commands_json);
+        defer self.gpa.free(body);
+        try ensureOk(self.gpa, body);
+    }
+
+    fn startProgress(self: *Bot, reply_id: i64, turn_id: i64) !i64 {
+        const req = try buildProgress(self.gpa, self.chat_id, reply_id, "Working…", turn_id);
+        defer self.gpa.free(req);
+        const body = try self.callWith(self.live_http.?, "sendMessage", req);
+        defer self.gpa.free(body);
+        return messageId(self.gpa, body) orelse error.InvalidTelegramResponse;
+    }
+
+    fn finishProgress(self: *Bot, text: []const u8) !void {
+        const id = self.progress_id orelse return;
+        const http = self.live_http orelse return;
+        const req = try buildEditProgress(self.gpa, self.chat_id, id, text);
+        defer self.gpa.free(req);
+        const body = try self.callWith(http, "editMessageText", req);
+        defer self.gpa.free(body);
+        try ensureOk(self.gpa, body);
+        try clearProgress(self.db);
+        self.progress_id = null;
+    }
+
+    fn recoverProgress(self: *Bot) !void {
+        self.progress_id = try loadProgress(self.db);
+        try self.finishProgress("Interrupted.");
     }
 
     /// Failed image downloads still produce a text turn.
@@ -357,25 +615,117 @@ pub const Bot = struct {
             } else |err| log.warn("photo {s}: {t}", .{ file_id, err });
         }
 
-        const reply = try self.agent.turnWith(.{
-            .text = if (u.text.len != 0) u.text else "(a picture, no caption)",
+        var prompt: ?[]u8 = null;
+        defer if (prompt) |s| self.gpa.free(s);
+        if (u.kind != .photo and u.kind != .text) prompt = try self.context(u, &picture, &mime);
+        const input = commandPrompt(u.text);
+        if (u.reply_text) |quoted| {
+            const combined = try std.fmt.allocPrint(self.gpa, "[replying to: {s}]\n{s}", .{ quoted, prompt orelse input });
+            if (prompt) |old| self.gpa.free(old);
+            prompt = combined;
+        }
+
+        var cancel: agent.Workers = .{};
+        self.cancel = &cancel.stop;
+        defer self.cancel = null;
+        var done: std.atomic.Value(bool) = .init(false);
+        var stop_update: std.atomic.Value(i64) = .init(0);
+        var activity_thread: ?std.Thread = null;
+        if (self.live_http != null) {
+            self.progress_id = self.startProgress(u.message_id, u.update_id) catch null;
+            if (self.progress_id) |id| try saveProgress(self.db, id);
+            activity_thread = try std.Thread.spawn(.{}, activity, .{ self, &cancel, &done, &stop_update, u.update_id + 1 });
+        }
+
+        const result = self.agent.turnWithCancel(.{
+            .text = prompt orelse if (input.len != 0) input else "(a picture, no caption)",
+            .owner_text = u.owner_text,
             .image = if (picture) |p| .{ .mime = mime, .data = p } else null,
-        });
+        }, &cancel);
+        done.store(true, .release);
+        if (activity_thread) |thread| thread.join();
+        if (stop_update.load(.acquire) != 0) try recordStop(self.db, stop_update.load(.acquire), std.Io.Timestamp.now(self.io, .real).toSeconds());
+        const reply = result catch |err| {
+            if (err != error.Cancelled) return err;
+            try self.queueReply(u.message_id, "Stopped.");
+            return error.TurnCancelled;
+        };
         defer self.gpa.free(reply);
-        try self.send(reply);
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+        if (u.kind == .sticker and std.mem.eql(u8, u.sticker_type orelse "", "static") and picture != null)
+            try storeSticker(self.db, u.unique_id orelse "", reply, now);
+        const approval_id = self.agent.last_approval;
+        var id_buf: [32]u8 = undefined;
+        if (approval_id) |pending_id| {
+            const id = try std.fmt.bufPrint(&id_buf, "{d}", .{pending_id});
+            try outbox.pushReply(self.db, .approval, id, reply, u.message_id, now);
+        } else {
+            try outbox.pushReply(self.db, .text, null, reply, u.message_id, now);
+        }
     }
 
     /// Sends queued owner output.
     fn flush(self: *Bot) !void {
-        const items = try outbox.drain(self.db, self.gpa);
-        defer outbox.free(self.gpa, items);
-        for (items) |item| {
-            const err = switch (item.kind) {
-                .text => self.send(item.text),
-                .photo, .document => self.sendFile(item.kind, item.path.?, item.text),
-            };
-            err catch |e| log.err("outbox {s}: {t}", .{ @tagName(item.kind), e });
+        self.delivery_failed = false;
+        var drained: usize = 0;
+        while (drained < outbox.max_drain) {
+            const n = try self.flushBatch();
+            if (n == 0) return;
+            drained += n;
         }
+    }
+
+    fn flushBatch(self: *Bot) !usize {
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+        const items = try outbox.claim(self.db, self.gpa, now);
+        defer outbox.free(self.gpa, items);
+        if (items.len >= 2) {
+            if (self.sendAlbum(items)) |_| {
+                for (items) |item| try outbox.delivered(self.db, item.id);
+            } else |err| for (items) |item| try self.failDelivery(item.id, err);
+            return items.len;
+        }
+        if (items.len == 0) return 0;
+        const item = items[0];
+        const result = switch (item.kind) {
+            .text => self.send(item.text, item.reply_id, null),
+            .approval => self.send(item.text, item.reply_id, std.fmt.parseInt(i64, item.path.?, 10) catch return error.BadCallback),
+            .sticker => self.sendStickerAlias(item.path.?, item.reply_id),
+            .photo, .document, .audio, .voice, .video, .animation => self.sendFile(item.kind, item.path.?, item.text, item.reply_id),
+        };
+        if (result) |_| try outbox.delivered(self.db, item.id) else |err| try self.failDelivery(item.id, err);
+        return items.len;
+    }
+
+    fn failDelivery(self: *Bot, id: i64, err: anyerror) !void {
+        self.delivery_failed = true;
+        if (retryableDelivery(err)) {
+            try outbox.retry(self.db, id, @errorName(err));
+        } else if (err == error.TelegramRejected or err == error.TelegramApiError or err == error.InvalidTelegramResponse or
+            err == error.FileNotFound or err == error.BadPath or err == error.FileTooLarge)
+        {
+            try outbox.failed(self.db, id, @errorName(err));
+        } else {
+            try outbox.uncertain(self.db, id, @errorName(err));
+        }
+        log.warn("outbox: {t}", .{err});
+    }
+
+    fn sendAlbum(self: *Bot, items: []const outbox.Item) !void {
+        if (items.len < 2 or items.len > 10) return error.BadAlbum;
+        var files: [10][]u8 = undefined;
+        var n: usize = 0;
+        defer for (files[0..n]) |bytes| self.gpa.free(bytes);
+        for (items) |item| {
+            files[n] = try workspace.readBytes(self.gpa, self.io, self.workspace, item.path.?, max_file);
+            n += 1;
+        }
+        const body = try albumBody(self.gpa, self.chat_id, items, files[0..n]);
+        defer self.gpa.free(body);
+        self.sendActivity(actionFor(items[0].kind)) catch |err| log.warn("upload action: {t}", .{err});
+        const reply = try self.post("sendMediaGroup", body, "multipart/form-data; boundary=" ++ boundary);
+        defer self.gpa.free(reply);
+        try ensureOk(self.gpa, reply);
     }
 
     /// Downloads a Telegram file within the shared cap.
@@ -400,7 +750,7 @@ pub const Bot = struct {
 
         const url = try std.fmt.allocPrint(self.gpa, "{s}{s}/{s}", .{ file_base, self.token.reveal(), path });
         defer self.gpa.free(url);
-        var hop = try get.request(self.gpa, url, null);
+        var hop = try get.request(self.gpa, url, null, null);
         errdefer hop.deinit(self.gpa);
         if (hop.status != 200) return error.TelegramHttp;
         if (hop.body.len > max_file) return error.FileTooLarge;
@@ -410,42 +760,61 @@ pub const Bot = struct {
         return bytes;
     }
 
-    fn sendFile(self: *Bot, kind: outbox.Kind, rel: []const u8, caption: []const u8) !void {
-        if (!outbox.safeRelative(rel)) return error.BadPath;
-        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ self.workspace, rel });
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(max_file));
+    fn sendFile(self: *Bot, kind: outbox.Kind, rel: []const u8, caption: []const u8, reply_id: ?i64) !void {
+        const bytes = try workspace.readBytes(self.gpa, self.io, self.workspace, rel, max_file);
         defer self.gpa.free(bytes);
 
-        const part = if (kind == .photo) "photo" else "document";
-        const body = try multipart(self.gpa, self.chat_id, part, baseName(rel), caption, bytes);
+        const part = @tagName(kind);
+        const body = try multipart(self.gpa, self.chat_id, part, baseName(rel), caption, reply_id, bytes);
         defer self.gpa.free(body);
 
-        const method = if (kind == .photo) "sendPhoto" else "sendDocument";
+        const method = switch (kind) {
+            .photo => "sendPhoto",
+            .document => "sendDocument",
+            .audio => "sendAudio",
+            .voice => "sendVoice",
+            .video => "sendVideo",
+            .animation => "sendAnimation",
+            else => return error.BadMediaKind,
+        };
+        self.sendActivity(actionFor(kind)) catch |err| log.warn("upload action: {t}", .{err});
         const reply = try self.post(method, body, "multipart/form-data; boundary=" ++ boundary);
         defer self.gpa.free(reply);
         try ensureOk(self.gpa, reply);
     }
 
-    fn typing(self: *Bot) !void {
-        const req = try buildChatAction(self.gpa, self.chat_id);
+    fn typing(self: *Bot, action: []const u8) !void {
+        const req = try buildChatAction(self.gpa, self.chat_id, action);
         defer self.gpa.free(req);
         const body = try self.call("sendChatAction", req);
         defer self.gpa.free(body);
         try ensureOk(self.gpa, body);
     }
 
-    fn send(self: *Bot, text: []const u8) !void {
-        var remaining = text;
+    fn sendActivity(self: *Bot, action: []const u8) !void {
+        const http = self.live_http orelse return;
+        const req = try buildChatAction(self.gpa, self.chat_id, action);
+        defer self.gpa.free(req);
+        const body = try self.callWith(http, "sendChatAction", req);
+        defer self.gpa.free(body);
+        try ensureOk(self.gpa, body);
+    }
+
+    fn send(self: *Bot, text: []const u8, reply_id: ?i64, approval_id: ?i64) !void {
+        const escaped = try escapeHtml(self.gpa, text);
+        defer self.gpa.free(escaped);
+        var remaining = escaped;
+        var first = true;
         while (remaining.len > 0) {
-            const end = utf8ChunkEnd(remaining, max_message);
+            const end = chunkEnd(remaining, max_message);
             if (end == 0) return error.InvalidTelegramText;
-            const req = try buildSendMessage(self.gpa, self.chat_id, remaining[0..end]);
+            const req = try buildSendMessage(self.gpa, self.chat_id, remaining[0..end], if (first) reply_id else null, if (first) approval_id else null);
             defer self.gpa.free(req);
-            const body = try self.call("sendMessage", req);
+            const body = self.call("sendMessage", req) catch |err| return if (first) err else error.PartialDelivery;
             defer self.gpa.free(body);
-            try ensureOk(self.gpa, body);
+            ensureOk(self.gpa, body) catch |err| return if (first) err else error.PartialDelivery;
             remaining = remaining[end..];
+            first = false;
         }
     }
 
@@ -453,32 +822,243 @@ pub const Bot = struct {
         return self.post(method, body, "application/json");
     }
 
+    fn callWith(self: *Bot, http: agent.Http, method: []const u8, body: []const u8) ![]u8 {
+        return self.postWith(http, method, body, "application/json");
+    }
+
     fn post(self: *Bot, method: []const u8, body: []const u8, content_type: []const u8) ![]u8 {
+        return self.postWith(self.http, method, body, content_type);
+    }
+
+    fn postWith(self: *Bot, transport: agent.Http, method: []const u8, body: []const u8, content_type: []const u8) ![]u8 {
         const url = try endpoint(self.gpa, self.token.reveal(), method);
         defer self.gpa.free(url);
         var tries: u8 = 0;
         while (true) {
-            var res = try self.http.post(self.gpa, .{
+            var res = try timedPost(self.io, transport, self.gpa, .{
                 .url = url,
                 .auth = "",
                 .body = body,
                 .content_type = content_type,
-            });
+            }, self.cancel, self.shutdown);
             if (res.status == 429) {
                 // ponytail: cap flood waits at 60 seconds.
                 const wait = @min(retryAfter(self.gpa, res.body) orelse 1, 60);
                 res.deinit(self.gpa);
                 tries += 1;
                 if (tries > 3) return error.TelegramHttp;
-                std.Io.sleep(self.io, .fromSeconds(wait), .awake) catch return error.TelegramHttp;
+                try waitRetry(self.io, wait, self.cancel, self.shutdown);
                 continue;
             }
             errdefer res.deinit(self.gpa);
-            if (res.status != 200) return error.TelegramHttp;
+            if (res.status != 200) return error.TelegramRejected;
             return res.body;
         }
     }
 };
+
+fn activity(
+    self: *Bot,
+    cancel: *agent.Workers,
+    done: *const std.atomic.Value(bool),
+    stop_update: *std.atomic.Value(i64),
+    offset: i64,
+) void {
+    const http = self.live_http orelse return;
+    while (!done.load(.acquire) and !cancel.cancelled()) {
+        if (self.shutdown) |stop| if (stop()) {
+            cancel.stop.store(true, .release);
+            return;
+        };
+        const action = buildChatAction(self.gpa, self.chat_id, "typing") catch {
+            std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
+            continue;
+        };
+        const action_reply = self.callWith(http, "sendChatAction", action) catch {
+            self.gpa.free(action);
+            std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
+            continue;
+        };
+        self.gpa.free(action);
+        self.gpa.free(action_reply);
+
+        const req = buildCancelUpdates(self.gpa, offset) catch {
+            std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
+            continue;
+        };
+        const body = self.callWith(http, "getUpdates", req) catch {
+            self.gpa.free(req);
+            std.Io.sleep(self.io, .fromSeconds(1), .awake) catch {};
+            continue;
+        };
+        self.gpa.free(req);
+        defer self.gpa.free(body);
+        var batch = parseUpdates(self.gpa, body) catch return;
+        defer batch.deinit(self.gpa);
+        for (batch.items) |u| {
+            if (u.kind != .callback) continue;
+            const allowed = admit(u, self.owner_id, self.chat_id);
+            var stop_buf: [32]u8 = undefined;
+            const expected = std.fmt.bufPrint(&stop_buf, "x:{d}", .{offset - 1}) catch return;
+            const stop = allowed and std.mem.eql(u8, u.callback_data orelse "", expected);
+            if (allowed and !stop) continue;
+            const ack = jsonBody(self.gpa, .{
+                .callback_query_id = u.callback_id.?,
+                .text = if (stop) "Stopping" else "Not allowed",
+            }) catch continue;
+            const ack_reply = self.callWith(http, "answerCallbackQuery", ack) catch {
+                self.gpa.free(ack);
+                continue;
+            };
+            self.gpa.free(ack);
+            self.gpa.free(ack_reply);
+            if (stop) {
+                stop_update.store(u.update_id, .release);
+                cancel.stop.store(true, .release);
+                return;
+            }
+        }
+    }
+}
+
+fn retryableDelivery(err: anyerror) bool {
+    const name = @errorName(err);
+    const retryable = [_][]const u8{
+        "TelegramHttp",    "ConnectionRefused", "NetworkUnreachable",
+        "HostUnreachable", "UnknownHostName",   "TemporaryNameServerFailure",
+    };
+    for (retryable) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    return false;
+}
+
+fn actionFor(kind: outbox.Kind) []const u8 {
+    return switch (kind) {
+        .photo => "upload_photo",
+        .video, .animation => "upload_video",
+        .audio, .voice => "upload_voice",
+        else => "upload_document",
+    };
+}
+
+fn waitRetry(io: std.Io, seconds: u64, cancel: ?*const std.atomic.Value(bool), shutdown: ?*const fn () bool) !void {
+    var ticks: u64 = 0;
+    while (ticks < seconds * 10) : (ticks += 1) {
+        if (cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+        if (shutdown) |stop| if (stop()) return error.Cancelled;
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch return error.TelegramHttp;
+    }
+}
+
+fn timedPost(
+    io: std.Io,
+    transport: agent.Http,
+    gpa: std.mem.Allocator,
+    req: agent.Http.Request,
+    cancel: ?*const std.atomic.Value(bool),
+    shutdown: ?*const fn () bool,
+) !agent.Http.Response {
+    const Race = union(enum) {
+        request: anyerror!agent.Http.Response,
+        timeout: std.Io.Cancelable!void,
+        cancel: std.Io.Cancelable!void,
+    };
+    const Run = struct {
+        fn request(http: agent.Http, alloc: std.mem.Allocator, arg: agent.Http.Request) anyerror!agent.Http.Response {
+            return http.post(alloc, arg);
+        }
+
+        fn timeout(io_arg: std.Io) std.Io.Cancelable!void {
+            return (std.Io.Clock.Duration{ .raw = .fromMilliseconds(request_timeout_ms), .clock = .awake }).sleep(io_arg);
+        }
+
+        fn cancelled(io_arg: std.Io, flag: ?*const std.atomic.Value(bool), stop: ?*const fn () bool) std.Io.Cancelable!void {
+            while (true) {
+                if (flag) |value| if (value.load(.acquire)) return;
+                if (stop) |requested| if (requested()) return;
+                try (std.Io.Clock.Duration{ .raw = .fromMilliseconds(25), .clock = .awake }).sleep(io_arg);
+            }
+        }
+
+        fn clean(race: *std.Io.Select(Race), alloc: std.mem.Allocator) void {
+            while (race.cancel()) |late| switch (late) {
+                .request => |result| if (result) |response| {
+                    var owned = response;
+                    owned.deinit(alloc);
+                } else |_| {},
+                .timeout, .cancel => |result| result catch {},
+            };
+        }
+    };
+
+    var ready: [3]Race = undefined;
+    var race = std.Io.Select(Race).init(io, &ready);
+    try race.concurrent(.request, Run.request, .{ transport, gpa, req });
+    {
+        errdefer Run.clean(&race, gpa);
+        try race.concurrent(.timeout, Run.timeout, .{io});
+        if (cancel != null or shutdown != null)
+            try race.concurrent(.cancel, Run.cancelled, .{ io, cancel, shutdown });
+    }
+
+    const first = try race.await();
+    defer Run.clean(&race, gpa);
+    return switch (first) {
+        .request => |result| result,
+        .timeout => |result| blk: {
+            try result;
+            break :blk error.TelegramTimeout;
+        },
+        .cancel => |result| blk: {
+            try result;
+            break :blk error.Cancelled;
+        },
+    };
+}
+
+fn recordStop(db: *Db, id: i64, now: i64) !void {
+    var q = try db.prepare(
+        \\INSERT OR IGNORE INTO telegram_updates(id, status, text, created, updated, kind, callback_data)
+        \\VALUES (?, 'completed', '', ?, ?, 'callback', 'stop')
+    );
+    defer q.finalize();
+    try q.bind(1, id);
+    try q.bind(2, now);
+    try q.bind(3, now);
+    _ = try q.step();
+}
+
+fn saveProgress(db: *Db, id: i64) !void {
+    var q = try db.prepare(
+        \\INSERT INTO kv(key, value) VALUES ('tg_progress', ?)
+        \\ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    );
+    defer q.finalize();
+    var buf: [32]u8 = undefined;
+    try q.bind(1, try std.fmt.bufPrint(&buf, "{d}", .{id}));
+    _ = try q.step();
+}
+
+fn loadProgress(db: *Db) !?i64 {
+    var q = try db.prepare("SELECT value FROM kv WHERE key = 'tg_progress'");
+    defer q.finalize();
+    if (!try q.step()) return null;
+    return std.fmt.parseInt(i64, q.text(0), 10) catch error.InvalidProgress;
+}
+
+fn clearProgress(db: *Db) !void {
+    try db.exec("DELETE FROM kv WHERE key = 'tg_progress';");
+}
+
+fn messageId(gpa: std.mem.Allocator, body: []const u8) ?i64 {
+    const Reply = struct {
+        ok: bool = false,
+        result: struct { message_id: ?i64 = null } = .{},
+    };
+    const parsed = std.json.parseFromSlice(Reply, gpa, body, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    if (!parsed.value.ok) return null;
+    return parsed.value.result.message_id;
+}
 
 fn endpoint(gpa: std.mem.Allocator, token: []const u8, method: []const u8) ![]u8 {
     if (!validToken(token) or !validMethod(method)) return error.InvalidTelegramToken;
@@ -547,7 +1127,14 @@ const ChatActionRequest = struct {
 const SendMessageRequest = struct {
     chat_id: i64,
     text: []const u8,
+    parse_mode: []const u8 = "HTML",
+    reply_parameters: ?ReplyParameters = null,
+    reply_markup: ?Markup = null,
 };
+
+const ReplyParameters = struct { message_id: i64 };
+const Button = struct { text: []const u8, callback_data: []const u8 };
+const Markup = struct { inline_keyboard: []const []const Button };
 
 fn jsonBody(gpa: std.mem.Allocator, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -556,15 +1143,126 @@ fn jsonBody(gpa: std.mem.Allocator, value: anytype) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn buildChatAction(gpa: std.mem.Allocator, chat_id: i64) ![]u8 {
-    return jsonBody(gpa, ChatActionRequest{ .chat_id = chat_id, .action = "typing" });
+fn buildChatAction(gpa: std.mem.Allocator, chat_id: i64, action: []const u8) ![]u8 {
+    return jsonBody(gpa, ChatActionRequest{ .chat_id = chat_id, .action = action });
 }
 
-fn buildSendMessage(gpa: std.mem.Allocator, chat_id: i64, text: []const u8) ![]u8 {
-    return jsonBody(gpa, SendMessageRequest{ .chat_id = chat_id, .text = text });
+fn buildSendMessage(gpa: std.mem.Allocator, chat_id: i64, text: []const u8, reply_id: ?i64, approval_id: ?i64) ![]u8 {
+    var approve_buf: [32]u8 = undefined;
+    var deny_buf: [32]u8 = undefined;
+    const buttons = [_]Button{
+        .{ .text = "Approve", .callback_data = if (approval_id) |id| try std.fmt.bufPrint(&approve_buf, "a:{d}", .{id}) else "" },
+        .{ .text = "Deny", .callback_data = if (approval_id) |id| try std.fmt.bufPrint(&deny_buf, "d:{d}", .{id}) else "" },
+    };
+    const rows = [_][]const Button{&buttons};
+    return jsonBody(gpa, SendMessageRequest{
+        .chat_id = chat_id,
+        .text = text,
+        .reply_parameters = if (reply_id) |id| .{ .message_id = id } else null,
+        .reply_markup = if (approval_id != null) .{ .inline_keyboard = &rows } else null,
+    });
+}
+
+fn buildProgress(gpa: std.mem.Allocator, chat_id: i64, reply_id: i64, text: []const u8, turn_id: i64) ![]u8 {
+    var stop_buf: [32]u8 = undefined;
+    const button = [_]Button{.{ .text = "Stop", .callback_data = try std.fmt.bufPrint(&stop_buf, "x:{d}", .{turn_id}) }};
+    const rows = [_][]const Button{&button};
+    return jsonBody(gpa, SendMessageRequest{
+        .chat_id = chat_id,
+        .text = text,
+        .reply_parameters = .{ .message_id = reply_id },
+        .reply_markup = .{ .inline_keyboard = &rows },
+    });
+}
+
+fn buildEditProgress(gpa: std.mem.Allocator, chat_id: i64, message_id: i64, text: []const u8) ![]u8 {
+    return jsonBody(gpa, .{
+        .chat_id = chat_id,
+        .message_id = message_id,
+        .text = text,
+        .parse_mode = "HTML",
+        .reply_markup = Markup{ .inline_keyboard = &.{} },
+    });
+}
+
+fn buildFileId(gpa: std.mem.Allocator, chat_id: i64, field_name: []const u8, file_id: []const u8, reply_id: ?i64) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    try out.writer.print("{{\"chat_id\":{d},\"{s}\":", .{ chat_id, field_name });
+    try std.json.Stringify.encodeJsonString(file_id, .{}, &out.writer);
+    if (reply_id) |id| try out.writer.print(",\"reply_parameters\":{{\"message_id\":{d}}}", .{id});
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn buildReaction(gpa: std.mem.Allocator, chat_id: i64, message_id: i64, emoji: []const u8) ![]u8 {
+    const Reaction = struct { type: []const u8 = "emoji", emoji: []const u8 };
+    const reactions = [_]Reaction{.{ .emoji = emoji }};
+    return jsonBody(gpa, .{ .chat_id = chat_id, .message_id = message_id, .reaction = &reactions });
+}
+
+const commands_json =
+    \\{"commands":[{"command":"help","description":"Show help"},{"command":"status","description":"Show status"},{"command":"tasks","description":"List tasks"},{"command":"routines","description":"List routines"},{"command":"memory","description":"Search memory"},{"command":"diary","description":"Show diary"},{"command":"skills","description":"List skills"},{"command":"character","description":"Show character"},{"command":"learning","description":"Show learning"},{"command":"stickers","description":"List stickers"},{"command":"stop","description":"Stop work"},{"command":"new","description":"New conversation"}]}
+;
+
+fn escapeHtml(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    for (text) |c| switch (c) {
+        '&' => try out.writer.writeAll("&amp;"),
+        '<' => try out.writer.writeAll("&lt;"),
+        '>' => try out.writer.writeAll("&gt;"),
+        else => try out.writer.writeByte(c),
+    };
+    return out.toOwnedSlice();
+}
+
+fn chunkEnd(text: []const u8, max_bytes: usize) usize {
+    var end = utf8ChunkEnd(text, max_bytes);
+    if (end == text.len) return end;
+    if (std.mem.lastIndexOf(u8, text[0..end], "\n\n")) |cut| {
+        if (cut > max_bytes / 2) end = cut + 2;
+    }
+    if (std.mem.lastIndexOfScalar(u8, text[0..end], '\n')) |cut| {
+        if (cut > max_bytes / 2) end = cut + 1;
+    }
+    const amp = std.mem.lastIndexOfScalar(u8, text[0..end], '&');
+    const semi = std.mem.lastIndexOfScalar(u8, text[0..end], ';');
+    if (amp != null and (semi == null or amp.? > semi.?)) end = amp.?;
+    return end;
 }
 
 const boundary = "zoroFormBoundary7Nn2Kq";
+
+fn albumBody(gpa: std.mem.Allocator, chat_id: i64, items: []const outbox.Item, files: []const []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.print("--{s}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{ boundary, chat_id });
+    if (items[0].reply_id) |id| try w.print("--{s}\r\nContent-Disposition: form-data; name=\"reply_parameters\"\r\nContent-Type: application/json\r\n\r\n{{\"message_id\":{d}}}\r\n", .{ boundary, id });
+    try w.print("--{s}\r\nContent-Disposition: form-data; name=\"media\"\r\nContent-Type: application/json\r\n\r\n[", .{boundary});
+    for (items, 0..) |item, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.print("{{\"type\":\"{s}\",\"media\":\"attach://f{d}\"", .{ @tagName(item.kind), i });
+        if (i == 0 and item.text.len != 0) {
+            try w.writeAll(",\"caption\":");
+            try std.json.Stringify.encodeJsonString(item.text[0..@min(item.text.len, 1024)], .{}, w);
+        }
+        try w.writeByte('}');
+    }
+    try w.writeAll("]\r\n");
+    for (items, files, 0..) |item, bytes, i| {
+        try w.print(
+            "--{s}\r\nContent-Disposition: form-data; name=\"f{d}\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+            .{ boundary, i, baseName(item.path.?) },
+        );
+        try w.writeAll(bytes);
+        try w.writeAll("\r\n");
+    }
+    try w.print("--{s}--\r\n", .{boundary});
+    return out.toOwnedSlice();
+}
+
 /// Removes control bytes that could forge multipart boundaries.
 fn field(w: *std.Io.Writer, text: []const u8) !void {
     for (text) |c| {
@@ -579,6 +1277,7 @@ fn multipart(
     part: []const u8,
     name: []const u8,
     caption: []const u8,
+    reply_id: ?i64,
     bytes: []const u8,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -586,6 +1285,7 @@ fn multipart(
     const w = &out.writer;
 
     try w.print("--{s}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{ boundary, chat_id });
+    if (reply_id) |id| try w.print("--{s}\r\nContent-Disposition: form-data; name=\"reply_parameters\"\r\nContent-Type: application/json\r\n\r\n{{\"message_id\":{d}}}\r\n", .{ boundary, id });
     if (caption.len != 0) {
         try w.print("--{s}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n", .{boundary});
         try field(w, caption[0..@min(caption.len, 1024)]);
@@ -614,10 +1314,19 @@ fn sniff(bytes: []const u8) []const u8 {
 }
 
 fn buildGetUpdates(gpa: std.mem.Allocator, offset: ?i64) ![]u8 {
-    const allowed = [_][]const u8{"message"};
+    const allowed = [_][]const u8{ "message", "edited_message", "callback_query", "message_reaction" };
     return jsonBody(gpa, GetUpdatesRequest{
         .offset = offset,
         .timeout = poll_timeout,
+        .allowed_updates = &allowed,
+    });
+}
+
+fn buildCancelUpdates(gpa: std.mem.Allocator, offset: i64) ![]u8 {
+    const allowed = [_][]const u8{"callback_query"};
+    return jsonBody(gpa, GetUpdatesRequest{
+        .offset = offset,
+        .timeout = 1,
         .allowed_updates = &allowed,
     });
 }
@@ -688,6 +1397,7 @@ const Harness = struct {
             .token = .init("123:abc"),
             .owner_id = 42,
             .chat_id = 42,
+            .reactions = false,
         };
     }
 
@@ -720,12 +1430,35 @@ test "getMe accepts a fixture with ok true" {
     try h.bot.getMe();
 }
 
+test "Telegram requests have a deadline" {
+    const Slow = struct {
+        io: std.Io,
+
+        fn http(self: *@This()) agent.Http {
+            return .{ .ptr = self, .post_fn = post };
+        }
+
+        fn post(ptr: *anyopaque, gpa: std.mem.Allocator, _: agent.Http.Request) anyerror!agent.Http.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try (std.Io.Clock.Duration{ .raw = .fromSeconds(5), .clock = .awake }).sleep(self.io);
+            return .{ .status = 200, .body = try gpa.dupe(u8, ok_json) };
+        }
+    };
+
+    var h: Harness = undefined;
+    try h.init(&.{}, &.{});
+    defer h.deinit();
+    var slow: Slow = .{ .io = h.threaded.io() };
+    h.bot.http = slow.http();
+    try testing.expectError(error.TelegramTimeout, h.bot.getMe());
+}
+
 test "getMe rejects HTTP non-200" {
     var h: Harness = undefined;
     try h.init(&.{"unauthorized"}, &.{});
     defer h.deinit();
     h.tg.status = 401;
-    try testing.expectError(error.TelegramHttp, h.bot.getMe());
+    try testing.expectError(error.TelegramRejected, h.bot.getMe());
 }
 
 test "pollOnce sends the reply via sendMessage" {
@@ -785,7 +1518,7 @@ test "a 429 is retried after retry-after rather than failing immediately" {
     try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"text\":\"hi\"") != null);
 }
 
-test "send failure is returned rather than swallowed" {
+test "a rejected send remains inspectable without repeating the turn" {
     var h: Harness = undefined;
     try h.init(
         &.{
@@ -796,7 +1529,9 @@ test "send failure is returned rather than swallowed" {
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     );
     defer h.deinit();
-    try testing.expectError(error.TelegramApiError, h.bot.pollOnce());
+    try h.bot.pollOnce();
+    try testing.expectEqual(@as(i64, 1), try scalar(&h.db, "SELECT count(*) FROM outbox WHERE status = 'failed'"));
+    try testing.expectEqual(@as(i64, 1), try scalar(&h.db, "SELECT count(*) FROM telegram_updates WHERE status = 'completed'"));
 }
 
 test "pollOnce splits a long reply into UTF-8-safe chunks" {
@@ -955,7 +1690,7 @@ const FakeGet = struct {
         return self.seen[0..self.seen_len];
     }
 
-    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, target: []const u8, _: ?[]const u8) anyerror!web.Hop {
+    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, target: []const u8, _: ?[]const u8, _: ?std.Io.net.IpAddress) anyerror!web.Hop {
         const self: *FakeGet = @ptrCast(@alignCast(ptr));
         self.seen_len = @min(target.len, self.seen.len);
         @memcpy(self.seen[0..self.seen_len], target[0..self.seen_len]);
@@ -1024,6 +1759,39 @@ test "a non-image attachment becomes metadata, never a failed turn" {
     try testing.expect(std.mem.startsWith(u8, u.text, "the lease\n[attachment: lease.pdf, application/pdf, 24576 bytes"));
 }
 
+test "reply text and identifier survive parsing" {
+    const body =
+        \\{"ok":true,"result":[{"update_id":2,"message":{"message_id":8,"from":{"id":42},"chat":{"id":42,"type":"private"},"reply_to_message":{"message_id":7,"text":"original"},"text":"follow up"}}]}
+    ;
+    var batch = try parseUpdates(testing.allocator, body);
+    defer batch.deinit(testing.allocator);
+    try testing.expectEqual(@as(?i64, 7), batch.items[0].reply_id);
+    try testing.expectEqualStrings("original", batch.items[0].reply_text.?);
+}
+
+test "document bytes land in the configured inbox" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        \\{"ok":true,"result":[{"update_id":1,"message":{"message_id":8,"from":{"id":42},"chat":{"id":42,"type":"private"},"caption":"read this","document":{"file_id":"d1","file_name":"note.txt","mime_type":"text/plain","file_size":5}}}]}
+        ,
+        ok_json,
+        "{\"ok\":true,\"result\":{\"file_path\":\"documents/note.txt\",\"file_size\":5}}",
+        ok_json,
+    }, &.{"{\"choices\":[{\"message\":{\"content\":\"read\"}}]}"});
+    defer h.deinit();
+    var root_buf: [128]u8 = undefined;
+    h.bot.workspace = try h.workspace(&root_buf);
+    h.bot.inbox = "incoming";
+    var files: FakeGet = .{ .body = "hello" };
+    h.bot.fetch = files.get();
+
+    try h.bot.pollOnce();
+    const saved = try workspace.readBytes(testing.allocator, h.threaded.io(), h.bot.workspace, "incoming/1-note.txt", 5);
+    defer testing.allocator.free(saved);
+    try testing.expectEqualStrings("hello", saved);
+    try testing.expect(std.mem.indexOf(u8, h.llm.sent(), "in inbox: incoming/1-note.txt") != null);
+}
+
 test "a workspace file goes out as a photo with its caption" {
     var h: Harness = undefined;
     try h.init(&.{ok_json}, &.{});
@@ -1049,9 +1817,186 @@ test "a workspace file goes out as a photo with its caption" {
     try testing.expectEqual(@as(usize, 1), h.tg.i);
 }
 
+test "compatible media are sent as one bounded album" {
+    var h: Harness = undefined;
+    try h.init(&.{ok_json}, &.{});
+    defer h.deinit();
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = try h.workspace(&dir_buf);
+    h.bot.workspace = dir;
+    var d = try std.Io.Dir.cwd().openDir(h.threaded.io(), dir, .{});
+    defer d.close(h.threaded.io());
+    try d.writeFile(h.threaded.io(), .{ .sub_path = "a.png", .data = "a" });
+    try d.writeFile(h.threaded.io(), .{ .sub_path = "b.mp4", .data = "b" });
+    try outbox.pushReply(&h.db, .photo, "a.png", "album", 12, 1);
+    try outbox.push(&h.db, .video, "b.mp4", "ignored", 2);
+
+    try h.bot.flush();
+    try testing.expect(std.mem.endsWith(u8, h.tg.sentUrl(), "/sendMediaGroup"));
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"media\":\"attach://f0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"media\":\"attach://f1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"message_id\":12") != null);
+    try testing.expectEqual(@as(i64, 0), try scalar(&h.db, "SELECT count(*) FROM outbox"));
+}
+
+test "a later text chunk failure is uncertain" {
+    var h: Harness = undefined;
+    try h.init(&.{ok_json}, &.{});
+    defer h.deinit();
+    var body: [max_message + 1]u8 = @splat('a');
+    try outbox.push(&h.db, .text, null, &body, 1);
+
+    try h.bot.flush();
+
+    try testing.expectEqual(@as(i64, 1), try scalar(&h.db, "SELECT count(*) FROM outbox WHERE status = 'uncertain'"));
+    try testing.expectEqual(@as(usize, 1), h.tg.i);
+}
+
+test "progress state is cleared only after a confirmed edit" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        "{\"ok\":true,\"result\":{\"message_id\":55}}",
+        ok_json,
+    }, &.{});
+    defer h.deinit();
+    h.bot.live_http = h.tg.http();
+
+    const id = try h.bot.startProgress(9, 4);
+    try testing.expectEqual(@as(i64, 55), id);
+    try saveProgress(&h.db, id);
+    h.bot.progress_id = id;
+    try h.bot.finishProgress("Done.");
+    try testing.expectEqual(@as(?i64, null), try loadProgress(&h.db));
+    try testing.expect(std.mem.endsWith(u8, h.tg.url(0), "/sendMessage"));
+    try testing.expect(std.mem.endsWith(u8, h.tg.url(1), "/editMessageText"));
+}
+
+test "stop callback cancels the active model turn" {
+    const Slow = struct {
+        io: std.Io,
+
+        fn http(self: *@This()) agent.Http {
+            return .{ .ptr = self, .post_fn = post };
+        }
+
+        fn post(ptr: *anyopaque, gpa: std.mem.Allocator, _: agent.Http.Request) anyerror!agent.Http.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try (std.Io.Clock.Duration{ .raw = .fromSeconds(5), .clock = .awake }).sleep(self.io);
+            return .{ .status = 200, .body = try gpa.dupe(u8, "{\"choices\":[{\"message\":{\"content\":\"late\"}}]}") };
+        }
+    };
+
+    var h: Harness = undefined;
+    try h.init(&.{
+        \\{"ok":true,"result":[{"update_id":4,"message":{"message_id":9,"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"text":"work"}}]}
+        ,
+        ok_json,
+    }, &.{});
+    defer h.deinit();
+    var live: FakeHttp = .{ .bodies = &.{
+        "{\"ok\":true,\"result\":{\"message_id\":55}}",
+        ok_json,
+        \\{"ok":true,"result":[{"update_id":5,"callback_query":{"id":"stop","from":{"id":42,"is_bot":false},"message":{"message_id":55,"chat":{"id":42,"type":"private"}},"data":"x:4"}}]}
+        ,
+        ok_json,
+        ok_json,
+    } };
+    var slow: Slow = .{ .io = h.threaded.io() };
+    h.agent.http = slow.http();
+    h.bot.live_http = live.http();
+
+    try h.bot.pollOnce();
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "Stopped.") != null);
+    try testing.expect(std.mem.endsWith(u8, live.url(3), "/answerCallbackQuery"));
+    try testing.expect(std.mem.endsWith(u8, live.url(4), "/editMessageText"));
+    try testing.expectEqual(@as(?i64, null), try loadProgress(&h.db));
+}
+
 test "an attachment pointing outside the workspace is refused" {
     var h: Harness = undefined;
     try h.init(&.{}, &.{});
     defer h.deinit();
-    try testing.expectError(error.BadPath, h.bot.sendFile(.document, "../../etc/passwd", ""));
+    try testing.expectError(error.BadPath, h.bot.sendFile(.document, "../../etc/passwd", "", null));
+}
+
+test "a failed approved action becomes uncertain" {
+    var h: Harness = undefined;
+    try h.init(
+        &.{
+            \\{"ok":true,"result":[{"update_id":7,"callback_query":{"id":"cb1","from":{"id":42,"is_bot":false},"message":{"message_id":90,"chat":{"id":42,"type":"private"}},"data":"a:1"}}]}
+            ,
+            ok_json,
+            ok_json,
+        },
+        &.{},
+    );
+    defer h.deinit();
+    _ = try tasks.ask(&h.db, "missing_tool", "{}", null, "test action", null, std.Io.Timestamp.now(h.threaded.io(), .real).toSeconds());
+
+    try testing.expectError(error.UnknownTool, h.bot.pollOnce());
+    try testing.expect(std.mem.endsWith(u8, h.tg.url(1), "/answerCallbackQuery"));
+    try testing.expectEqual(@as(usize, 2), h.tg.i);
+    var q = try h.db.prepare("SELECT status FROM approvals WHERE id = 1");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("uncertain", q.text(0));
+}
+
+test "foreign callback is answered without granting authority" {
+    var h: Harness = undefined;
+    try h.init(
+        &.{
+            \\{"ok":true,"result":[{"update_id":7,"callback_query":{"id":"cb1","from":{"id":99,"is_bot":false},"message":{"message_id":90,"chat":{"id":42,"type":"private"}},"data":"a:1"}}]}
+            ,
+            ok_json,
+        },
+        &.{},
+    );
+    defer h.deinit();
+    _ = try tasks.ask(&h.db, "missing_tool", "{}", null, "test action", null, 1);
+
+    try h.bot.pollOnce();
+    try testing.expect(std.mem.endsWith(u8, h.tg.sentUrl(), "/answerCallbackQuery"));
+    var q = try h.db.prepare("SELECT status FROM approvals WHERE id = 1");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("pending", q.text(0));
+}
+
+test "HTML output is escaped and chunks keep entities whole" {
+    const escaped = try escapeHtml(testing.allocator, "<a&b>");
+    defer testing.allocator.free(escaped);
+    try testing.expectEqualStrings("&lt;a&amp;b&gt;", escaped);
+    const cut = chunkEnd("abc&amp;def", 6);
+    try testing.expectEqual(@as(usize, 3), cut);
+}
+
+test "sticker aliases are durable and listed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &buf);
+    defer db.close();
+
+    try beginStickerLearning(&db, "wave", 10);
+    var u: Update = .{
+        .update_id = 1,
+        .from_id = 42,
+        .chat_id = 42,
+        .chat_type = try testing.allocator.dupe(u8, "private"),
+        .kind = .sticker,
+        .text = try testing.allocator.dupe(u8, ""),
+        .file_id = try testing.allocator.dupe(u8, "sticker-file"),
+        .unique_id = try testing.allocator.dupe(u8, "stable"),
+        .emoji = try testing.allocator.dupe(u8, "👋"),
+    };
+    defer u.deinit(testing.allocator);
+    const alias = (try takeStickerLearning(&db, testing.allocator, u, 11)).?;
+    defer testing.allocator.free(alias);
+    try testing.expectEqualStrings("wave", alias);
+
+    const list = try listStickers(&db, testing.allocator);
+    defer testing.allocator.free(list);
+    try testing.expectEqualStrings("wave 👋\n", list);
 }

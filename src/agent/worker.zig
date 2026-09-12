@@ -485,6 +485,9 @@ test "a subagent is handed no way to delegate and no tool that reaches Telegram"
     defer testing.allocator.free(list);
     for (list) |t| {
         try testing.expect(!std.mem.eql(u8, t.name, "delegate"));
+        try testing.expect(!std.mem.eql(u8, t.name, "notify_owner"));
+        try testing.expect(!std.mem.eql(u8, t.name, "attach_file"));
+        try testing.expect(!std.mem.eql(u8, t.name, "send_sticker"));
         try testing.expect(std.mem.indexOf(u8, t.name, "telegram") == null);
     }
 }

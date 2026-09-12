@@ -1,5 +1,6 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
+const workspace = @import("../app/workspace.zig");
 const tools = @import("../tools/root.zig");
 const testing = std.testing;
 const testkit = @import("../testing/testkit.zig");
@@ -8,14 +9,18 @@ const testkit = @import("../testing/testkit.zig");
 pub const max_text: usize = 8 * 1024;
 /// Drained per turn. A runaway routine cannot flood the owner in one go.
 pub const max_drain: usize = 16;
+const max_attempts: i64 = 3;
 
-pub const Kind = enum { text, photo, document };
+pub const Kind = enum { text, photo, document, audio, voice, video, animation, sticker, approval };
+
+pub const Status = enum { queued, claimed, retryable, uncertain, failed };
 
 pub const Item = struct {
     id: i64,
     kind: Kind,
     path: ?[]u8,
     text: []u8,
+    reply_id: ?i64,
 
     pub fn deinit(self: *Item, gpa: std.mem.Allocator) void {
         if (self.path) |p| gpa.free(p);
@@ -26,44 +31,141 @@ pub const Item = struct {
 
 /// Queues output with an optional workspace-relative path.
 pub fn push(db: *Db, kind: Kind, path: ?[]const u8, body: []const u8, now: i64) !void {
+    return pushReply(db, kind, path, body, null, now);
+}
+
+pub fn pushReply(db: *Db, kind: Kind, path: ?[]const u8, body: []const u8, reply_id: ?i64, now: i64) !void {
     if (kind != .text and (path == null or !safeRelative(path.?))) return error.BadPath;
     const text = clamp(body);
-    var q = try db.prepare("INSERT INTO outbox(kind, path, text, created) VALUES (?, ?, ?, ?)");
+    var q = try db.prepare("INSERT INTO outbox(kind, path, text, reply_id, created) VALUES (?, ?, ?, ?, ?)");
     defer q.finalize();
     try q.bind(1, @tagName(kind));
     try q.bind(2, path);
     try q.bind(3, text);
-    try q.bind(4, now);
+    try q.bind(4, reply_id);
+    try q.bind(5, now);
     _ = try q.step();
 }
 
-/// Takes up to `max_drain` items and removes them. Caller owns the slice.
-pub fn drain(db: *Db, gpa: std.mem.Allocator) ![]Item {
+/// Claims up to `max_drain` rows. Caller must finalize every returned item.
+pub fn claim(db: *Db, gpa: std.mem.Allocator, now: i64) ![]Item {
     var out: std.ArrayList(Item) = .empty;
     errdefer free(gpa, out.items);
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
     {
-        var q = try db.prepare("SELECT id, kind, path, text FROM outbox ORDER BY id LIMIT ?");
+        var q = try db.prepare("SELECT id, kind, path, text, reply_id FROM outbox WHERE status = 'queued' OR (status = 'retryable' AND next_attempt <= ?) ORDER BY id LIMIT ?");
         defer q.finalize();
-        try q.bind(1, @as(i64, @intCast(max_drain)));
+        try q.bind(1, now);
+        try q.bind(2, @as(i64, @intCast(max_drain)));
         while (try q.step()) {
+            try out.ensureUnusedCapacity(gpa, 1);
             const kind = std.meta.stringToEnum(Kind, q.text(1)) orelse .text;
             const path = if (q.isNull(2)) null else try gpa.dupe(u8, q.text(2));
             errdefer if (path) |p| gpa.free(p);
-            try out.append(gpa, .{
+            const text = try gpa.dupe(u8, q.text(3));
+            errdefer gpa.free(text);
+            out.appendAssumeCapacity(.{
                 .id = q.int(0),
                 .kind = kind,
                 .path = path,
-                .text = try gpa.dupe(u8, q.text(3)),
+                .text = text,
+                .reply_id = if (q.isNull(4)) null else q.int(4),
             });
         }
     }
+    const keep = claimCount(out.items);
+    for (out.items[keep..]) |*item| item.deinit(gpa);
+    out.items.len = keep;
     for (out.items) |item| {
-        var d = try db.prepare("DELETE FROM outbox WHERE id = ?");
+        var d = try db.prepare("UPDATE outbox SET status = 'claimed', attempts = attempts + 1, claimed = ?, error = NULL WHERE id = ?");
         defer d.finalize();
-        try d.bind(1, item.id);
+        try d.bind(1, now);
+        try d.bind(2, item.id);
         _ = try d.step();
     }
+    try db.exec("COMMIT;");
     return out.toOwnedSlice(gpa);
+}
+
+/// Removes an item only after the destination confirmed it.
+pub fn delivered(db: *Db, id: i64) !void {
+    var q = try db.prepare("DELETE FROM outbox WHERE id = ? AND status = 'claimed'");
+    defer q.finalize();
+    try q.bind(1, id);
+    _ = try q.step();
+}
+
+/// Keeps a definite pre-send failure eligible for a later attempt.
+pub fn retry(db: *Db, id: i64, note: []const u8) !void {
+    var q = try db.prepare(
+        \\UPDATE outbox SET
+        \\ status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'retryable' END,
+        \\ next_attempt = unixepoch() + CASE attempts WHEN 1 THEN 1 WHEN 2 THEN 5 ELSE 30 END,
+        \\ error = ? WHERE id = ? AND status = 'claimed'
+    );
+    defer q.finalize();
+    try q.bind(1, max_attempts);
+    try q.bind(2, note);
+    try q.bind(3, id);
+    _ = try q.step();
+}
+
+/// Requeues one terminal delivery after an owner retry.
+pub fn retryDelivery(db: *Db, id: i64) !bool {
+    var q = try db.prepare("UPDATE outbox SET status = 'retryable', attempts = 0, next_attempt = 0, error = NULL WHERE id = ? AND status IN ('failed', 'uncertain')");
+    defer q.finalize();
+    try q.bind(1, id);
+    _ = try q.step();
+    return @import("c").sqlite3_changes(db.ptr) == 1;
+}
+
+/// Records an outcome that may have reached Telegram without retrying it.
+pub fn uncertain(db: *Db, id: i64, note: []const u8) !void {
+    try setStatus(db, id, .uncertain, note);
+}
+
+pub fn failed(db: *Db, id: i64, note: []const u8) !void {
+    try setStatus(db, id, .failed, note);
+}
+
+/// A crashed claimed send may already have reached its destination.
+pub fn recover(db: *Db) !void {
+    try db.exec("UPDATE outbox SET status = 'uncertain', error = 'interrupted during delivery' WHERE status = 'claimed';");
+}
+
+pub fn recoverBefore(db: *Db, cutoff: i64) !void {
+    var q = try db.prepare("UPDATE outbox SET status = 'uncertain', error = 'interrupted during delivery' WHERE status = 'claimed' AND claimed <= ?");
+    defer q.finalize();
+    try q.bind(1, cutoff);
+    _ = try q.step();
+}
+
+fn setStatus(db: *Db, id: i64, status: Status, note: []const u8) !void {
+    var q = try db.prepare("UPDATE outbox SET status = ?, error = ? WHERE id = ? AND status = 'claimed'");
+    defer q.finalize();
+    try q.bind(1, @tagName(status));
+    try q.bind(2, note);
+    try q.bind(3, id);
+    _ = try q.step();
+}
+
+fn claimCount(items: []const Item) usize {
+    if (items.len == 0) return 0;
+    const class = albumClass(items[0].kind);
+    if (class == 0) return 1;
+    var n: usize = 1;
+    while (n < items.len and n < 10 and albumClass(items[n].kind) == class) : (n += 1) {}
+    return n;
+}
+
+fn albumClass(kind: Kind) u2 {
+    return switch (kind) {
+        .photo, .video => 1,
+        .audio => 2,
+        .document => 3,
+        else => 0,
+    };
 }
 
 pub fn free(gpa: std.mem.Allocator, items: []Item) void {
@@ -81,17 +183,7 @@ fn clamp(text: []const u8) []const u8 {
 
 /// Accepts safe workspace-relative paths for multipart headers.
 pub fn safeRelative(path: []const u8) bool {
-    if (path.len == 0 or path.len > 512) return false;
-    if (path[0] == '/') return false;
-    for (path) |c| {
-        const ok = std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_' or c == '/';
-        if (!ok) return false;
-    }
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |seg| {
-        if (seg.len == 0 or std.mem.eql(u8, seg, "..") or std.mem.eql(u8, seg, ".")) return false;
-    }
-    return true;
+    return workspace.validPath(path);
 }
 
 const notify_params = [_]tools.Param{
@@ -102,6 +194,7 @@ pub const notify_owner: tools.Def = .{
     .name = "notify_owner",
     .description = "Queue a message for the owner. Use this from a routine; a normal reply reaches them already.",
     .params = &notify_params,
+    .primary_only = true,
     .run = runNotify,
 };
 
@@ -115,7 +208,20 @@ pub const attach_file: tools.Def = .{
     .name = "attach_file",
     .description = "Send a file from the workspace to the owner as a photo or document.",
     .params = &attach_params,
+    .primary_only = true,
     .run = runAttach,
+};
+
+const sticker_params = [_]tools.Param{
+    .{ .name = "alias", .description = "learned sticker alias" },
+};
+
+pub const send_sticker: tools.Def = .{
+    .name = "send_sticker",
+    .description = "Send one learned Telegram sticker to the owner.",
+    .params = &sticker_params,
+    .primary_only = true,
+    .run = runSticker,
 };
 
 fn runNotify(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
@@ -138,10 +244,27 @@ fn runAttach(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     defer parsed.deinit();
     const a = parsed.value;
     const kind: Kind = if (a.as) |s| (std.meta.stringToEnum(Kind, s) orelse .document) else .document;
+    try workspace.checkFile(ctx.io, ctx.workspace, a.path, workspace.max_write);
     const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
-    push(ctx.db, if (kind == .text) .document else kind, a.path, a.caption orelse "", now) catch |err|
+    push(ctx.db, if (kind == .text or kind == .approval or kind == .sticker) .document else kind, a.path, a.caption orelse "", now) catch |err|
         return std.fmt.allocPrint(ctx.gpa, "not queued: {s}", .{@errorName(err)});
     return std.fmt.allocPrint(ctx.gpa, "queued {s}", .{a.path});
+}
+
+fn runSticker(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
+    const Args = struct { alias: []const u8 };
+    const parsed = try std.json.parseFromSlice(Args, ctx.gpa, args, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (!safeAlias(parsed.value.alias)) return ctx.gpa.dupe(u8, "invalid sticker alias");
+    push(ctx.db, .sticker, parsed.value.alias, "", std.Io.Timestamp.now(ctx.io, .real).toSeconds()) catch |err|
+        return std.fmt.allocPrint(ctx.gpa, "not queued: {s}", .{@errorName(err)});
+    return ctx.gpa.dupe(u8, "sticker queued");
+}
+
+fn safeAlias(alias: []const u8) bool {
+    if (alias.len == 0 or alias.len > 32) return false;
+    for (alias) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
+    return true;
 }
 
 test "safeRelative refuses escapes and absolutes" {
@@ -154,11 +277,11 @@ test "safeRelative refuses escapes and absolutes" {
     try testing.expect(!safeRelative("./x"));
     try testing.expect(!safeRelative("a\"b.png"));
     try testing.expect(!safeRelative("a\r\nb.png"));
-    try testing.expect(!safeRelative("a b.png"));
+    try testing.expect(safeRelative("a b.png"));
     try testing.expect(!safeRelative("a\\b.png"));
 }
 
-test "push then drain returns items once and empties the queue" {
+test "claimed output remains until delivery is confirmed" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
@@ -169,17 +292,69 @@ test "push then drain returns items once and empties the queue" {
     try push(&db, .photo, "out/chart.png", "yesterday", 101);
     try testing.expectError(error.BadPath, push(&db, .photo, "../etc/shadow", "", 102));
 
-    const items = try drain(&db, testing.allocator);
+    const items = try claim(&db, testing.allocator, 200);
     defer free(testing.allocator, items);
-    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqual(@as(usize, 1), items.len);
     try testing.expectEqual(Kind.text, items[0].kind);
     try testing.expectEqualStrings("brief is ready", items[0].text);
-    try testing.expectEqual(Kind.photo, items[1].kind);
-    try testing.expectEqualStrings("out/chart.png", items[1].path.?);
 
-    const again = try drain(&db, testing.allocator);
+    const again = try claim(&db, testing.allocator, 201);
     defer free(testing.allocator, again);
-    try testing.expectEqual(@as(usize, 0), again.len);
+    try testing.expectEqual(@as(usize, 1), again.len);
+    try testing.expectEqual(Kind.photo, again[0].kind);
+    try testing.expectEqualStrings("out/chart.png", again[0].path.?);
+
+    try delivered(&db, items[0].id);
+    try retry(&db, again[0].id, "offline");
+    const retrying = try claim(&db, testing.allocator, std.math.maxInt(i64));
+    defer free(testing.allocator, retrying);
+    try testing.expectEqual(@as(usize, 1), retrying.len);
+    try testing.expectEqual(again[0].id, retrying[0].id);
+    try uncertain(&db, retrying[0].id, "timeout");
+    const final = try claim(&db, testing.allocator, 203);
+    defer free(testing.allocator, final);
+    try testing.expectEqual(@as(usize, 0), final.len);
+}
+
+test "restart preserves an interrupted send as uncertain" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &buf);
+    defer db.close();
+
+    try push(&db, .text, null, "sent maybe", 1);
+    const items = try claim(&db, testing.allocator, 2);
+    defer free(testing.allocator, items);
+    try recover(&db);
+
+    var q = try db.prepare("SELECT status FROM outbox WHERE id = ?");
+    defer q.finalize();
+    try q.bind(1, items[0].id);
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("uncertain", q.text(0));
+}
+
+test "delivery retries stop after three attempts" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &buf);
+    defer db.close();
+
+    try push(&db, .text, null, "later", 1);
+    var attempt: i64 = 0;
+    while (attempt < max_attempts) : (attempt += 1) {
+        const items = try claim(&db, testing.allocator, std.math.maxInt(i64));
+        defer free(testing.allocator, items);
+        try testing.expectEqual(@as(usize, 1), items.len);
+        try retry(&db, items[0].id, "offline");
+    }
+    var q = try db.prepare("SELECT status, attempts FROM outbox");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("failed", q.text(0));
+    try testing.expectEqual(max_attempts, q.int(1));
 }
 
 test "an over-long message is trimmed on a codepoint boundary, not rejected" {
@@ -199,7 +374,7 @@ test "an over-long message is trimmed on a codepoint boundary, not rejected" {
     long[long.len - 1] = 'x';
 
     try push(&db, .text, null, long, 1);
-    const items = try drain(&db, testing.allocator);
+    const items = try claim(&db, testing.allocator, 2);
     defer free(testing.allocator, items);
     try testing.expect(items[0].text.len <= max_text);
     try testing.expect(std.unicode.utf8ValidateSlice(items[0].text));

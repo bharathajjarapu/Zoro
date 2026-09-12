@@ -203,13 +203,24 @@ pub fn ask(
 pub const AuthorizeError = error{ NotFound, Expired, WrongAction, Sqlite, OutOfMemory };
 
 pub fn authorize(db: *Db, id: i64, tool: []const u8, args: []const u8, now: i64) AuthorizeError!void {
+    {
+        var claim = try db.prepare("UPDATE approvals SET status = 'executing', updated = ? WHERE id = ? AND tool = ? AND args = ? AND status = 'pending' AND expires > ?");
+        defer claim.finalize();
+        try claim.bind(1, now);
+        try claim.bind(2, id);
+        try claim.bind(3, tool);
+        try claim.bind(4, args);
+        try claim.bind(5, now);
+        _ = try claim.step();
+    }
+    if (try changed(db)) return;
     var q = try db.prepare("SELECT tool, args, expires, status FROM approvals WHERE id = ?");
     defer q.finalize();
     try q.bind(1, id);
     if (!try q.step()) return error.NotFound;
-    if (q.int(2) <= now) return error.Expired;
-    if (!std.mem.eql(u8, q.text(3), "pending")) return error.NotFound;
     if (!std.mem.eql(u8, q.text(0), tool) or !std.mem.eql(u8, q.text(1), args)) return error.WrongAction;
+    if (q.int(2) <= now) return error.Expired;
+    return error.NotFound;
 }
 
 pub const Decision = enum { approve, deny, other };
@@ -248,12 +259,47 @@ pub fn latestPending(db: *Db, gpa: std.mem.Allocator) !?Approval {
     return first;
 }
 
+pub fn pending(db: *Db, gpa: std.mem.Allocator, id: i64) !?Approval {
+    var q = try db.prepare(
+        \\SELECT id, task, tool, args, target, reason, status, created, expires
+        \\FROM approvals WHERE id = ? AND status = 'pending'
+    );
+    defer q.finalize();
+    try q.bind(1, id);
+    if (!try q.step()) return null;
+    return try readApproval(gpa, &q);
+}
+
 pub fn setApproval(db: *Db, id: i64, status: []const u8) !void {
-    var q = try db.prepare("UPDATE approvals SET status = ? WHERE id = ?");
+    var q = try db.prepare("UPDATE approvals SET status = ?, updated = unixepoch() WHERE id = ?");
     defer q.finalize();
     try q.bind(1, status);
     try q.bind(2, id);
     _ = try q.step();
+}
+
+pub fn transitionApproval(db: *Db, id: i64, from: []const u8, to: []const u8) !bool {
+    var q = try db.prepare("UPDATE approvals SET status = ?, updated = unixepoch() WHERE id = ? AND status = ?");
+    defer q.finalize();
+    try q.bind(1, to);
+    try q.bind(2, id);
+    try q.bind(3, from);
+    _ = try q.step();
+    return changed(db);
+}
+
+pub fn recoverApprovals(db: *Db, cutoff: i64) !void {
+    var q = try db.prepare("UPDATE approvals SET status = 'uncertain', updated = unixepoch() WHERE status = 'executing' AND updated <= ?");
+    defer q.finalize();
+    try q.bind(1, cutoff);
+    _ = try q.step();
+}
+
+fn changed(db: *Db) !bool {
+    var q = try db.prepare("SELECT changes()");
+    defer q.finalize();
+    if (!try q.step()) return error.Sqlite;
+    return q.int(0) == 1;
 }
 
 /// Formats pending approvals oldest first. Caller frees.
@@ -436,6 +482,24 @@ test "approval for action A cannot authorize action B" {
     const id = try ask(&db, "fetch_url", "{\"url\":\"https://example.com\"}", "example.com", "read the page", null, 0);
     try authorize(&db, id, "fetch_url", "{\"url\":\"https://example.com\"}", 1);
     try testing.expectError(error.WrongAction, authorize(&db, id, "fetch_url", "{\"url\":\"https://evil.test\"}", 1));
+    try testing.expectError(error.NotFound, authorize(&db, id, "fetch_url", "{\"url\":\"https://example.com\"}", 1));
+}
+
+test "an interrupted approval becomes uncertain" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
+    defer db.close();
+    try db.migrate();
+    const id = try ask(&db, "shell", "{}", null, "run it", null, 1);
+    try authorize(&db, id, "shell", "{}", 2);
+    try recoverApprovals(&db, 2);
+    var q = try db.prepare("SELECT status FROM approvals WHERE id = ?");
+    defer q.finalize();
+    try q.bind(1, id);
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("uncertain", q.text(0));
 }
 
 test "expired approval is refused" {

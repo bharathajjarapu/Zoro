@@ -1,5 +1,6 @@
 const std = @import("std");
 const tools = @import("../tools/root.zig");
+const learning = @import("../data/learning.zig");
 const testing = std.testing;
 
 pub const Skill = struct {
@@ -86,6 +87,13 @@ pub fn parse(text: []const u8) !Skill {
     return skill;
 }
 
+pub fn validateLearned(text: []const u8) !Skill {
+    const skill = try parse(text);
+    if (skill.schedule != null or skill.timezone != null or skill.authority != null or
+        skill.allowed_tools != null or skill.model != null) return error.LearnedAuthority;
+    return skill;
+}
+
 pub fn list(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![]Entry {
     var root = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return &.{},
@@ -122,6 +130,12 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u
     return try gpa.dupe(u8, skill.body);
 }
 
+/// Caller owns the full markdown.
+pub fn readMarkdown(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]u8 {
+    if (!validName(name)) return error.BadName;
+    return readSkill(gpa, io, dir, name);
+}
+
 pub fn save(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, markdown: []const u8) ![]const u8 {
     const skill = try parse(markdown);
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -129,9 +143,21 @@ pub fn save(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, markdown: []con
     try std.Io.Dir.cwd().createDirPath(io, sub);
     var d = try std.Io.Dir.cwd().openDir(io, sub, .{});
     defer d.close(io);
-    try d.writeFile(io, .{ .sub_path = "SKILL.md", .data = markdown });
+    var atomic = try d.createFileAtomic(io, "SKILL.md", .{ .replace = true });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, markdown);
+    try atomic.replace(io);
     _ = gpa;
     return skill.name;
+}
+
+pub fn remove(io: std.Io, dir: []const u8, name: []const u8) !void {
+    if (!validName(name)) return error.BadName;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const sub = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name });
+    var d = try std.Io.Dir.cwd().openDir(io, sub, .{});
+    defer d.close(io);
+    try d.deleteFile(io, "SKILL.md");
 }
 
 fn readSkill(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]u8 {
@@ -168,7 +194,7 @@ pub const load_skill: tools.Def = .{
 
 pub const save_skill: tools.Def = .{
     .name = "save_skill",
-    .description = "Write a SKILL.md. Content must include name and description frontmatter.",
+    .description = "Propose a SKILL.md change for owner review.",
     .params = &content_param,
     .mutates = true,
     .run = runSave,
@@ -187,9 +213,19 @@ fn runLoad(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
 fn runSave(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     const parsed = try std.json.parseFromSlice(ContentArgs, ctx.gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    const name = save(ctx.gpa, ctx.io, ctx.skills_dir, parsed.value.content) catch |err|
+    const skill = validateLearned(parsed.value.content) catch |err|
         return std.fmt.allocPrint(ctx.gpa, "could not save skill: {s}", .{@errorName(err)});
-    return try std.fmt.allocPrint(ctx.gpa, "saved skill {s}", .{name});
+    const old = readMarkdown(ctx.gpa, ctx.io, ctx.skills_dir, skill.name) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return std.fmt.allocPrint(ctx.gpa, "could not inspect skill: {s}", .{@errorName(err)}),
+    };
+    defer if (old) |text| ctx.gpa.free(text);
+    const target = std.fmt.allocPrint(ctx.gpa, "skill-{s}", .{skill.name}) catch return error.OutOfMemory;
+    defer ctx.gpa.free(target);
+    const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const id = learning.create(ctx.db, target, null, ctx.source_message, "Requested through save_skill.", "Save reusable workflow.", old, parsed.value.content, now) catch |err|
+        return std.fmt.allocPrint(ctx.gpa, "could not propose skill: {s}", .{@errorName(err)});
+    return try std.fmt.allocPrint(ctx.gpa, "pending skill proposal #{d}: {s}", .{ id, skill.name });
 }
 
 test "parse requires name and description" {
@@ -214,6 +250,13 @@ test "parse reads required fields, body, and a schedule" {
     try testing.expectEqualStrings("0 7 * * *", s.schedule.?);
     try testing.expectEqualStrings("fetch_url remember", s.allowed_tools.?);
     try testing.expectEqualStrings("Check mail first.", s.body);
+}
+
+test "learned skills cannot grant runtime authority" {
+    try testing.expectError(error.LearnedAuthority, validateLearned(
+        "---\nname: risky\ndescription: Risky\nallowed-tools: shell\n---\nRun it.",
+    ));
+    _ = try validateLearned("---\nname: note\ndescription: Safe workflow\n---\nRemember it.");
 }
 
 test "save then load round-trips, and the index is name plus description only" {

@@ -53,12 +53,29 @@ pub fn chat(a: *Agent, in: *std.Io.Reader, out: *std.Io.Writer, err_out: *std.Io
 
 /// Prints output queued outside the agent.
 fn drain(a: *Agent, out: *std.Io.Writer) !void {
-    const items = try outbox.drain(a.db, a.gpa);
-    defer outbox.free(a.gpa, items);
-    for (items) |item| {
-        if (item.path) |p| try out.print("[{s}] {s}\n", .{ @tagName(item.kind), p });
-        if (item.text.len != 0) try writeReply(out, item.text);
+    const now = std.Io.Timestamp.now(a.io, .real).toSeconds();
+    try outbox.recoverBefore(a.db, now - 300);
+    var sent: usize = 0;
+    while (sent < outbox.max_drain) {
+        const items = try outbox.claim(a.db, a.gpa, now);
+        defer outbox.free(a.gpa, items);
+        if (items.len == 0) break;
+        sent += items.len;
+        for (items, 0..) |item, i| {
+            writeItem(out, item) catch |err| {
+                try outbox.uncertain(a.db, item.id, @errorName(err));
+                for (items[i + 1 ..]) |rest| try outbox.retry(a.db, rest.id, @errorName(err));
+                return err;
+            };
+            try outbox.delivered(a.db, item.id);
+        }
     }
+    try out.flush();
+}
+
+fn writeItem(out: *std.Io.Writer, item: outbox.Item) !void {
+    if (item.path) |p| try out.print("[{s}] {s}\n", .{ @tagName(item.kind), p });
+    if (item.text.len != 0) return writeReply(out, item.text);
     try out.flush();
 }
 
@@ -141,6 +158,23 @@ pub fn printRoutines(db: *Db, out: *std.Io.Writer) !void {
         });
     }
     if (n == 0) try out.writeAll("no routines\n");
+    try out.flush();
+}
+
+pub fn printStatus(db: *Db, out: *std.Io.Writer) !void {
+    var q = try db.prepare(
+        \\SELECT
+        \\ (SELECT count(*) FROM tasks WHERE status IN ('queued','running','blocked')) + (SELECT count(*) FROM outbox WHERE status IN ('queued','claimed','retryable')) + (SELECT count(*) FROM telegram_updates WHERE status IN ('pending','processing','retryable')) + (SELECT count(*) FROM approvals WHERE status IN ('pending','executing')),
+        \\ (SELECT count(*) FROM tasks WHERE status = 'failed') + (SELECT count(*) FROM outbox WHERE status = 'failed') + (SELECT count(*) FROM telegram_updates WHERE status = 'failed'),
+        \\ (SELECT count(*) FROM outbox WHERE status = 'uncertain') + (SELECT count(*) FROM telegram_updates WHERE status = 'uncertain') + (SELECT count(*) FROM approvals WHERE status = 'uncertain')
+    );
+    defer q.finalize();
+    if (!try q.step()) return error.NoRow;
+    const pending = q.int(0);
+    const failed = q.int(1);
+    const uncertain = q.int(2);
+    const state: []const u8 = if (uncertain != 0 or failed != 0) "blocked" else if (pending != 0) "recovering" else "usable";
+    try out.print("{s} pending={d} failed={d} uncertain={d}\n", .{ state, pending, failed, uncertain });
     try out.flush();
 }
 
@@ -298,6 +332,18 @@ test "tasks lists parent and child with status, priority, and goal" {
     try testing.expect(std.mem.indexOf(u8, out.written(), "prio=2") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "notes written") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "  #") != null);
+}
+
+test "status reports recovery without transcript or secrets" {
+    var h: Harness = undefined;
+    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
+    defer h.deinit();
+    _ = try tasks.create(h.agent.db, "work", "done", 0, null, 0);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try printStatus(h.agent.db, &out.writer);
+    try testing.expectEqualStrings("recovering pending=1 failed=0 uncertain=0\n", out.written());
 }
 
 const Harness = struct {

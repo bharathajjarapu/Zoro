@@ -19,8 +19,12 @@ pub const tick_every: u64 = 30;
 pub const missed_after: i64 = 5 * 60;
 
 pub fn tick(a: *agent.Agent, now: i64) !void {
+    return tickWithCancel(a, now, null);
+}
+
+fn tickWithCancel(a: *agent.Agent, now: i64, cancel: ?*const agent.Workers) !void {
     try sync(a.db, a.gpa, a.io, a.skills_dir, now);
-    try fire(a, now);
+    try fire(a, now, cancel);
     try compact(a, now);
 }
 
@@ -56,9 +60,10 @@ fn mark(db: *Db, day: []const u8) !void {
 }
 
 pub fn loop(a: *agent.Agent, stop: *const fn () bool) void {
+    var cancel: agent.Workers = .{ .shutdown = stop };
     while (!stop()) {
         const now = std.Io.Timestamp.now(a.io, .real).toSeconds();
-        tick(a, now) catch |err| log.err("{t}", .{err});
+        tickWithCancel(a, now, &cancel) catch |err| log.err("{t}", .{err});
         var left = tick_every;
         while (left > 0 and !stop()) : (left -= 1) {
             std.Io.sleep(a.io, .fromSeconds(1), .awake) catch return;
@@ -153,7 +158,7 @@ fn nameArgs(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{{\"name\":\"{s}\"}}", .{name});
 }
 
-fn fire(a: *agent.Agent, now: i64) !void {
+fn fire(a: *agent.Agent, now: i64, cancel: ?*const agent.Workers) !void {
     var names: std.ArrayList([]u8) = .empty;
     defer {
         for (names.items) |n| a.gpa.free(n);
@@ -171,7 +176,8 @@ fn fire(a: *agent.Agent, now: i64) !void {
     }
 
     for (names.items) |name| {
-        runOne(a, name, now) catch |err| {
+        runOne(a, name, now, cancel) catch |err| {
+            if (err == error.Cancelled) return err;
             log.err("{s}: {t}", .{ name, err });
             // Back off broken skills to avoid a hot loop.
             try record(a.db, name, now, now + 3600, "failed");
@@ -179,7 +185,7 @@ fn fire(a: *agent.Agent, now: i64) !void {
     }
 }
 
-fn runOne(a: *agent.Agent, name: []const u8, now: i64) !void {
+fn runOne(a: *agent.Agent, name: []const u8, now: i64, cancel: ?*const agent.Workers) !void {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}/SKILL.md", .{ a.skills_dir, name });
     const text = try std.Io.Dir.cwd().readFileAlloc(a.io, path, a.gpa, .limited(64 * 1024));
@@ -196,7 +202,7 @@ fn runOne(a: *agent.Agent, name: []const u8, now: i64) !void {
         if (now - state.due > missed_after) return skip(a, name, now, next);
         return askFirst(a, name, skill.description, now, next);
     }
-    return execute(a, name, skill, tier, now, next);
+    return execute(a, name, skill, tier, now, next, cancel);
 }
 
 const State = struct { due: i64, approved: bool };
@@ -209,7 +215,7 @@ fn stateOf(db: *Db, name: []const u8) !State {
     return .{ .due = q.int(0), .approved = std.mem.eql(u8, q.text(1), "approved") };
 }
 
-fn execute(a: *agent.Agent, name: []const u8, skill: skills.Skill, tier: skills.Authority, now: i64, next: i64) !void {
+fn execute(a: *agent.Agent, name: []const u8, skill: skills.Skill, tier: skills.Authority, now: i64, next: i64, cancel: ?*const agent.Workers) !void {
     const list = try tools.subset(a.gpa, a.tools, tier.readOnly(), skill.allowed_tools);
     defer a.gpa.free(list);
     const prompt = try std.fmt.allocPrint(a.gpa, "Run routine {s}.\n\n{s}", .{ name, skill.body });
@@ -220,11 +226,16 @@ fn execute(a: *agent.Agent, name: []const u8, skill: skills.Skill, tier: skills.
     a.tools = list;
     defer a.tools = full;
 
-    if (a.turn(prompt)) |reply| {
+    const result = if (cancel) |state|
+        a.turnWithCancel(.{ .text = prompt }, state)
+    else
+        a.turn(prompt);
+    if (result) |reply| {
         defer a.gpa.free(reply);
         if (reply.len != 0) try outbox.push(a.db, .text, null, reply, now);
         try record(a.db, name, now, next, "ok");
     } else |err| {
+        if (err == error.Cancelled) return err;
         log.err("{s}: {t}", .{ name, err });
         try record(a.db, name, now, next, "failed");
     }

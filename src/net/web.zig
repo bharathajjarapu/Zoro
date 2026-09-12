@@ -3,6 +3,7 @@ const testing = std.testing;
 
 pub const max_body: usize = 2 * 1024 * 1024;
 pub const per_host_per_min: usize = 10;
+pub const request_timeout_ms: i64 = 10_000;
 const max_hops: u8 = 5;
 
 pub const Api = struct {
@@ -19,16 +20,78 @@ pub const Api = struct {
     pub fn call(self: Api, gpa: std.mem.Allocator, req: Request) anyerror!Hop {
         return self.call_fn(self.ptr, gpa, req);
     }
+
+    pub fn callCancellable(self: Api, gpa: std.mem.Allocator, io: std.Io, req: Request, cancel: ?*const std.atomic.Value(bool), parent: ?*const std.atomic.Value(bool)) !Hop {
+        return timedFor(self, gpa, io, req, request_timeout_ms, cancel, parent);
+    }
 };
 
 pub const Get = struct {
     ptr: *anyopaque,
-    request_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, ?[]const u8) anyerror!Hop,
+    request_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, ?[]const u8, ?std.Io.net.IpAddress) anyerror!Hop,
 
-    pub fn request(self: Get, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8) anyerror!Hop {
-        return self.request_fn(self.ptr, gpa, url, auth);
+    pub fn request(self: Get, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8, address: ?std.Io.net.IpAddress) anyerror!Hop {
+        return self.request_fn(self.ptr, gpa, url, auth, address);
     }
 };
+
+fn timedFor(api: Api, gpa: std.mem.Allocator, io: std.Io, req: Api.Request, timeout_ms: i64, cancel: ?*const std.atomic.Value(bool), parent: ?*const std.atomic.Value(bool)) !Hop {
+    const Race = union(enum) {
+        request: anyerror!Hop,
+        timeout: std.Io.Cancelable!void,
+        cancel: std.Io.Cancelable!void,
+    };
+    const Run = struct {
+        fn request(transport: Api, alloc: std.mem.Allocator, api_req: Api.Request) anyerror!Hop {
+            return transport.call(alloc, api_req);
+        }
+
+        fn clean(race: *std.Io.Select(Race), alloc: std.mem.Allocator) void {
+            while (race.cancel()) |late| switch (late) {
+                .request => |result| if (result) |hop| {
+                    var owned = hop;
+                    owned.deinit(alloc);
+                } else |_| {},
+                .timeout, .cancel => |result| result catch {},
+            };
+        }
+    };
+
+    var ready: [3]Race = undefined;
+    var race = std.Io.Select(Race).init(io, &ready);
+    try race.concurrent(.request, Run.request, .{ api, gpa, req });
+    {
+        errdefer Run.clean(&race, gpa);
+        try race.concurrent(.timeout, timeout, .{ io, timeout_ms });
+        if (cancel != null or parent != null) try race.concurrent(.cancel, cancelled, .{ io, cancel, parent });
+    }
+
+    const first = try race.await();
+    defer Run.clean(&race, gpa);
+    return switch (first) {
+        .request => |result| result,
+        .timeout => |result| blk: {
+            try result;
+            break :blk error.Timeout;
+        },
+        .cancel => |result| blk: {
+            try result;
+            break :blk error.Cancelled;
+        },
+    };
+}
+
+fn timeout(io: std.Io, ms: i64) std.Io.Cancelable!void {
+    return (std.Io.Clock.Duration{ .raw = .fromMilliseconds(ms), .clock = .awake }).sleep(io);
+}
+
+fn cancelled(io: std.Io, local: ?*const std.atomic.Value(bool), parent: ?*const std.atomic.Value(bool)) std.Io.Cancelable!void {
+    while (true) {
+        if (local) |flag| if (flag.load(.acquire)) return;
+        if (parent) |flag| if (flag.load(.acquire)) return;
+        try (std.Io.Clock.Duration{ .raw = .fromMilliseconds(25), .clock = .awake }).sleep(io);
+    }
+}
 
 pub const Hop = struct {
     status: u16,
@@ -44,6 +107,7 @@ pub const Hop = struct {
 
 /// ponytail: 8 hosts × 10 stamps. Evict the quietest host if we see more.
 pub const Limiter = struct {
+    mutex: std.atomic.Mutex = .unlocked,
     slots: [8]Slot = .{Slot{}} ** 8,
 
     const Slot = struct {
@@ -54,6 +118,8 @@ pub const Limiter = struct {
     };
 
     pub fn allow(self: *Limiter, host: []const u8, now: i64) bool {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         const window = now - 60;
         const s = self.find(host) orelse return false;
         var live: usize = 0;
@@ -113,17 +179,21 @@ pub fn guard(url: []const u8, buf: *[std.Io.net.HostName.max_len]u8) ![]const u8
 }
 
 pub fn guardResolved(io: std.Io, host: []const u8) !void {
+    _ = try resolveAddress(io, host, 443);
+}
+
+pub fn resolveAddress(io: std.Io, host: []const u8, port: u16) !std.Io.net.IpAddress {
     if (blockedLiteral(host)) return error.Blocked;
-    const name = std.Io.net.HostName.init(host) catch return;
+    const name = std.Io.net.HostName.init(host) catch return error.Blocked;
     var buf: [16]std.Io.net.HostName.LookupResult = undefined;
     var q: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buf);
-    name.lookup(io, &q, .{ .port = 443 }) catch return error.Blocked;
-    var any = false;
+    name.lookup(io, &q, .{ .port = port }) catch return error.Blocked;
+    var first: ?std.Io.net.IpAddress = null;
     while (q.getOne(io)) |r| {
         switch (r) {
             .address => |addr| {
-                any = true;
                 if (blockedAddr(addr)) return error.Blocked;
+                if (first == null) first = addr;
             },
             .canonical_name => {},
         }
@@ -131,10 +201,132 @@ pub fn guardResolved(io: std.Io, host: []const u8) !void {
         error.Closed => {},
         else => return error.Blocked,
     }
-    if (!any) return error.Blocked;
+    return first orelse error.Blocked;
+}
+
+pub fn resolveCancellable(io: std.Io, host: []const u8, cancel: ?*const std.atomic.Value(bool), parent: ?*const std.atomic.Value(bool)) !void {
+    const Race = union(enum) {
+        resolve: anyerror!void,
+        timeout: std.Io.Cancelable!void,
+        cancel: std.Io.Cancelable!void,
+    };
+    const Run = struct {
+        fn resolve(run_io: std.Io, name: []const u8) anyerror!void {
+            return guardResolved(run_io, name);
+        }
+
+        fn clean(race: *std.Io.Select(Race)) void {
+            while (race.cancel()) |late| switch (late) {
+                .resolve, .timeout, .cancel => |result| result catch {},
+            };
+        }
+    };
+
+    var ready: [3]Race = undefined;
+    var race = std.Io.Select(Race).init(io, &ready);
+    try race.concurrent(.resolve, Run.resolve, .{ io, host });
+    {
+        errdefer Run.clean(&race);
+        try race.concurrent(.timeout, timeout, .{ io, request_timeout_ms });
+        if (cancel != null or parent != null) try race.concurrent(.cancel, cancelled, .{ io, cancel, parent });
+    }
+
+    const first = try race.await();
+    defer Run.clean(&race);
+    return switch (first) {
+        .resolve => |result| result,
+        .timeout => |result| blk: {
+            try result;
+            break :blk error.Timeout;
+        },
+        .cancel => |result| blk: {
+            try result;
+            break :blk error.Cancelled;
+        },
+    };
 }
 
 pub fn fetch(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    get: Get,
+    limiter: *Limiter,
+    now: i64,
+    url: []const u8,
+    auth: ?[]const u8,
+) ![]u8 {
+    return fetchCancellable(gpa, io, get, limiter, now, url, auth, null, null);
+}
+
+pub fn fetchCancellable(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    get: Get,
+    limiter: *Limiter,
+    now: i64,
+    url: []const u8,
+    auth: ?[]const u8,
+    cancel: ?*const std.atomic.Value(bool),
+    parent: ?*const std.atomic.Value(bool),
+) ![]u8 {
+    return fetchFor(gpa, io, get, limiter, now, url, auth, request_timeout_ms, cancel, parent);
+}
+
+fn fetchFor(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    get: Get,
+    limiter: *Limiter,
+    now: i64,
+    url: []const u8,
+    auth: ?[]const u8,
+    timeout_ms: i64,
+    cancel: ?*const std.atomic.Value(bool),
+    parent: ?*const std.atomic.Value(bool),
+) ![]u8 {
+    const Race = union(enum) {
+        request: anyerror![]u8,
+        timeout: std.Io.Cancelable!void,
+        cancel: std.Io.Cancelable!void,
+    };
+    const Run = struct {
+        fn request(alloc: std.mem.Allocator, run_io: std.Io, transport: Get, limit: *Limiter, at: i64, target: []const u8, authorization: ?[]const u8) anyerror![]u8 {
+            return fetchInner(alloc, run_io, transport, limit, at, target, authorization);
+        }
+
+        fn clean(race: *std.Io.Select(Race), alloc: std.mem.Allocator) void {
+            while (race.cancel()) |late| switch (late) {
+                .request => |result| if (result) |body| alloc.free(body) else |_| {},
+                .timeout, .cancel => |result| result catch {},
+            };
+        }
+    };
+
+    var ready: [3]Race = undefined;
+    var race = std.Io.Select(Race).init(io, &ready);
+    try race.concurrent(.request, Run.request, .{ gpa, io, get, limiter, now, url, auth });
+    {
+        errdefer Run.clean(&race, gpa);
+        try race.concurrent(.timeout, timeout, .{ io, timeout_ms });
+        if (cancel != null or parent != null) try race.concurrent(.cancel, cancelled, .{ io, cancel, parent });
+    }
+
+    const first = try race.await();
+    defer Run.clean(&race, gpa);
+    return switch (first) {
+        .request => |result| result,
+        .timeout => |result| blk: {
+            try result;
+            break :blk error.Timeout;
+        },
+        .cancel => |result| blk: {
+            try result;
+            break :blk error.Cancelled;
+        },
+    };
+}
+
+fn fetchInner(
     gpa: std.mem.Allocator,
     io: std.Io,
     get: Get,
@@ -150,10 +342,11 @@ pub fn fetch(
     while (hop < max_hops) : (hop += 1) {
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         const host = try guard(current, &host_buf);
-        try guardResolved(io, host);
+        const uri = std.Uri.parse(current) catch return error.BadUrl;
+        const address = try resolveAddress(io, host, uri.port orelse 443);
         if (!limiter.allow(host, now)) return error.RateLimited;
 
-        var res = try get.request(gpa, current, header);
+        var res = try get.request(gpa, current, header, address);
         header = null; // never forward a secret across a redirect
         errdefer res.deinit(gpa);
 
@@ -165,11 +358,7 @@ pub fn fetch(
             current = next;
             continue;
         }
-        if (res.status < 200 or res.status >= 300) {
-            const msg = try std.fmt.allocPrint(gpa, "HTTP {d}", .{res.status});
-            res.deinit(gpa);
-            return msg;
-        }
+        try checkStatus(res.status);
         if (res.body.len > max_body) return error.ResponseTooLarge;
         const body = res.body;
         res.body = &.{};
@@ -177,6 +366,13 @@ pub fn fetch(
         return body;
     }
     return error.TooManyRedirects;
+}
+
+pub fn checkStatus(status: u16) !void {
+    if (status >= 200 and status < 300) return;
+    if (status == 429) return error.HttpThrottled;
+    if (status == 408 or status == 425 or status >= 500) return error.HttpTransient;
+    return error.HttpPermanent;
 }
 
 fn blockedName(host: []const u8) bool {
@@ -305,6 +501,22 @@ test "per-host rate limit is 10 per minute" {
     try testing.expect(lim.allow("example.com", 1000 + 61));
 }
 
+test "shared limiter stays exact under concurrent callers" {
+    const Run = struct {
+        fn run(lim: *Limiter, allowed: *std.atomic.Value(usize)) void {
+            for (0..10) |_| {
+                if (lim.allow("example.com", 1000)) _ = allowed.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var lim: Limiter = .{};
+    var allowed: std.atomic.Value(usize) = .init(0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Run.run, .{ &lim, &allowed });
+    for (threads) |thread| thread.join();
+    try testing.expectEqual(per_host_per_min, allowed.load(.acquire));
+}
+
 test "fetch returns the body of a 200" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -357,6 +569,108 @@ test "auth is dropped on redirect" {
     try testing.expect(!fake.auth_later);
 }
 
+test "a request is cancelled at its total deadline" {
+    const Slow = struct {
+        io: std.Io,
+
+        fn api(self: *@This()) Api {
+            return .{ .ptr = self, .call_fn = call };
+        }
+
+        fn call(ptr: *anyopaque, gpa: std.mem.Allocator, _: Api.Request) anyerror!Hop {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try (std.Io.Clock.Duration{ .raw = .fromMilliseconds(50), .clock = .awake }).sleep(self.io);
+            return .{ .status = 200, .body = try gpa.dupe(u8, "late") };
+        }
+    };
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var slow: Slow = .{ .io = io };
+    const req: Api.Request = .{
+        .method = .GET,
+        .url = "https://example.com",
+        .key = "test",
+    };
+    try testing.expectError(error.Timeout, timedFor(slow.api(), testing.allocator, io, req, 1, null, null));
+    var cancel: std.atomic.Value(bool) = .init(true);
+    try testing.expectError(error.Cancelled, timedFor(slow.api(), testing.allocator, io, req, 100, &cancel, null));
+}
+
+test "one deadline covers every redirect hop" {
+    const Slow = struct {
+        io: std.Io,
+        hops: u8 = 0,
+
+        fn get(self: *@This()) Get {
+            return .{ .ptr = self, .request_fn = request };
+        }
+
+        fn request(ptr: *anyopaque, gpa: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: ?std.Io.net.IpAddress) anyerror!Hop {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try (std.Io.Clock.Duration{ .raw = .fromMilliseconds(8), .clock = .awake }).sleep(self.io);
+            self.hops += 1;
+            if (self.hops < 4) return .{
+                .status = 302,
+                .body = try gpa.dupe(u8, ""),
+                .location = try gpa.dupe(u8, "https://8.8.8.8/next"),
+            };
+            return .{ .status = 200, .body = try gpa.dupe(u8, "late") };
+        }
+    };
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var slow: Slow = .{ .io = threaded.io() };
+    var limiter: Limiter = .{};
+    try testing.expectError(error.Timeout, fetchFor(
+        testing.allocator,
+        threaded.io(),
+        slow.get(),
+        &limiter,
+        1000,
+        "https://8.8.8.8/",
+        null,
+        15,
+        null,
+        null,
+    ));
+
+    var cancel: std.atomic.Value(bool) = .init(true);
+    var fresh_limiter: Limiter = .{};
+    try testing.expectError(error.Cancelled, fetchFor(
+        testing.allocator,
+        threaded.io(),
+        slow.get(),
+        &fresh_limiter,
+        1000,
+        "https://8.8.8.8/",
+        null,
+        100,
+        &cancel,
+        null,
+    ));
+}
+
+test "direct fetch rejects HTTP failure bodies" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var fake: FakeGet = .{ .status = 404, .body = "not found" };
+    defer fake.deinit(testing.allocator);
+    var limiter: Limiter = .{};
+    try testing.expectError(error.HttpPermanent, fetch(
+        testing.allocator,
+        threaded.io(),
+        fake.get(),
+        &limiter,
+        1000,
+        "https://8.8.8.8/missing",
+        null,
+    ));
+    try testing.expect(fake.pinned);
+}
+
 const FakeGet = struct {
     status: u16 = 200,
     body: []const u8 = "ok",
@@ -365,6 +679,7 @@ const FakeGet = struct {
     hop: u8 = 0,
     auth_first: bool = false,
     auth_later: bool = false,
+    pinned: bool = false,
 
     fn deinit(self: *FakeGet, gpa: std.mem.Allocator) void {
         if (self.seen) |s| gpa.free(s);
@@ -375,22 +690,21 @@ const FakeGet = struct {
         return .{ .ptr = self, .request_fn = request };
     }
 
-    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8) anyerror!Hop {
+    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8, address: ?std.Io.net.IpAddress) anyerror!Hop {
         const self: *FakeGet = @ptrCast(@alignCast(ptr));
         self.hop += 1;
+        self.pinned = address != null;
         if (auth != null) {
             if (self.hop == 1) self.auth_first = true else self.auth_later = true;
         }
         if (self.seen) |s| gpa.free(s);
         self.seen = try gpa.dupe(u8, url);
-        if (self.hop == 1) {
-            if (self.location) |l| {
-                return .{
-                    .status = self.status,
-                    .body = try gpa.dupe(u8, ""),
-                    .location = try gpa.dupe(u8, l),
-                };
-            }
+        if (self.hop == 1 and (self.status != 200 or self.location != null)) {
+            return .{
+                .status = self.status,
+                .body = try gpa.dupe(u8, self.body),
+                .location = if (self.location) |l| try gpa.dupe(u8, l) else null,
+            };
         }
         return .{
             .status = 200,
@@ -404,7 +718,29 @@ pub fn fromClient(client: *std.http.Client) Get {
     return .{ .ptr = client, .request_fn = stdRequest };
 }
 
-fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8) anyerror!Hop {
+pub fn pinnedConnection(client: *std.http.Client, uri: std.Uri, addr: std.Io.net.IpAddress) !*std.http.Client.Connection {
+    var remote_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const remote = uri.getHost(&remote_buf) catch return error.BadUrl;
+    var endpoint_buf: [96]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&endpoint_buf);
+    try addr.format(&writer);
+    const endpoint = writer.buffered();
+    const host_text = if (endpoint[0] == '[')
+        endpoint[1 .. std.mem.indexOfScalar(u8, endpoint, ']') orelse return error.BadUrl]
+    else
+        endpoint[0 .. std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.BadUrl];
+    const host = std.Io.net.HostName.init(host_text) catch return error.BadUrl;
+    const port = uri.port orelse 443;
+    return client.connectTcpOptions(.{
+        .host = host,
+        .port = port,
+        .protocol = .tls,
+        .proxied_host = remote,
+        .proxied_port = port,
+    });
+}
+
+fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[]const u8, address: ?std.Io.net.IpAddress) anyerror!Hop {
     const client: *std.http.Client = @ptrCast(@alignCast(ptr));
     const uri = std.Uri.parse(url) catch return error.BadUrl;
 
@@ -414,13 +750,25 @@ fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[
     else
         null;
 
+    var connection: ?*std.http.Client.Connection = null;
+    var handed_off = false;
+    defer if (!handed_off) if (connection) |conn| {
+        conn.closing = true;
+        client.connection_pool.release(conn, client.io);
+    };
+    if (address) |addr| {
+        connection = try pinnedConnection(client, uri, addr);
+    }
+
     var req = try client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
+        .connection = connection,
         .headers = .{
             .user_agent = .{ .override = "zoro/0.0" },
             .authorization = if (auth_header) |h| .{ .override = h } else .omit,
         },
     });
+    handed_off = true;
     defer req.deinit();
     try req.sendBodiless();
     // ponytail: Zig 0.16 ignores request timeouts; revisit when supported.

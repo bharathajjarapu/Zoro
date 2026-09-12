@@ -24,5 +24,8 @@ temp/
 .agents/
 .claude/
 .commandcode/
+TODO.md
+docs/
+RESEARCH.md
 AGENTS.md
 CLAUDE.md

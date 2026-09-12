@@ -38,7 +38,9 @@ fn runFetch(ctx: *Ctx, args: []const u8) anyerror![]u8 {
 
     var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     const host = try web.guard(url, &host_buf);
+    try web.resolveCancellable(ctx.io, host, ctx.cancel, ctx.cancel_parent);
     try allow(ctx, host);
+    try allow(ctx, "api.fetch.tinyfish.ai");
 
     var body: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer body.deinit();
@@ -68,11 +70,12 @@ fn runSearch(ctx: *Ctx, args: []const u8) anyerror![]u8 {
 fn call(ctx: *Ctx, method: std.http.Method, url: []const u8, body: ?[]const u8) ![]u8 {
     const api = ctx.web_api orelse return error.WebUnavailable;
     const key = ctx.tinyfish_key orelse return error.WebUnavailable;
-    var res = try api.call(ctx.gpa, .{ .method = method, .url = url, .key = key, .body = body });
+    var res = api.callCancellable(ctx.gpa, ctx.io, .{ .method = method, .url = url, .key = key, .body = body }, ctx.cancel, ctx.cancel_parent) catch |err| switch (err) {
+        error.OutOfMemory, error.Timeout, error.Cancelled, error.ResponseTooLarge, error.Blocked, error.HttpsOnly => return err,
+        else => return error.HttpTransient,
+    };
     defer res.deinit(ctx.gpa);
-    if (res.status < 200 or res.status >= 300) {
-        return std.fmt.allocPrint(ctx.gpa, "TinyFish HTTP {d}", .{res.status});
-    }
+    try web.checkStatus(res.status);
     const out = res.body;
     res.body = &.{};
     return out;
@@ -102,6 +105,7 @@ fn isUnreserved(c: u8) bool {
 const FakeApi = struct {
     reply: []const u8,
     status: u16 = 200,
+    fail: bool = false,
     called: bool = false,
     method: std.http.Method = .GET,
     key_ok: bool = false,
@@ -117,6 +121,7 @@ const FakeApi = struct {
     fn request(ptr: *anyopaque, gpa: std.mem.Allocator, req: web.Api.Request) anyerror!web.Hop {
         const self: *FakeApi = @ptrCast(@alignCast(ptr));
         self.called = true;
+        if (self.fail) return error.ConnectionResetByPeer;
         self.method = req.method;
         self.key_ok = std.mem.eql(u8, req.key, "tf-test");
         self.url_len = @min(req.url.len, self.url.len);
@@ -172,13 +177,13 @@ test "fetch_url returns TinyFish Markdown" {
     var limiter: web.Limiter = .{};
     var ctx = ctxOf(&db, threaded.io(), &fake, &limiter);
 
-    const out = try tools.call(&ctx, &tools.builtins, "fetch_url", "{\"url\":\"https://example.com/a?x=1\"}");
+    const out = try tools.call(&ctx, &tools.builtins, "fetch_url", "{\"url\":\"https://8.8.8.8/a?x=1\"}");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("# Example", out);
     try testing.expectEqual(std.http.Method.POST, fake.method);
     try testing.expect(fake.key_ok);
     try testing.expectEqualStrings(fetch_endpoint, fake.url[0..fake.url_len]);
-    try testing.expectEqualStrings("{\"urls\":[\"https://example.com/a?x=1\"],\"format\":\"markdown\"}", fake.body[0..fake.body_len]);
+    try testing.expectEqualStrings("{\"urls\":[\"https://8.8.8.8/a?x=1\"],\"format\":\"markdown\"}", fake.body[0..fake.body_len]);
 }
 
 test "fetch_url rejects private hosts before TinyFish" {
@@ -197,9 +202,14 @@ test "fetch_url rejects private hosts before TinyFish" {
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "Blocked") != null);
     try testing.expect(!fake.called);
+
+    const resolved = try tools.call(&ctx, &tools.builtins, "fetch_url", "{\"url\":\"https://localhost./\"}");
+    defer testing.allocator.free(resolved);
+    try testing.expect(std.mem.indexOf(u8, resolved, "Blocked") != null);
+    try testing.expect(!fake.called);
 }
 
-test "TinyFish HTTP failures keep their status" {
+test "TinyFish HTTP failures have distinct classes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path: [128]u8 = undefined;
@@ -211,7 +221,23 @@ test "TinyFish HTTP failures keep their status" {
     var limiter: web.Limiter = .{};
     var ctx = ctxOf(&db, threaded.io(), &fake, &limiter);
 
-    const out = try tools.call(&ctx, &tools.builtins, "search", "{\"query\":\"zig\"}");
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings("TinyFish HTTP 429", out);
+    const throttled = try tools.call(&ctx, &tools.builtins, "search", "{\"query\":\"zig\"}");
+    defer testing.allocator.free(throttled);
+    try testing.expectEqualStrings("tool error: HttpThrottled", throttled);
+
+    fake.status = 503;
+    const transient = try tools.call(&ctx, &tools.builtins, "search", "{\"query\":\"zig\"}");
+    defer testing.allocator.free(transient);
+    try testing.expectEqualStrings("tool error: HttpTransient", transient);
+
+    fake.status = 400;
+    const permanent = try tools.call(&ctx, &tools.builtins, "search", "{\"query\":\"zig\"}");
+    defer testing.allocator.free(permanent);
+    try testing.expectEqualStrings("tool error: HttpPermanent", permanent);
+
+    fake.status = 200;
+    fake.fail = true;
+    const transport = try tools.call(&ctx, &tools.builtins, "search", "{\"query\":\"zig\"}");
+    defer testing.allocator.free(transport);
+    try testing.expectEqualStrings("tool error: HttpTransient", transport);
 }

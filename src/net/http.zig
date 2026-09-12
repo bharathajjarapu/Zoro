@@ -57,26 +57,35 @@ pub const StdHttp = struct {
 
     fn webCall(ptr: *anyopaque, gpa: std.mem.Allocator, req: web.Api.Request) anyerror!web.Hop {
         const self: *StdHttp = @ptrCast(@alignCast(ptr));
-        var cap: CappedBody = undefined;
-        cap.init(gpa, max_body);
-        defer cap.deinit();
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host = try web.guard(req.url, &host_buf);
+        const uri = std.Uri.parse(req.url) catch return error.BadUrl;
+        const address = try web.resolveAddress(self.client.io, host, uri.port orelse 443);
+        const connection = try web.pinnedConnection(&self.client, uri, address);
+        var handed_off = false;
+        defer if (!handed_off) {
+            connection.closing = true;
+            self.client.connection_pool.release(connection, self.client.io);
+        };
         const key = [_]std.http.Header{.{ .name = "X-API-Key", .value = req.key }};
-        const result = self.client.fetch(.{
-            .location = .{ .url = req.url },
-            .method = req.method,
-            .payload = req.body,
+        var request = try self.client.request(req.method, uri, .{
+            .connection = connection,
             .headers = .{
                 .content_type = if (req.body != null) .{ .override = "application/json" } else .omit,
                 .user_agent = .{ .override = "zoro/0.0" },
             },
             .extra_headers = &key,
             .redirect_behavior = .unhandled,
-            .response_writer = &cap.writer,
-        }) catch |err| {
-            if (cap.overflow) return error.ResponseTooLarge;
-            return err;
+        });
+        handed_off = true;
+        defer request.deinit();
+        if (req.body) |body| try request.sendBodyComplete(@constCast(body)) else try request.sendBodiless();
+        var response = try request.receiveHead(&.{});
+        const body = response.reader(&.{}).allocRemaining(gpa, .limited(max_body)) catch |err| switch (err) {
+            error.StreamTooLong => return error.ResponseTooLarge,
+            else => return err,
         };
-        return .{ .status = @intFromEnum(result.status), .body = try cap.take() };
+        return .{ .status = @intFromEnum(response.head.status), .body = body };
     }
 };
 
