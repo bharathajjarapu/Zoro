@@ -389,7 +389,7 @@ const Rig = struct {
         self.threaded = .init(testing.allocator, .{});
         const path = try testkit.tmpPath(&self.tmp, &self.path, "zoro.db");
         self.main_db = try Db.open(path);
-        try self.main_db.migrate();
+        try self.main_db.initSchema();
         self.owner_fake = .{ .bodies = &.{} };
 
         var protos: [max_live]agent.Agent = undefined;

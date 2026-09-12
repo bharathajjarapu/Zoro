@@ -105,7 +105,7 @@ test "remember then recall round-trips a fact" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try tmpPath(&tmp, &buf));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 

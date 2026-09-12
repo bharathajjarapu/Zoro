@@ -4,7 +4,7 @@ const config = @import("app/config.zig");
 const Db = @import("data/db.zig").Db;
 const task_data = @import("data/tasks.zig");
 const agent = @import("agent/root.zig");
-const cli = @import("app/cli.zig");
+const cli = @import("channel/cli.zig");
 const telegram = @import("channel/telegram.zig");
 const tools = @import("tools/root.zig");
 const learning_tools = @import("tools/learning.zig");
@@ -17,7 +17,6 @@ const log = std.log.scoped(.zoro);
 /// Kept in step with `build.zig.zon` by hand.
 const version = "0.0.0";
 
-/// Zig supplies process memory, arguments, and I/O.
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
         // Already reported in the owner's terms; a stack trace would only bury it.
@@ -78,7 +77,7 @@ fn daemon(init: std.process.Init) !void {
 
     var db = try openDb(init.io, cfg.data_dir);
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     var lock = try telegram.tryLock(init.io, cfg.data_dir) orelse {
         log.err("telegram already running on this machine", .{});
@@ -309,7 +308,7 @@ const Store = struct {
         try createRuntimeDirs(p.io, self.cfg);
         self.db = try openDb(p.io, self.cfg.data_dir);
         errdefer self.db.close();
-        try self.db.migrate();
+        try self.db.initSchema();
     }
 
     /// The returned writer borrows `self.out_buf`.
@@ -444,7 +443,7 @@ test {
     _ = @import("data/db.zig");
     _ = @import("app/config.zig");
     _ = @import("agent/root.zig");
-    _ = @import("app/cli.zig");
+    _ = @import("channel/cli.zig");
     _ = @import("channel/telegram.zig");
     _ = @import("data/memory.zig");
     _ = @import("tools/root.zig");

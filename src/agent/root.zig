@@ -1252,7 +1252,7 @@ test "a picture reaches the base model with its caption, and is not persisted" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try std.fmt.bufPrintZ(&buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path}));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 

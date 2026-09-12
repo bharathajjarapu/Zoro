@@ -404,7 +404,7 @@ test "a task survives reopen and carries a success criterion" {
     const id = blk: {
         var db = try Db.open(path);
         defer db.close();
-        try db.migrate();
+        try db.initSchema();
         break :blk try create(&db, "book the vet", "appointment confirmed for next week", 1000, null, 1);
     };
 
@@ -491,7 +491,7 @@ test "an interrupted approval becomes uncertain" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
     const id = try ask(&db, "shell", "{}", null, "run it", null, 1);
     try authorize(&db, id, "shell", "{}", 2);
     try recoverApprovals(&db, 2);
@@ -521,7 +521,7 @@ test "approvals survive reopen" {
     {
         var db = try Db.open(path);
         defer db.close();
-        try db.migrate();
+        try db.initSchema();
         _ = try ask(&db, "fetch_url", "{}", "h", "why", null, 10);
     }
     var db = try Db.open(path);

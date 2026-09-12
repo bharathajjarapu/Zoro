@@ -68,10 +68,10 @@ pub fn tmpPath(tmp: *testing.TmpDir, buf: []u8, name: []const u8) ![:0]u8 {
     return std.fmt.bufPrintZ(buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
-/// An open, migrated database in the test's temp directory.
+/// An open database in the test's temp directory.
 pub fn tmpDb(tmp: *testing.TmpDir, buf: []u8) !Db {
     var db = try Db.open(try tmpPath(tmp, buf, "zoro.db"));
     errdefer db.close();
-    try db.migrate();
+    try db.initSchema();
     return db;
 }

@@ -363,7 +363,7 @@ const Harness = struct {
         const path = try std.fmt.bufPrintZ(&self.path_buf, ".zig-cache/tmp/{s}/zoro.db", .{self.tmp.sub_path});
         self.db = try Db.open(path);
         errdefer self.db.close();
-        try self.db.migrate();
+        try self.db.initSchema();
         self.agent = .{
             .gpa = testing.allocator,
             .io = self.threaded.io(),
@@ -390,7 +390,7 @@ test "zoro routines shows tier state and the runs that were skipped" {
     const path = try std.fmt.bufPrintZ(&buf, ".zig-cache/tmp/{s}/zoro.db", .{tmp.sub_path});
     var db = try Db.open(path);
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();

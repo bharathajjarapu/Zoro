@@ -231,7 +231,7 @@ test "proposal transitions require a pending proposal" {
     var path: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &path, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     const id = try create(&db, "skill-weather", null, null, "Owner asked twice.", "Reuse forecast workflow.", null, "---\nname: weather\ndescription: Forecast\n---\nFetch weather.", 1);
     try setStatus(&db, id, .rejected, 2);
@@ -250,7 +250,7 @@ test "apply and rollback have durable intermediate states" {
     var path: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &path, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     const old = hash("");
     const next = hash("new");

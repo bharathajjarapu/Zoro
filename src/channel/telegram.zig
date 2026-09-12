@@ -1256,7 +1256,7 @@ const Harness = struct {
         const path = try std.fmt.bufPrintZ(&self.path_buf, ".zig-cache/tmp/{s}/zoro.db", .{self.tmp.sub_path});
         self.db = try Db.open(path);
         errdefer self.db.close();
-        try self.db.migrate();
+        try self.db.initSchema();
         self.agent = .{
             .gpa = testing.allocator,
             .io = self.threaded.io(),

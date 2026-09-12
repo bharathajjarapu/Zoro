@@ -90,7 +90,7 @@ test "the model-visible list is names only" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "weather_api_key", "sk-secret-value", "api.weather.com", 1000);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -106,7 +106,7 @@ test "the value is attached only to its approved host" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "weather_api_key", "sk-secret-value", "api.weather.com", 1000);
     {
@@ -124,7 +124,7 @@ test "storing a secret scrubs it from the transcript" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     var ins = try db.prepare("INSERT INTO messages(role, content, created) VALUES ('user', ?, 1)");
     defer ins.finalize();
@@ -146,7 +146,7 @@ test "redact strips secret values from text" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "weather_api_key", "sk-secret-value", "api.weather.com", 1000);
     const out = try redact(&db, testing.allocator, "the key is sk-secret-value");

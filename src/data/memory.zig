@@ -489,7 +489,7 @@ test "a fact survives closing and reopening the database" {
     {
         var db = try Db.open(path);
         defer db.close();
-        try db.migrate();
+        try db.initSchema();
         try put(&db, "pet", "a black cat named mittens", .owner, 1000, null);
     }
 
@@ -506,7 +506,7 @@ test "porter stemming matches inflections" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "cal", "booked the appointment for tuesday", .owner, 1000, null);
     const hits = try search(&db, testing.allocator, "appointments", 1000, 8);
@@ -521,7 +521,7 @@ test "an alias makes vet find veterinarian" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "clinic", "the veterinarian is on oak street", .owner, 1000, null);
     {
@@ -542,7 +542,7 @@ test "alias expansion keeps other query terms" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "weather", "the weather is nice today", .owner, 1000, null);
     try put(&db, "clinic", "the veterinarian is on oak street", .owner, 1000, null);
@@ -559,7 +559,7 @@ test "raw messages are never indexed" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "pet", "a black cat named mittens", .owner, 1000, null);
     try db.exec("INSERT INTO messages(role, content, created) VALUES ('user', 'secretwordxyz never in a fact', 1000)");
@@ -580,7 +580,7 @@ test "diary entries are indexed" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try indexDiary(&db, "2026-08-21", "walked the dog at sunrise", 1000);
     const hits = try search(&db, testing.allocator, "walked", 1000, 8);
@@ -596,7 +596,7 @@ test "expired facts are not returned" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "temp", "the plumber comes on friday", .owner, 10, 50);
     try testing.expect(try get(&db, testing.allocator, "temp", 50) == null);
@@ -621,7 +621,7 @@ test "an inferred fact does not overwrite an owner statement" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "clinic", "oak street", .owner, 1000, null);
     try put(&db, "clinic", "maple street", .inferred, 2000, null);
@@ -644,7 +644,7 @@ test "forget removes a fact from lookup and search" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "pet", "a black cat named mittens", .owner, 1000, null);
     try forget(&db, "pet");
@@ -660,7 +660,7 @@ test "owner facts rank above inferred facts with the same text" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "guess", "the cat sat on the mat", .inferred, 1000, null);
     try put(&db, "told", "the cat sat on the mat", .owner, 1000, null);
@@ -677,7 +677,7 @@ test "recent facts rank above older facts with the same text" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     const month: i64 = 30 * 24 * 60 * 60;
     try put(&db, "old", "the cat sat on the mat", .inferred, 1000, null);
@@ -695,7 +695,7 @@ test "compaction writes a diary file and deletes that day's messages" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -734,7 +734,7 @@ test "a failure at each compaction step leaves raw messages intact" {
         var buf: [128]u8 = undefined;
         var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
         defer db.close();
-        try db.migrate();
+        try db.initSchema();
 
         var threaded: std.Io.Threaded = .init(testing.allocator, .{});
         defer threaded.deinit();
@@ -766,7 +766,7 @@ test "compaction can be retried after a failed commit" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -800,7 +800,7 @@ test "compaction redacts secret values from the diary" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -826,7 +826,7 @@ test "a fact is found by its own key, not only by its value" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "landlord", "Priya", .owner, 100, null);
 
@@ -838,32 +838,13 @@ test "a fact is found by its own key, not only by its value" {
     }
 }
 
-test "an existing database re-indexes its facts on upgrade" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [128]u8 = undefined;
-    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
-    defer db.close();
-
-    try db.exec("BEGIN;\n" ++ @embedFile("schema.sql") ++ "\nPRAGMA user_version = 1;\nCOMMIT;");
-    try db.exec(
-        \\INSERT INTO facts(key, value, source, created, updated) VALUES ('landlord', 'Priya', 'owner', 1, 1);
-        \\INSERT INTO chunks(text, kind, ref) VALUES ('Priya', 'fact', 'landlord');
-    );
-    try db.migrate();
-
-    const hits = try search(&db, testing.allocator, "landlord", 200, 8);
-    defer freeHits(testing.allocator, hits);
-    try testing.expectEqual(@as(usize, 1), hits.len);
-}
-
 test "an alias makes the owner's shorthand recall the full word" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     try put(&db, "clinic", "the veterinarian on Third Street", .owner, 100, null);
 

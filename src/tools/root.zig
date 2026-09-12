@@ -296,7 +296,7 @@ test "invalid arguments are rejected before the tool runs" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -313,7 +313,7 @@ test "a failing tool returns an error result instead of crashing" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -331,7 +331,7 @@ test "tool output is truncated at the cap with a visible marker" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -349,7 +349,7 @@ test "unknown tool is an error result" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -374,7 +374,7 @@ test "store_secret scrubs the value and keeps the name" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -424,7 +424,7 @@ test "a gated tool is invisible to the model and reachable only once approved" {
     var buf: [128]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 

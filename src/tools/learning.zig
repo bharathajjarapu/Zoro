@@ -472,7 +472,7 @@ test "learning evidence must quote the current owner message" {
     var db_buf: [160]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &db_buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
     try db.exec("INSERT INTO messages(role, content, owner_text, created) VALUES ('user', 'attachment plus prompt', 'Please remember concise replies.', 1)");
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -502,7 +502,7 @@ test "reconcile commits an interrupted skill apply" {
     var db_buf: [192]u8 = undefined;
     var db = try Db.open(try testkit.tmpPath(&tmp, &db_buf, "zoro.db"));
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     const markdown = "---\nname: weather\ndescription: Forecast\n---\nFetch weather.";
     const id = try learning.create(&db, "skill-weather", null, null, "Owner asked.", "Useful.", null, markdown, 1);

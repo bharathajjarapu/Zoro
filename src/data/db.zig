@@ -4,18 +4,6 @@ const testing = std.testing;
 
 const log = std.log.scoped(.db);
 
-/// Append migrations; never edit shipped steps.
-const steps = [_][:0]const u8{
-    @embedFile("schema.sql"),
-    @embedFile("migrations/002.sql"),
-    @embedFile("migrations/003.sql"),
-    @embedFile("migrations/004.sql"),
-    @embedFile("migrations/005.sql"),
-    @embedFile("migrations/006.sql"),
-    @embedFile("migrations/007.sql"),
-    @embedFile("migrations/008.sql"),
-};
-
 /// A SQLite connection. One per thread; WAL lets several coexist on one file.
 pub const Db = struct {
     ptr: *c.sqlite3,
@@ -69,26 +57,11 @@ pub const Db = struct {
         }
     }
 
-    /// Applies pending migrations atomically.
-    pub fn migrate(self: *Db) !void {
-        const done = blk: {
-            var q = try self.prepare("PRAGMA user_version");
-            defer q.finalize();
-            if (!try q.step()) return error.Sqlite;
-            // Clamp externally editable user_version values.
-            break :blk @as(usize, @intCast(@max(0, q.int(0))));
-        };
-        if (done >= steps.len) return;
-
-        for (steps[done..], done + 1..) |sql, level| {
-            var buf: [48]u8 = undefined;
-            const bump = try std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{level});
-            try self.exec("BEGIN;");
-            errdefer self.exec("ROLLBACK;") catch {};
-            try self.exec(sql);
-            try self.exec(bump);
-            try self.exec("COMMIT;");
-        }
+    pub fn initSchema(self: *Db) !void {
+        try self.exec("BEGIN;");
+        errdefer self.exec("ROLLBACK;") catch {};
+        try self.exec(@embedFile("schema.sql"));
+        try self.exec("COMMIT;");
     }
 
     pub fn lastId(self: *Db) i64 {
@@ -202,16 +175,16 @@ test "open turns on WAL and foreign keys" {
     try testing.expectEqual(@as(i64, 1), fk.int(0));
 }
 
-test "migrate creates every table and is idempotent" {
+test "schema creates every table and is idempotent" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
     var db = try tmpDb(&tmp, &buf);
     defer db.close();
 
-    try db.migrate();
+    try db.initSchema();
     try db.exec("INSERT INTO kv(key, value) VALUES ('tg_offset', '42')");
-    try db.migrate(); // a no-op: no error, and it must not wipe what is there
+    try db.initSchema();
     try testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM kv"));
 
     var q = try db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'chunks_%' ORDER BY name");
@@ -248,7 +221,7 @@ test "deleting a task cascades to its children and approvals" {
     var buf: [128]u8 = undefined;
     var db = try tmpDb(&tmp, &buf);
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     var ins = try db.prepare(
         \\INSERT INTO tasks(id, parent, status, summary, goal, model, created)
@@ -285,7 +258,7 @@ test "bind copies text, so a caller's buffer need not outlive the step" {
     var buf: [128]u8 = undefined;
     var db = try tmpDb(&tmp, &buf);
     defer db.close();
-    try db.migrate();
+    try db.initSchema();
 
     var scratch: [9]u8 = "tg_offset".*;
     var ins = try db.prepare("INSERT INTO kv(key, value) VALUES (?, 'x')");
@@ -298,20 +271,4 @@ test "bind copies text, so a caller's buffer need not outlive the step" {
     defer q.finalize();
     try testing.expect(try q.step());
     try testing.expectEqualStrings("tg_offset", q.text(0));
-}
-
-test "an old database is upgraded in place instead of rebuilt" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [128]u8 = undefined;
-    var db = try tmpDb(&tmp, &buf);
-    defer db.close();
-
-    try db.exec("BEGIN;\n" ++ @embedFile("schema.sql") ++ "\nPRAGMA user_version = 1;\nCOMMIT;");
-    try db.exec("INSERT INTO kv(key, value) VALUES ('tg_offset', '42')");
-
-    try db.migrate();
-    try testing.expectEqual(@as(i64, 42), try scalar(&db, "SELECT value FROM kv WHERE key = 'tg_offset'"));
-    try testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT count(*) FROM outbox"));
-    try testing.expectEqual(@as(i64, steps.len), try scalar(&db, "PRAGMA user_version"));
 }
