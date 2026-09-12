@@ -172,9 +172,10 @@ update path. The shell accepts JSON argument arrays, uses pinned executables and
 a clean environment, and kills the process group on timeout or cancellation.
 
 Telegram uses long polling for one private owner chat. Accepted updates and
-outgoing messages are durable. It supports replies, conservative HTML, bounded
-message splitting, callbacks, progress and stop controls, native media sends,
-guarded incoming files, locations, stickers, reactions, and BotFather commands.
+outgoing messages are durable. Internal work and recovery state stays out of
+the chat. It supports natural typing indicators, `/stop`, conservative HTML,
+bounded message splitting, callbacks, native media sends, guarded incoming
+files, locations, stickers, and BotFather commands.
 Static sticker images and ordinary photos use the configured base model's image
 input. Voice and other media are saved; transcription requires an explicitly
 supported model path.

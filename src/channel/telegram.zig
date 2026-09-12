@@ -323,9 +323,6 @@ pub const Bot = struct {
     /// The one directory an outbound attachment may come from.
     workspace: []const u8 = "workspace",
     inbox: []const u8 = "inbox",
-    reactions: bool = true,
-    progress_id: ?i64 = null,
-    delivery_failed: bool = false,
     cancel: ?*const std.atomic.Value(bool) = null,
     shutdown: ?*const fn () bool = null,
 
@@ -358,7 +355,6 @@ pub const Bot = struct {
                 if (err == error.TurnCancelled) {
                     try updateStatus(self.db, u.update_id, "cancelled", now);
                     try self.flush();
-                    self.finishProgress("Stopped.") catch |finish_err| log.warn("progress: {t}", .{finish_err});
                     continue;
                 }
                 try updateStatus(self.db, u.update_id, "failed", now);
@@ -366,9 +362,6 @@ pub const Bot = struct {
             };
             try updateStatus(self.db, u.update_id, "completed", now);
             try self.flush();
-            self.finishProgress(if (self.delivery_failed) "Delivery failed." else "Done.") catch |err| log.warn("progress: {t}", .{err});
-            if (self.reactions and u.message_id != 0 and u.kind != .callback and u.kind != .reaction)
-                self.react(u.message_id, if (self.delivery_failed) "👎" else "👍") catch |err| log.warn("reaction: {t}", .{err});
         }
         if (batch.next_offset) |n| try saveOffset(self.db, n);
     }
@@ -378,7 +371,6 @@ pub const Bot = struct {
         defer self.shutdown = null;
         try outbox.recover(self.db);
         try self.recoverUpdates();
-        self.recoverProgress() catch |err| log.warn("progress recovery: {t}", .{err});
         self.setCommands() catch |err| log.warn("commands: {t}", .{err});
         while (!stop()) {
             self.flush() catch |err| log.warn("outbox: {t}", .{err});
@@ -400,13 +392,6 @@ pub const Bot = struct {
 
     fn recoverUpdates(self: *Bot) !void {
         try self.db.exec("UPDATE telegram_updates SET status = 'uncertain', updated = unixepoch() WHERE status = 'processing';");
-        if (cChanges(self.db) > 0) try outbox.push(
-            self.db,
-            .text,
-            null,
-            "A Telegram turn was interrupted. I did not repeat it because its effects are uncertain.",
-            std.Io.Timestamp.now(self.io, .real).toSeconds(),
-        );
 
         const pending = try loadPending(self.db, self.gpa, self.owner_id, self.chat_id);
         defer freeUpdates(self.gpa, pending);
@@ -438,7 +423,6 @@ pub const Bot = struct {
                 if (stopped) tasks.setStatus(self.db, id, .cancelled) catch {};
                 try outbox.pushReply(self.db, .text, null, if (stopped) "Stopping that task." else "That task is no longer running.", u.message_id, now);
             },
-            'x' => try outbox.pushReply(self.db, .text, null, "That turn is no longer running.", u.message_id, now),
             'r' => {
                 const queued = try outbox.retryDelivery(self.db, id);
                 try outbox.pushReply(self.db, .text, null, if (queued) "Queued one retry." else "That delivery cannot be retried.", u.message_id, now);
@@ -456,6 +440,10 @@ pub const Bot = struct {
         if (std.mem.eql(u8, text, "/new")) {
             try self.db.exec("DELETE FROM messages;");
             try self.queueReply(u.message_id, "Started a new conversation.");
+            return true;
+        }
+        if (std.mem.eql(u8, text, "/stop")) {
+            try self.queueReply(u.message_id, "Nothing is running right now.");
             return true;
         }
         const learn = "/learn sticker ";
@@ -563,43 +551,10 @@ pub const Bot = struct {
         try ensureOk(self.gpa, body);
     }
 
-    fn react(self: *Bot, message_id: i64, emoji: []const u8) !void {
-        const req = try buildReaction(self.gpa, self.chat_id, message_id, emoji);
-        defer self.gpa.free(req);
-        const body = try self.call("setMessageReaction", req);
-        defer self.gpa.free(body);
-        try ensureOk(self.gpa, body);
-    }
-
     fn setCommands(self: *Bot) !void {
         const body = try self.call("setMyCommands", commands_json);
         defer self.gpa.free(body);
         try ensureOk(self.gpa, body);
-    }
-
-    fn startProgress(self: *Bot, reply_id: i64, turn_id: i64) !i64 {
-        const req = try buildProgress(self.gpa, self.chat_id, reply_id, "Working…", turn_id);
-        defer self.gpa.free(req);
-        const body = try self.callWith(self.live_http.?, "sendMessage", req);
-        defer self.gpa.free(body);
-        return messageId(self.gpa, body) orelse error.InvalidTelegramResponse;
-    }
-
-    fn finishProgress(self: *Bot, text: []const u8) !void {
-        const id = self.progress_id orelse return;
-        const http = self.live_http orelse return;
-        const req = try buildEditProgress(self.gpa, self.chat_id, id, text);
-        defer self.gpa.free(req);
-        const body = try self.callWith(http, "editMessageText", req);
-        defer self.gpa.free(body);
-        try ensureOk(self.gpa, body);
-        try clearProgress(self.db);
-        self.progress_id = null;
-    }
-
-    fn recoverProgress(self: *Bot) !void {
-        self.progress_id = try loadProgress(self.db);
-        try self.finishProgress("Interrupted.");
     }
 
     /// Failed image downloads still produce a text turn.
@@ -632,8 +587,6 @@ pub const Bot = struct {
         var stop_update: std.atomic.Value(i64) = .init(0);
         var activity_thread: ?std.Thread = null;
         if (self.live_http != null) {
-            self.progress_id = self.startProgress(u.message_id, u.update_id) catch null;
-            if (self.progress_id) |id| try saveProgress(self.db, id);
             activity_thread = try std.Thread.spawn(.{}, activity, .{ self, &cancel, &done, &stop_update, u.update_id + 1 });
         }
 
@@ -647,7 +600,7 @@ pub const Bot = struct {
         if (stop_update.load(.acquire) != 0) try recordStop(self.db, stop_update.load(.acquire), std.Io.Timestamp.now(self.io, .real).toSeconds());
         const reply = result catch |err| {
             if (err != error.Cancelled) return err;
-            try self.queueReply(u.message_id, "Stopped.");
+            try self.queueReply(u.message_id, "Okay, I stopped.");
             return error.TurnCancelled;
         };
         defer self.gpa.free(reply);
@@ -660,13 +613,12 @@ pub const Bot = struct {
             const id = try std.fmt.bufPrint(&id_buf, "{d}", .{pending_id});
             try outbox.pushReply(self.db, .approval, id, reply, u.message_id, now);
         } else {
-            try outbox.pushReply(self.db, .text, null, reply, u.message_id, now);
+            try outbox.push(self.db, .text, null, reply, now);
         }
     }
 
     /// Sends queued owner output.
     fn flush(self: *Bot) !void {
-        self.delivery_failed = false;
         var drained: usize = 0;
         while (drained < outbox.max_drain) {
             const n = try self.flushBatch();
@@ -698,7 +650,6 @@ pub const Bot = struct {
     }
 
     fn failDelivery(self: *Bot, id: i64, err: anyerror) !void {
-        self.delivery_failed = true;
         if (retryableDelivery(err)) {
             try outbox.retry(self.db, id, @errorName(err));
         } else if (err == error.TelegramRejected or err == error.TelegramApiError or err == error.InvalidTelegramResponse or
@@ -896,29 +847,17 @@ fn activity(
         var batch = parseUpdates(self.gpa, body) catch return;
         defer batch.deinit(self.gpa);
         for (batch.items) |u| {
-            if (u.kind != .callback) continue;
-            const allowed = admit(u, self.owner_id, self.chat_id);
-            var stop_buf: [32]u8 = undefined;
-            const expected = std.fmt.bufPrint(&stop_buf, "x:{d}", .{offset - 1}) catch return;
-            const stop = allowed and std.mem.eql(u8, u.callback_data orelse "", expected);
-            if (allowed and !stop) continue;
-            const ack = jsonBody(self.gpa, .{
-                .callback_query_id = u.callback_id.?,
-                .text = if (stop) "Stopping" else "Not allowed",
-            }) catch continue;
-            const ack_reply = self.callWith(http, "answerCallbackQuery", ack) catch {
-                self.gpa.free(ack);
-                continue;
-            };
-            self.gpa.free(ack);
-            self.gpa.free(ack_reply);
-            if (stop) {
-                stop_update.store(u.update_id, .release);
-                cancel.stop.store(true, .release);
-                return;
-            }
+            if (!admit(u, self.owner_id, self.chat_id) or u.kind != .text or !stopText(u.text)) continue;
+            stop_update.store(u.update_id, .release);
+            cancel.stop.store(true, .release);
+            return;
         }
     }
+}
+
+fn stopText(text: []const u8) bool {
+    const value = std.mem.trim(u8, text, &std.ascii.whitespace);
+    return std.ascii.eqlIgnoreCase(value, "stop") or std.ascii.eqlIgnoreCase(value, "/stop");
 }
 
 fn retryableDelivery(err: anyerror) bool {
@@ -1018,46 +957,13 @@ fn timedPost(
 fn recordStop(db: *Db, id: i64, now: i64) !void {
     var q = try db.prepare(
         \\INSERT OR IGNORE INTO telegram_updates(id, status, text, created, updated, kind, callback_data)
-        \\VALUES (?, 'completed', '', ?, ?, 'callback', 'stop')
+        \\VALUES (?, 'completed', '/stop', ?, ?, 'text', NULL)
     );
     defer q.finalize();
     try q.bind(1, id);
     try q.bind(2, now);
     try q.bind(3, now);
     _ = try q.step();
-}
-
-fn saveProgress(db: *Db, id: i64) !void {
-    var q = try db.prepare(
-        \\INSERT INTO kv(key, value) VALUES ('tg_progress', ?)
-        \\ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    );
-    defer q.finalize();
-    var buf: [32]u8 = undefined;
-    try q.bind(1, try std.fmt.bufPrint(&buf, "{d}", .{id}));
-    _ = try q.step();
-}
-
-fn loadProgress(db: *Db) !?i64 {
-    var q = try db.prepare("SELECT value FROM kv WHERE key = 'tg_progress'");
-    defer q.finalize();
-    if (!try q.step()) return null;
-    return std.fmt.parseInt(i64, q.text(0), 10) catch error.InvalidProgress;
-}
-
-fn clearProgress(db: *Db) !void {
-    try db.exec("DELETE FROM kv WHERE key = 'tg_progress';");
-}
-
-fn messageId(gpa: std.mem.Allocator, body: []const u8) ?i64 {
-    const Reply = struct {
-        ok: bool = false,
-        result: struct { message_id: ?i64 = null } = .{},
-    };
-    const parsed = std.json.parseFromSlice(Reply, gpa, body, .{ .ignore_unknown_fields = true }) catch return null;
-    defer parsed.deinit();
-    if (!parsed.value.ok) return null;
-    return parsed.value.result.message_id;
 }
 
 fn endpoint(gpa: std.mem.Allocator, token: []const u8, method: []const u8) ![]u8 {
@@ -1163,28 +1069,6 @@ fn buildSendMessage(gpa: std.mem.Allocator, chat_id: i64, text: []const u8, repl
     });
 }
 
-fn buildProgress(gpa: std.mem.Allocator, chat_id: i64, reply_id: i64, text: []const u8, turn_id: i64) ![]u8 {
-    var stop_buf: [32]u8 = undefined;
-    const button = [_]Button{.{ .text = "Stop", .callback_data = try std.fmt.bufPrint(&stop_buf, "x:{d}", .{turn_id}) }};
-    const rows = [_][]const Button{&button};
-    return jsonBody(gpa, SendMessageRequest{
-        .chat_id = chat_id,
-        .text = text,
-        .reply_parameters = .{ .message_id = reply_id },
-        .reply_markup = .{ .inline_keyboard = &rows },
-    });
-}
-
-fn buildEditProgress(gpa: std.mem.Allocator, chat_id: i64, message_id: i64, text: []const u8) ![]u8 {
-    return jsonBody(gpa, .{
-        .chat_id = chat_id,
-        .message_id = message_id,
-        .text = text,
-        .parse_mode = "HTML",
-        .reply_markup = Markup{ .inline_keyboard = &.{} },
-    });
-}
-
 fn buildFileId(gpa: std.mem.Allocator, chat_id: i64, field_name: []const u8, file_id: []const u8, reply_id: ?i64) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -1193,12 +1077,6 @@ fn buildFileId(gpa: std.mem.Allocator, chat_id: i64, field_name: []const u8, fil
     if (reply_id) |id| try out.writer.print(",\"reply_parameters\":{{\"message_id\":{d}}}", .{id});
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
-}
-
-fn buildReaction(gpa: std.mem.Allocator, chat_id: i64, message_id: i64, emoji: []const u8) ![]u8 {
-    const Reaction = struct { type: []const u8 = "emoji", emoji: []const u8 };
-    const reactions = [_]Reaction{.{ .emoji = emoji }};
-    return jsonBody(gpa, .{ .chat_id = chat_id, .message_id = message_id, .reaction = &reactions });
 }
 
 const commands_json =
@@ -1314,7 +1192,7 @@ fn sniff(bytes: []const u8) []const u8 {
 }
 
 fn buildGetUpdates(gpa: std.mem.Allocator, offset: ?i64) ![]u8 {
-    const allowed = [_][]const u8{ "message", "edited_message", "callback_query", "message_reaction" };
+    const allowed = [_][]const u8{ "message", "edited_message", "callback_query" };
     return jsonBody(gpa, GetUpdatesRequest{
         .offset = offset,
         .timeout = poll_timeout,
@@ -1323,7 +1201,7 @@ fn buildGetUpdates(gpa: std.mem.Allocator, offset: ?i64) ![]u8 {
 }
 
 fn buildCancelUpdates(gpa: std.mem.Allocator, offset: i64) ![]u8 {
-    const allowed = [_][]const u8{"callback_query"};
+    const allowed = [_][]const u8{"message"};
     return jsonBody(gpa, GetUpdatesRequest{
         .offset = offset,
         .timeout = 1,
@@ -1397,7 +1275,6 @@ const Harness = struct {
             .token = .init("123:abc"),
             .owner_id = 42,
             .chat_id = 42,
-            .reactions = false,
         };
     }
 
@@ -1477,6 +1354,7 @@ test "pollOnce sends the reply via sendMessage" {
     try testing.expect(std.mem.indexOf(u8, h.tg.sentUrl(), "sendMessage") != null);
     try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"chat_id\":42") != null);
     try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"text\":\"hi\"") != null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "reply_parameters") == null);
 }
 
 test "pollOnce sends a typing indicator before the turn" {
@@ -1853,26 +1731,7 @@ test "a later text chunk failure is uncertain" {
     try testing.expectEqual(@as(usize, 1), h.tg.i);
 }
 
-test "progress state is cleared only after a confirmed edit" {
-    var h: Harness = undefined;
-    try h.init(&.{
-        "{\"ok\":true,\"result\":{\"message_id\":55}}",
-        ok_json,
-    }, &.{});
-    defer h.deinit();
-    h.bot.live_http = h.tg.http();
-
-    const id = try h.bot.startProgress(9, 4);
-    try testing.expectEqual(@as(i64, 55), id);
-    try saveProgress(&h.db, id);
-    h.bot.progress_id = id;
-    try h.bot.finishProgress("Done.");
-    try testing.expectEqual(@as(?i64, null), try loadProgress(&h.db));
-    try testing.expect(std.mem.endsWith(u8, h.tg.url(0), "/sendMessage"));
-    try testing.expect(std.mem.endsWith(u8, h.tg.url(1), "/editMessageText"));
-}
-
-test "stop callback cancels the active model turn" {
+test "a stop message cancels the active model turn" {
     const Slow = struct {
         io: std.Io,
 
@@ -1895,22 +1754,19 @@ test "stop callback cancels the active model turn" {
     }, &.{});
     defer h.deinit();
     var live: FakeHttp = .{ .bodies = &.{
-        "{\"ok\":true,\"result\":{\"message_id\":55}}",
         ok_json,
-        \\{"ok":true,"result":[{"update_id":5,"callback_query":{"id":"stop","from":{"id":42,"is_bot":false},"message":{"message_id":55,"chat":{"id":42,"type":"private"}},"data":"x:4"}}]}
+        \\{"ok":true,"result":[{"update_id":5,"message":{"message_id":10,"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"text":"/stop"}}]}
         ,
-        ok_json,
-        ok_json,
     } };
     var slow: Slow = .{ .io = h.threaded.io() };
     h.agent.http = slow.http();
     h.bot.live_http = live.http();
 
     try h.bot.pollOnce();
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "Stopped.") != null);
-    try testing.expect(std.mem.endsWith(u8, live.url(3), "/answerCallbackQuery"));
-    try testing.expect(std.mem.endsWith(u8, live.url(4), "/editMessageText"));
-    try testing.expectEqual(@as(?i64, null), try loadProgress(&h.db));
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "Okay, I stopped.") != null);
+    try testing.expect(std.mem.endsWith(u8, live.url(0), "/sendChatAction"));
+    try testing.expect(std.mem.endsWith(u8, live.url(1), "/getUpdates"));
+    try testing.expectEqual(@as(i64, 1), try scalar(&h.db, "SELECT count(*) FROM telegram_updates WHERE id = 5 AND status = 'completed'"));
 }
 
 test "an attachment pointing outside the workspace is refused" {
