@@ -411,7 +411,7 @@ pub const Bot = struct {
     fn handleCommand(self: *Bot, u: Update) !bool {
         const text = std.mem.trim(u8, u.text, &std.ascii.whitespace);
         if (std.mem.eql(u8, text, "/help")) {
-            try self.queueReply(u.message_id, "Use /status, /tasks, /routines, /memory, /diary, /skills, /character, /learn, /compact, /clear, /stickers, /stop, or /new.");
+            try self.queueReply(u.message_id, "Use /status, /tasks, /routines, /memory, /diary, /skills, /character, /learn, /model, /cache, /compact, /clear, /stickers, /stop, or /new.");
             return true;
         }
         if (std.mem.eql(u8, text, "/stop")) {
@@ -1094,7 +1094,7 @@ fn buildFileId(gpa: std.mem.Allocator, chat_id: i64, field_name: []const u8, fil
 }
 
 const commands_json =
-    \\{"commands":[{"command":"help","description":"Show help"},{"command":"status","description":"Show status"},{"command":"tasks","description":"List tasks"},{"command":"routines","description":"List routines"},{"command":"memory","description":"Search memory"},{"command":"diary","description":"Show diary"},{"command":"skills","description":"List skills"},{"command":"character","description":"Show character"},{"command":"learn","description":"Show learning"},{"command":"compact","description":"Compact conversation"},{"command":"clear","description":"Save and clear"},{"command":"stickers","description":"List stickers"},{"command":"stop","description":"Stop work"},{"command":"new","description":"New conversation"}]}
+    \\{"commands":[{"command":"help","description":"Show help"},{"command":"status","description":"Show status"},{"command":"tasks","description":"List tasks"},{"command":"routines","description":"List routines"},{"command":"memory","description":"Search memory"},{"command":"diary","description":"Show diary"},{"command":"skills","description":"List skills"},{"command":"character","description":"Show character"},{"command":"learn","description":"Show learning"},{"command":"model","description":"Change model"},{"command":"cache","description":"Show prompt cache"},{"command":"compact","description":"Compact conversation"},{"command":"clear","description":"Save and clear"},{"command":"stickers","description":"List stickers"},{"command":"stop","description":"Stop work"},{"command":"new","description":"New conversation"}]}
 ;
 
 fn escapeHtml(gpa: std.mem.Allocator, text: []const u8) ![]u8 {

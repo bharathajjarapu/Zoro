@@ -1,10 +1,11 @@
 const std = @import("std");
 
-/// Pinned vendored SQLite. Regenerate with `sha256sum vendor/sqlite3/*`.
+/// Pinned vendored inputs.
 const vendored = [_]struct { path: []const u8, sha256: []const u8 }{
     .{ .path = "vendor/sqlite3/sqlite3.c", .sha256 = "dc58f0b5b74e8416cc29b49163a00d6b8bf08a24dd4127652beaaae307bd1839" },
     .{ .path = "vendor/sqlite3/sqlite3.h", .sha256 = "05c48cbf0a0d7bda2b6d0145ac4f2d3a5e9e1cb98b5d4fa9d88ef620e1940046" },
     .{ .path = "vendor/sqlite3/sqlite3ext.h", .sha256 = "ea81fb7bd05882e0e0b92c4d60f677b205f7f1fbf085f218b12f0b5b3f0b9e48" },
+    .{ .path = "vendor/anydoc/anydoc", .sha256 = "610013d93cda03f4a51cba78eb951a990a00b9dfab1a6ca2a5a3beda67a4b81a" },
 };
 
 /// Compile-time trim of SQLite: each flag removes code we never call.
@@ -45,6 +46,7 @@ pub fn build(b: *std.Build) void {
         exe.root_module.unwind_tables = .none;
     }
     b.installArtifact(exe);
+    b.installBinFile("vendor/anydoc/anydoc", "anydoc");
 
     const run = b.addRunArtifact(exe);
     if (b.args) |args| run.addArgs(args);

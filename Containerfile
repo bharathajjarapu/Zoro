@@ -25,7 +25,7 @@ RUN apk add --no-cache ca-certificates \
  && mkdir -p /data /workspace/inbox /data/tmp \
  && chown -R zoro:zoro /data /workspace
 
-COPY --from=build /src/zig-out/bin/zoro /usr/local/bin/zoro
+COPY --from=build /src/zig-out/bin/zoro /src/zig-out/bin/anydoc /usr/local/bin/
 
 USER zoro
 WORKDIR /home/zoro

@@ -108,6 +108,7 @@ const worker = @import("../agent/worker.zig");
 const workspace = @import("workspace.zig");
 const shell = @import("shell.zig");
 const learning = @import("learning.zig");
+const document = @import("document.zig");
 
 const ask_params = [_]Param{
     .{ .name = "tool", .description = "tool name" },
@@ -154,6 +155,7 @@ pub const builtins = [_]Def{
     workspace.edit_file,
     workspace.download_file,
     workspace.delete_file,
+    document.inspect_file,
     shell.run,
     learning.character_inspect,
     learning.character_propose,

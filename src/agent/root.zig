@@ -19,12 +19,14 @@ const log = std.log.scoped(.agent);
 pub const max_rounds: usize = 32;
 pub const max_tool_result: usize = tools.max_result;
 const max_history_rows: usize = 40;
-const max_history_bytes: usize = 24 * 1024;
+const max_history_bytes: usize = 16 * 1024;
+const compact_after_bytes: usize = 24 * 1024;
 const max_message_bytes: usize = 8 * 1024;
 const max_summary_bytes: usize = 4 * 1024;
 const compact_keep: usize = 6;
 const max_compact_calls: usize = 4;
-const max_memories: usize = 8;
+const max_memories: usize = 4;
+const max_memory_bytes: usize = 512;
 const model_timeout_ms: i64 = if (builtin.is_test) 50 else 120_000;
 pub const default_base_url = "https://api.openai.com/v1";
 
@@ -166,6 +168,9 @@ pub const Agent = struct {
         const input = in.text;
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
         const command = std.mem.trim(u8, input, &std.ascii.whitespace);
+        if (std.mem.eql(u8, command, "/model") or std.mem.startsWith(u8, command, "/model "))
+            return self.modelCommand(command, now);
+        if (std.mem.eql(u8, command, "/cache")) return self.cacheCommand(now);
         if (std.mem.eql(u8, command, "/compact")) return self.compactCommand(false, now, cancel);
         if (std.mem.eql(u8, command, "/clear") or std.mem.eql(u8, command, "/new")) return self.compactCommand(true, now, cancel);
         // A bare yes/no is only a verdict when something is actually waiting.
@@ -190,10 +195,18 @@ pub const Agent = struct {
         const arena = arena_inst.allocator();
 
         var messages: std.ArrayList(Msg) = .empty;
-        try messages.append(arena, .{ .role = "system", .content = try withContext(arena, self, input, now) });
+        try messages.append(arena, .{ .role = "system", .content = system_prompt });
+        const context = try dynamicContext(arena, self, input, now);
+        if (context.len != 0) try messages.append(arena, .{ .role = "system", .content = context });
         try loadHistory(self.db, arena, &messages, source_message);
         // Attach the image to the stored caption without persisting its bytes.
         if (in.image) |img| messages.items[messages.items.len - 1].image = img;
+        log.debug("context system={d} dynamic={d} messages={d} tools={d}", .{
+            system_prompt.len,
+            context.len,
+            messageBytes(messages.items),
+            self.tools.len,
+        });
 
         const reply = try drive(self, arena, &messages, .{
             .tools = self.tools,
@@ -210,6 +223,33 @@ pub const Agent = struct {
         }
         _ = try insertMsg(self.db, "assistant", reply, now);
         return reply;
+    }
+
+    fn modelCommand(self: *Agent, command: []const u8, now: i64) ![]u8 {
+        if (std.mem.eql(u8, command, "/model")) {
+            const model = try activeModel(self.db, self.gpa, self.model);
+            defer self.gpa.free(model);
+            return sayFmt(self, now, "Using model {s}.", .{model});
+        }
+        const model = std.mem.trim(u8, command["/model ".len..], &std.ascii.whitespace);
+        if (!validModel(model)) return sayFmt(self, now, "Use /model followed by one model name.", .{});
+        try setActiveModel(self.db, model);
+        return sayFmt(self, now, "Using model {s}.", .{model});
+    }
+
+    fn cacheCommand(self: *Agent, now: i64) ![]u8 {
+        const stats = try cacheStats(self.db);
+        if (stats.calls == 0 or stats.input == 0) return sayFmt(self, now, "No prompt-cache data yet.", .{});
+        const call_rate = 100.0 * @as(f64, @floatFromInt(stats.hits)) / @as(f64, @floatFromInt(stats.calls));
+        const token_rate = 100.0 * @as(f64, @floatFromInt(stats.cached)) / @as(f64, @floatFromInt(stats.input));
+        return sayFmt(self, now, "Cache {d:.1}% calls ({d}/{d}), {d:.1}% tokens ({d}/{d}).", .{
+            call_rate,
+            stats.hits,
+            stats.calls,
+            token_rate,
+            stats.cached,
+            stats.input,
+        });
     }
 
     fn compactCommand(self: *Agent, clear: bool, now: i64, cancel: ?*const Workers) ![]u8 {
@@ -286,6 +326,8 @@ pub const Agent = struct {
 fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), b: Budget) ![]u8 {
     const endpoint = try chatUrl(arena, self.base_url);
     const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{self.api_key.reveal()});
+    const model = try activeModel(self.db, arena, self.model);
+    const cache_key: ?[]const u8 = if (std.mem.startsWith(u8, self.base_url, "https://api.openai.com/")) "zoro" else null;
 
     var round: usize = 0;
     while (true) {
@@ -298,7 +340,7 @@ fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), 
             );
         }
 
-        const body = try buildRequest(arena, self.model, messages.items, b.tools);
+        const body = try buildRequest(arena, model, messages.items, b.tools, cache_key);
         const started = std.Io.Timestamp.now(self.io, .awake);
         var res = try postModel(self, .{
             .url = endpoint,
@@ -306,20 +348,26 @@ fn drive(self: *Agent, arena: std.mem.Allocator, messages: *std.ArrayList(Msg), 
             .body = body,
         }, b.cancel);
         defer res.deinit(self.gpa);
-        log.debug("model round={d} request={d} response={d} elapsed_ms={d}", .{
-            round + 1,
-            body.len,
-            res.body.len,
-            started.durationTo(std.Io.Timestamp.now(self.io, .awake)).toMilliseconds(),
-        });
+        const elapsed_ms = started.durationTo(std.Io.Timestamp.now(self.io, .awake)).toMilliseconds();
 
         if (res.status != 200) {
-            log.err("chat HTTP {d}", .{res.status});
+            log.err("chat HTTP {d} elapsed_ms={d}", .{ res.status, elapsed_ms });
             return error.ChatHttp;
         }
 
         var parsed = try parseAssistant(self.gpa, res.body);
         defer parsed.deinit(self.gpa);
+        log.debug("model round={d} request={d} response={d} elapsed_ms={d} input={d} cached={d} output={d}", .{
+            round + 1,
+            body.len,
+            res.body.len,
+            elapsed_ms,
+            parsed.prompt_tokens,
+            parsed.cached_tokens,
+            parsed.output_tokens,
+        });
+        if (parsed.cache_reported) recordCache(self.db, parsed.prompt_tokens, parsed.cached_tokens) catch |err|
+            log.warn("cache metrics: {t}", .{err});
 
         if (parsed.tool_calls.len == 0) return self.gpa.dupe(u8, parsed.content orelse "");
 
@@ -519,8 +567,8 @@ fn insertOwnerMsg(db: *Db, content: []const u8, owner_text: ?[]const u8, created
     return db.lastId();
 }
 
-/// Adds relevant state to the system prompt.
-fn withContext(arena: std.mem.Allocator, self: *Agent, query: []const u8, now: i64) ![]const u8 {
+/// Adds current state after the stable system prefix.
+fn dynamicContext(arena: std.mem.Allocator, self: *Agent, query: []const u8, now: i64) ![]const u8 {
     const character = try identity.load(arena, self.io, self.workspace);
     const hits = try memory.searchAny(self.db, arena, query, now, max_memories);
     const skill_index = skills.list(arena, self.io, self.skills_dir) catch &.{};
@@ -528,24 +576,14 @@ fn withContext(arena: std.mem.Allocator, self: *Agent, query: []const u8, now: i
     const pending = tasks.pendingLines(self.db, arena) catch "";
     const stickers = stickerIndex(self.db, arena) catch "";
 
-    if (character.len == 0 and hits.len == 0 and skill_index.len == 0 and secret_names.len == 0 and pending.len == 0 and stickers.len == 0) return system_prompt;
+    if (character.len == 0 and hits.len == 0 and skill_index.len == 0 and secret_names.len == 0 and pending.len == 0 and stickers.len == 0) return "";
 
     var buf: std.Io.Writer.Allocating = .init(arena);
     var w = &buf.writer;
-    try w.writeAll(system_prompt);
     if (character.len != 0) {
-        try w.writeAll("\nOwner-controlled identity:\n");
+        try w.writeAll("Owner-controlled identity:\n");
         try w.writeAll(character);
         try w.writeByte('\n');
-    }
-    if (hits.len != 0) {
-        try w.writeAll("\n\n## memory\n");
-        for (hits) |h| {
-            try w.writeAll(h.ref);
-            try w.writeAll(": ");
-            try w.writeAll(clip(h.text, 1024));
-            try w.writeByte('\n');
-        }
     }
     if (skill_index.len != 0) {
         try w.writeAll("\n\n## skills\n");
@@ -559,15 +597,74 @@ fn withContext(arena: std.mem.Allocator, self: *Agent, query: []const u8, now: i
             try w.print("- {s}\n", .{clip(n, 64)});
         }
     }
-    if (pending.len != 0) {
-        try w.writeAll("\n\n## waiting for the owner's yes or no\n");
-        try w.writeAll(clip(pending, 4 * 1024));
-    }
     if (stickers.len != 0) {
         try w.writeAll("\n\n## stickers\n");
         try w.writeAll(stickers);
     }
+    if (hits.len != 0) {
+        try w.writeAll("\n\n## memory\n");
+        for (hits) |h| {
+            try w.writeAll(h.ref);
+            try w.writeAll(": ");
+            try w.writeAll(clip(h.text, max_memory_bytes));
+            try w.writeByte('\n');
+        }
+    }
+    if (pending.len != 0) {
+        try w.writeAll("\n\n## waiting for the owner's yes or no\n");
+        try w.writeAll(clip(pending, 4 * 1024));
+    }
     return try buf.toOwnedSlice();
+}
+
+fn validModel(model: []const u8) bool {
+    if (model.len == 0 or model.len > 128) return false;
+    for (model) |c| if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-_.:/", c) != null)) return false;
+    return true;
+}
+
+fn setActiveModel(db: *Db, model: []const u8) !void {
+    var q = try db.prepare("INSERT INTO kv(key, value) VALUES ('active_model', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    defer q.finalize();
+    try q.bind(1, model);
+    _ = try q.step();
+}
+
+/// Caller owns the result.
+fn activeModel(db: *Db, gpa: std.mem.Allocator, fallback: []const u8) ![]u8 {
+    var q = try db.prepare("SELECT value FROM kv WHERE key = 'active_model'");
+    defer q.finalize();
+    if (!try q.step() or !validModel(q.text(0))) return gpa.dupe(u8, fallback);
+    return gpa.dupe(u8, q.text(0));
+}
+
+const CacheStats = struct { calls: i64, hits: i64, input: i64, cached: i64 };
+
+fn recordCache(db: *Db, input: u64, cached: u64) !void {
+    if (input == 0) return;
+    var q = try db.prepare(
+        \\INSERT INTO kv(key, value) VALUES
+        \\ ('cache_calls', 1), ('cache_hits', ?), ('cache_input', ?), ('cache_read', ?)
+        \\ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(kv.value AS INTEGER) + CAST(excluded.value AS INTEGER) AS TEXT)
+    );
+    defer q.finalize();
+    try q.bind(1, @as(i64, if (cached > 0) 1 else 0));
+    try q.bind(2, @as(i64, @intCast(@min(input, std.math.maxInt(i64)))));
+    try q.bind(3, @as(i64, @intCast(@min(cached, std.math.maxInt(i64)))));
+    _ = try q.step();
+}
+
+fn cacheStats(db: *Db) !CacheStats {
+    var q = try db.prepare(
+        \\SELECT
+        \\ COALESCE((SELECT CAST(value AS INTEGER) FROM kv WHERE key = 'cache_calls'), 0),
+        \\ COALESCE((SELECT CAST(value AS INTEGER) FROM kv WHERE key = 'cache_hits'), 0),
+        \\ COALESCE((SELECT CAST(value AS INTEGER) FROM kv WHERE key = 'cache_input'), 0),
+        \\ COALESCE((SELECT CAST(value AS INTEGER) FROM kv WHERE key = 'cache_read'), 0)
+    );
+    defer q.finalize();
+    if (!try q.step()) return error.NoRow;
+    return .{ .calls = q.int(0), .hits = q.int(1), .input = q.int(2), .cached = q.int(3) };
 }
 
 fn stickerIndex(db: *Db, gpa: std.mem.Allocator) ![]u8 {
@@ -584,6 +681,12 @@ fn clip(text: []const u8, max: usize) []const u8 {
     var end = max;
     while (end > 0 and text[end] & 0xc0 == 0x80) end -= 1;
     return text[0..end];
+}
+
+fn messageBytes(messages: []const Msg) usize {
+    var total: usize = 0;
+    for (messages) |m| total += m.content.len;
+    return total;
 }
 
 /// Loads recent dialogue; plain tool rows lack replay metadata.
@@ -655,7 +758,7 @@ fn needsCompact(db: *Db) !bool {
     try q.bind(1, id);
     try q.bind(2, try compactedThrough(db, id));
     if (!try q.step()) return false;
-    return q.int(0) > max_history_bytes;
+    return q.int(0) > compact_after_bytes;
 }
 
 fn compactCutoff(db: *Db, id: i64, through: i64, keep: usize) !?i64 {
@@ -750,7 +853,7 @@ fn dupeCalls(arena: std.mem.Allocator, calls: []const ToolCall) ![]ToolCall {
     return out;
 }
 
-fn buildRequest(arena: std.mem.Allocator, model: []const u8, messages: []const Msg, tool_list: []const Tool) ![]u8 {
+fn buildRequest(arena: std.mem.Allocator, model: []const u8, messages: []const Msg, tool_list: []const Tool, cache_key: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     var w = &out.writer;
 
@@ -804,6 +907,10 @@ fn buildRequest(arena: std.mem.Allocator, model: []const u8, messages: []const M
         }
         try w.writeAll("],\"tool_choice\":\"auto\"");
     }
+    if (cache_key) |key| {
+        try w.writeAll(",\"prompt_cache_key\":");
+        try writeJsonString(w, key);
+    }
     try w.writeByte('}');
     return try out.toOwnedSlice();
 }
@@ -820,7 +927,7 @@ test "tool calls without text serialize null content" {
         .content = "",
         .tool_calls = &.{.{ .id = "c1", .name = "echo", .arguments = "{}" }},
     }};
-    const body = try buildRequest(arena.allocator(), "m", &messages, &.{});
+    const body = try buildRequest(arena.allocator(), "m", &messages, &.{}, null);
     try testing.expect(std.mem.indexOf(u8, body, "\"content\":null") != null);
 }
 
@@ -844,6 +951,10 @@ fn writeParts(arena: std.mem.Allocator, w: *std.Io.Writer, text: []const u8, img
 const Parsed = struct {
     content: ?[]u8,
     tool_calls: []ToolCall,
+    prompt_tokens: u64,
+    cached_tokens: u64,
+    output_tokens: u64,
+    cache_reported: bool,
 
     fn deinit(self: *Parsed, gpa: std.mem.Allocator) void {
         if (self.content) |c| gpa.free(c);
@@ -872,6 +983,11 @@ fn parseAssistant(gpa: std.mem.Allocator, body: []const u8) !Parsed {
                 } = null,
             } = .{},
         } = &.{},
+        usage: ?struct {
+            prompt_tokens: u64 = 0,
+            completion_tokens: u64 = 0,
+            prompt_tokens_details: ?struct { cached_tokens: ?u64 = null } = null,
+        } = null,
     };
 
     const tree = std.json.parseFromSlice(Response, gpa, body, .{
@@ -882,6 +998,9 @@ fn parseAssistant(gpa: std.mem.Allocator, body: []const u8) !Parsed {
 
     if (tree.value.choices.len == 0) return error.BadResponse;
     const msg = tree.value.choices[0].message;
+    const usage = tree.value.usage;
+    const details = if (usage) |u| u.prompt_tokens_details else null;
+    const cached = if (details) |d| d.cached_tokens else null;
 
     var content: ?[]u8 = null;
     errdefer if (content) |c| gpa.free(c);
@@ -915,6 +1034,10 @@ fn parseAssistant(gpa: std.mem.Allocator, body: []const u8) !Parsed {
     return .{
         .content = content,
         .tool_calls = try calls.toOwnedSlice(gpa),
+        .prompt_tokens = if (usage) |u| u.prompt_tokens else 0,
+        .cached_tokens = cached orelse 0,
+        .output_tokens = if (usage) |u| u.completion_tokens else 0,
+        .cache_reported = cached != null,
     };
 }
 
@@ -950,6 +1073,71 @@ test "turn returns the stubbed assistant reply" {
 
 test "the default chat language is English" {
     try testing.expect(std.mem.indexOf(u8, system_prompt, "English by default") != null);
+}
+
+test "model names are bounded" {
+    try testing.expect(validModel("openai/gpt-5.6"));
+    try testing.expect(!validModel("bad model"));
+}
+
+test "model command changes the shared model" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &buf);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var idle: FakeHttp = .{};
+    var first: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = idle.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "default",
+    };
+    const changed = try first.turn("/model gpt-5-mini");
+    defer testing.allocator.free(changed);
+    try testing.expectEqualStrings("Using model gpt-5-mini.", changed);
+
+    var fake: FakeHttp = .{ .bodies = &.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"} };
+    var second: Agent = first;
+    second.http = fake.http();
+    const reply = try second.turn("hello");
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, fake.sent(), "\"model\":\"gpt-5-mini\"") != null);
+    try testing.expect(std.mem.indexOf(u8, fake.sent(), "\"prompt_cache_key\":\"zoro\"") != null);
+}
+
+test "cache command reports provider usage" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &buf);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var fake: FakeHttp = .{ .bodies = &.{
+        "{\"choices\":[{\"message\":{\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":2000,\"prompt_tokens_details\":{\"cached_tokens\":1960}}}",
+    } };
+    var a: Agent = .{
+        .gpa = testing.allocator,
+        .io = threaded.io(),
+        .db = &db,
+        .http = fake.http(),
+        .api_key = .init("k"),
+        .base_url = default_base_url,
+        .model = "m",
+    };
+
+    const reply = try a.turn("hello");
+    defer testing.allocator.free(reply);
+    const stats = try a.turn("/cache");
+    defer testing.allocator.free(stats);
+    try testing.expectEqualStrings("Cache 100.0% calls (1/1), 98.0% tokens (1960/2000).", stats);
 }
 
 test "turn keeps the complete current message" {
@@ -1285,7 +1473,7 @@ test "turn keeps injected memory and history bounded as history grows" {
         if (std.mem.indexOf(u8, sent, s) != null) n += 1;
     }
     try testing.expect(n > 0);
-    try testing.expect(n <= max_memories);
+    try testing.expect(n <= 4);
     try testing.expect(n < 20);
 }
 

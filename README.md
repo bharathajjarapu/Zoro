@@ -105,6 +105,8 @@ Telegram commands:
 | `/memory`, `/diary` | Search memory or read the diary |
 | `/skills`, `/character` | Inspect skills or character |
 | `/learn` | Show learning mode and proposals |
+| `/model <name>` | Change the model for all work |
+| `/cache` | Show prompt-cache hits and misses |
 | `/compact` | Summarize older conversation turns |
 | `/clear`, `/new` | Save the summary and start fresh |
 | `/learn sticker <alias>` | Teach the next sticker for five minutes |
@@ -136,6 +138,16 @@ input.
 models, schedules, or authority. Applying or rolling back a proposal requires
 an exact owner approval. The agent cannot gain new capabilities without a
 rebuild.
+
+`/model <name>` stores the selected model in SQLite and uses it for the primary
+agent, routines, and workers. It keeps the configured `LLM_BASE_URL` and
+`LLM_API_KEY`; only the model name changes.
+
+Prompt caching is provider-managed. Zoro keeps its fixed system instructions in
+a stable prefix, adds a stable cache key for OpenAI, and records reported cached
+and total prompt tokens. `/cache` shows measured call and token rates. Short or
+changed prompts can miss, so the displayed rates are observed rather than
+guaranteed.
 
 **Authority is enforced, not advisory.** A `notify` routine is handed no tool
 that mutates anything. A `safe` or `critical` routine stays switched off until
@@ -205,10 +217,12 @@ suppresses a redundant companion message.
 The chat defaults to English and follows the owner's language or explicit
 request. Photos, image documents, static stickers, and available media previews
 use the configured model's image input. Incoming photos and files up to 20 MiB
-are saved in the workspace inbox; text files are also passed as text. Voice,
-audio, video, and animation files are preserved, but understanding their
-contents requires a supported transcription or video path. Outgoing albums are
-capped at 20 MiB.
+are saved in the workspace inbox; text files are also passed as text. PDF,
+Office, OpenDocument, RTF, EPUB, and CSV files can be extracted to Markdown
+with `inspect_file`; scanned PDFs report that OCR is required. Voice, audio,
+video, and animation files are preserved, but understanding their contents
+requires a supported transcription or video path. Outgoing albums are capped
+at 20 MiB.
 
 Teach a sticker with `/learn sticker <alias>`, then send the sticker within five
 minutes. The agent can use that alias later without sending an extra emoji or
