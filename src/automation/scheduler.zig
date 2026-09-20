@@ -18,55 +18,55 @@ pub const tick_every: u64 = 30;
 /// Runs older than this are missed, not delayed.
 pub const missed_after: i64 = 5 * 60;
 
-pub fn tick(a: *agent.Agent, now: i64) !void {
-    return tickWithCancel(a, now, null);
+pub fn tick(assistant: *agent.Agent, now: i64) !void {
+    return tickWithCancel(assistant, now, null);
 }
 
-fn tickWithCancel(a: *agent.Agent, now: i64, cancel: ?*const agent.Workers) !void {
-    try sync(a.db, a.gpa, a.io, a.skills_dir, now);
-    try fire(a, now, cancel);
-    try compact(a, now);
+fn tickWithCancel(assistant: *agent.Agent, now: i64, cancel: ?*const agent.Workers) !void {
+    try sync(assistant.db, assistant.gpa, assistant.io, assistant.skills_dir, now);
+    try fire(assistant, now, cancel);
+    try compact(assistant, now);
 }
 
 /// Failures preserve messages and retry later.
-fn compact(a: *agent.Agent, now: i64) !void {
+fn compact(assistant: *agent.Agent, now: i64) !void {
     var day_buf: [10]u8 = undefined;
     const day = memory.formatDay(&day_buf, now - 86_400);
-    if (try compacted(a.db, day)) return;
+    if (try compacted(assistant.db, day)) return;
 
-    memory.compact(a.db, a.gpa, a.io, a.diary_dir, day, now, &.{}) catch |err| {
+    memory.compact(assistant.db, assistant.gpa, assistant.io, assistant.diary_dir, day, now, &.{}) catch |err| {
         log.err("compacting {s}: {t}", .{ day, err });
         return;
     };
-    try mark(a.db, day);
+    try mark(assistant.db, day);
 }
 
 /// One high-water mark covers ordered days.
 fn compacted(db: *Db, day: []const u8) !bool {
-    var q = try db.prepare("SELECT value FROM kv WHERE key = 'compacted'");
-    defer q.finalize();
-    if (!try q.step()) return false;
-    return std.mem.order(u8, q.text(0), day) != .lt;
+    var statement = try db.prepare("SELECT value FROM kv WHERE key = 'compacted'");
+    defer statement.finalize();
+    if (!try statement.step()) return false;
+    return std.mem.order(u8, statement.text(0), day) != .lt;
 }
 
 fn mark(db: *Db, day: []const u8) !void {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\INSERT INTO kv(key, value) VALUES ('compacted', ?)
         \\ON CONFLICT(key) DO UPDATE SET value = excluded.value
     );
-    defer q.finalize();
-    try q.bind(1, day);
-    _ = try q.step();
+    defer statement.finalize();
+    try statement.bind(1, day);
+    _ = try statement.step();
 }
 
-pub fn loop(a: *agent.Agent, stop: *const fn () bool) void {
+pub fn loop(assistant: *agent.Agent, stop: *const fn () bool) void {
     var cancel: agent.Workers = .{ .shutdown = stop };
     while (!stop()) {
-        const now = std.Io.Timestamp.now(a.io, .real).toSeconds();
-        tickWithCancel(a, now, &cancel) catch |err| log.err("{t}", .{err});
+        const now = std.Io.Timestamp.now(assistant.io, .real).toSeconds();
+        tickWithCancel(assistant, now, &cancel) catch |err| log.err("{t}", .{err});
         var left = tick_every;
         while (left > 0 and !stop()) : (left -= 1) {
-            std.Io.sleep(a.io, .fromSeconds(1), .awake) catch return;
+            std.Io.sleep(assistant.io, .fromSeconds(1), .awake) catch return;
         }
     }
 }
@@ -97,23 +97,23 @@ fn sync(db: *Db, gpa: std.mem.Allocator, io: std.Io, dir: []const u8, now: i64) 
 }
 
 fn hasRoutine(db: *Db, name: []const u8) !bool {
-    var q = try db.prepare("SELECT 1 FROM routines WHERE name = ?");
-    defer q.finalize();
-    try q.bind(1, name);
-    return try q.step();
+    var statement = try db.prepare("SELECT 1 FROM routines WHERE name = ?");
+    defer statement.finalize();
+    try statement.bind(1, name);
+    return try statement.step();
 }
 
 /// Mutating routines start disabled.
 fn insertRoutine(db: *Db, name: []const u8, next: i64, tier: skills.Authority) !void {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\INSERT INTO routines(name, next, last, status, fails, enabled)
         \\VALUES (?, ?, NULL, NULL, 0, ?)
     );
-    defer q.finalize();
-    try q.bind(1, name);
-    try q.bind(2, next);
-    try q.bind(3, @as(i64, if (tier.readOnly()) 1 else 0));
-    _ = try q.step();
+    defer statement.finalize();
+    try statement.bind(1, name);
+    try statement.bind(2, next);
+    try statement.bind(3, @as(i64, if (tier.readOnly()) 1 else 0));
+    _ = try statement.step();
 }
 
 /// Rechecks disk authority each tick before enabling mutations.
@@ -138,20 +138,20 @@ fn gate(db: *Db, gpa: std.mem.Allocator, name: []const u8, why: []const u8, tier
 }
 
 fn setEnabled(db: *Db, name: []const u8, on: bool) !void {
-    var q = try db.prepare("UPDATE routines SET enabled = ? WHERE name = ?");
-    defer q.finalize();
-    try q.bind(1, @as(i64, if (on) 1 else 0));
-    try q.bind(2, name);
-    _ = try q.step();
+    var statement = try db.prepare("UPDATE routines SET enabled = ? WHERE name = ?");
+    defer statement.finalize();
+    try statement.bind(1, @as(i64, if (on) 1 else 0));
+    try statement.bind(2, name);
+    _ = try statement.step();
 }
 
 fn hasApproval(db: *Db, tool: []const u8, target: []const u8, status: []const u8) !bool {
-    var q = try db.prepare("SELECT 1 FROM approvals WHERE tool = ? AND target = ? AND status = ? LIMIT 1");
-    defer q.finalize();
-    try q.bind(1, tool);
-    try q.bind(2, target);
-    try q.bind(3, status);
-    return try q.step();
+    var statement = try db.prepare("SELECT 1 FROM approvals WHERE tool = ? AND target = ? AND status = ? LIMIT 1");
+    defer statement.finalize();
+    try statement.bind(1, tool);
+    try statement.bind(2, target);
+    try statement.bind(3, status);
+    return try statement.step();
 }
 
 /// Valid names are safe inside the bound approval JSON.
@@ -160,130 +160,130 @@ fn nameArgs(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{{\"name\":\"{s}\"}}", .{name});
 }
 
-fn fire(a: *agent.Agent, now: i64, cancel: ?*const agent.Workers) !void {
+fn fire(assistant: *agent.Agent, now: i64, cancel: ?*const agent.Workers) !void {
     var names: std.ArrayList([]u8) = .empty;
     defer {
-        for (names.items) |n| a.gpa.free(n);
-        names.deinit(a.gpa);
+        for (names.items) |name| assistant.gpa.free(name);
+        names.deinit(assistant.gpa);
     }
     {
-        var q = try a.db.prepare(
+        var statement = try assistant.db.prepare(
             \\SELECT name FROM routines WHERE enabled = 1 AND next IS NOT NULL AND next <= ?
         );
-        defer q.finalize();
-        try q.bind(1, now);
-        while (try q.step()) {
-            try names.append(a.gpa, try a.gpa.dupe(u8, q.text(0)));
+        defer statement.finalize();
+        try statement.bind(1, now);
+        while (try statement.step()) {
+            try names.append(assistant.gpa, try assistant.gpa.dupe(u8, statement.text(0)));
         }
     }
 
     for (names.items) |name| {
-        runOne(a, name, now, cancel) catch |err| {
+        runOne(assistant, name, now, cancel) catch |err| {
             if (err == error.Cancelled) return err;
             log.err("{s}: {t}", .{ name, err });
             // Back off broken skills to avoid a hot loop.
-            try record(a.db, name, now, now + 3600, "failed");
+            try record(assistant.db, name, now, now + 3600, "failed");
         };
     }
 }
 
-fn runOne(a: *agent.Agent, name: []const u8, now: i64, cancel: ?*const agent.Workers) !void {
+fn runOne(assistant: *agent.Agent, name: []const u8, now: i64, cancel: ?*const agent.Workers) !void {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}/SKILL.md", .{ a.skills_dir, name });
-    const text = try std.Io.Dir.cwd().readFileAlloc(a.io, path, a.gpa, .limited(64 * 1024));
-    defer a.gpa.free(text);
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}/SKILL.md", .{ assistant.skills_dir, name });
+    const text = try std.Io.Dir.cwd().readFileAlloc(assistant.io, path, assistant.gpa, .limited(64 * 1024));
+    defer assistant.gpa.free(text);
     const skill = try skills.parse(text);
     const expr = skill.schedule orelse return;
     const spec = try cron.parse(expr);
     const next = try cron.nextRun(spec, now, skill.timezone);
     const tier = skills.Authority.of(skill.authority);
-    const state = try stateOf(a.db, name);
+    const state = try stateOf(assistant.db, name);
 
     if (tier == .critical and !state.approved) {
         // Never replay critical work after downtime.
-        if (now - state.due > missed_after) return skip(a, name, now, next);
-        return askFirst(a, name, skill.description, now, next);
+        if (now - state.due > missed_after) return skip(assistant, name, now, next);
+        return askFirst(assistant, name, skill.description, now, next);
     }
-    return execute(a, name, skill, tier, now, next, cancel);
+    return execute(assistant, name, skill, tier, now, next, cancel);
 }
 
 const State = struct { due: i64, approved: bool };
 
 fn stateOf(db: *Db, name: []const u8) !State {
-    var q = try db.prepare("SELECT COALESCE(next, 0), COALESCE(status, '') FROM routines WHERE name = ?");
-    defer q.finalize();
-    try q.bind(1, name);
-    if (!try q.step()) return error.NoRoutine;
-    return .{ .due = q.int(0), .approved = std.mem.eql(u8, q.text(1), "approved") };
+    var statement = try db.prepare("SELECT COALESCE(next, 0), COALESCE(status, '') FROM routines WHERE name = ?");
+    defer statement.finalize();
+    try statement.bind(1, name);
+    if (!try statement.step()) return error.NoRoutine;
+    return .{ .due = statement.int(0), .approved = std.mem.eql(u8, statement.text(1), "approved") };
 }
 
-fn execute(a: *agent.Agent, name: []const u8, skill: skills.Skill, tier: skills.Authority, now: i64, next: i64, cancel: ?*const agent.Workers) !void {
-    const list = try tools.subset(a.gpa, a.tools, tier.readOnly(), skill.allowed_tools);
-    defer a.gpa.free(list);
-    const prompt = try std.fmt.allocPrint(a.gpa, "Run routine {s}.\n\n{s}", .{ name, skill.body });
-    defer a.gpa.free(prompt);
+fn execute(assistant: *agent.Agent, name: []const u8, skill: skills.Skill, tier: skills.Authority, now: i64, next: i64, cancel: ?*const agent.Workers) !void {
+    const list = try tools.subset(assistant.gpa, assistant.tools, tier.readOnly(), skill.allowed_tools);
+    defer assistant.gpa.free(list);
+    const prompt = try std.fmt.allocPrint(assistant.gpa, "Run routine {s}.\n\n{s}", .{ name, skill.body });
+    defer assistant.gpa.free(prompt);
 
     // This thread exclusively owns the agent.
-    const full = a.tools;
-    a.tools = list;
-    defer a.tools = full;
+    const full = assistant.tools;
+    assistant.tools = list;
+    defer assistant.tools = full;
 
     const result = if (cancel) |state|
-        a.turnWithCancel(.{ .text = prompt }, state)
+        assistant.turnWithCancel(.{ .text = prompt }, state)
     else
-        a.turn(prompt);
+        assistant.turn(prompt);
     if (result) |reply| {
-        defer a.gpa.free(reply);
-        if (reply.len != 0) try outbox.push(a.db, .text, null, reply, now);
-        try record(a.db, name, now, next, "ok");
+        defer assistant.gpa.free(reply);
+        if (reply.len != 0) try outbox.push(assistant.db, .text, null, reply, now);
+        try record(assistant.db, name, now, next, "ok");
     } else |err| {
         if (err == error.Cancelled) return err;
         log.err("{s}: {t}", .{ name, err });
-        try record(a.db, name, now, next, "failed");
+        try record(assistant.db, name, now, next, "failed");
     }
 }
 
 /// Keeps one pending approval per firing.
-fn askFirst(a: *agent.Agent, name: []const u8, why: []const u8, now: i64, next: i64) !void {
-    if (try hasApproval(a.db, "run_routine", name, "pending")) {
-        return record(a.db, name, now, next, "awaiting-approval");
+fn askFirst(assistant: *agent.Agent, name: []const u8, why: []const u8, now: i64, next: i64) !void {
+    if (try hasApproval(assistant.db, "run_routine", name, "pending")) {
+        return record(assistant.db, name, now, next, "awaiting-approval");
     }
-    const args = try nameArgs(a.gpa, name);
-    defer a.gpa.free(args);
-    const reason = try std.fmt.allocPrint(a.gpa, "{s} ({s}) is due. Run it?", .{ name, why });
-    defer a.gpa.free(reason);
-    const id = try tasks.ask(a.db, "run_routine", args, name, reason, null, now);
-    const question = try std.fmt.allocPrint(a.gpa, "{s} (#{d})", .{ reason, id });
-    defer a.gpa.free(question);
-    try outbox.push(a.db, .text, null, question, now);
-    try record(a.db, name, now, next, "awaiting-approval");
+    const args = try nameArgs(assistant.gpa, name);
+    defer assistant.gpa.free(args);
+    const reason = try std.fmt.allocPrint(assistant.gpa, "{s} ({s}) is due. Run it?", .{ name, why });
+    defer assistant.gpa.free(reason);
+    const id = try tasks.ask(assistant.db, "run_routine", args, name, reason, null, now);
+    const question = try std.fmt.allocPrint(assistant.gpa, "{s} (#{d})", .{ reason, id });
+    defer assistant.gpa.free(question);
+    try outbox.push(assistant.db, .text, null, question, now);
+    try record(assistant.db, name, now, next, "awaiting-approval");
 }
 
-fn skip(a: *agent.Agent, name: []const u8, now: i64, next: i64) !void {
+fn skip(assistant: *agent.Agent, name: []const u8, now: i64, next: i64) !void {
     const note = try std.fmt.allocPrint(
-        a.gpa,
+        assistant.gpa,
         "Skipped {s}: it came due while I was down, and I never replay a critical routine on my own.",
         .{name},
     );
-    defer a.gpa.free(note);
-    try outbox.push(a.db, .text, null, note, now);
-    try record(a.db, name, now, next, "skipped");
+    defer assistant.gpa.free(note);
+    try outbox.push(assistant.db, .text, null, note, now);
+    try record(assistant.db, name, now, next, "skipped");
 }
 
 /// Records outcomes and advances `next` together.
 fn record(db: *Db, name: []const u8, now: i64, next: i64, status: []const u8) !void {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\UPDATE routines SET last = ?, next = ?, status = ?, fails = fails + ?, skips = skips + ?
         \\WHERE name = ?
     );
-    defer q.finalize();
-    try q.bind(1, now);
-    try q.bind(2, next);
-    try q.bind(3, status);
-    try q.bind(4, @as(i64, if (std.mem.eql(u8, status, "failed")) 1 else 0));
-    try q.bind(5, @as(i64, if (std.mem.eql(u8, status, "skipped")) 1 else 0));
-    try q.bind(6, name);
-    _ = try q.step();
+    defer statement.finalize();
+    try statement.bind(1, now);
+    try statement.bind(2, next);
+    try statement.bind(3, status);
+    try statement.bind(4, @as(i64, if (std.mem.eql(u8, status, "failed")) 1 else 0));
+    try statement.bind(5, @as(i64, if (std.mem.eql(u8, status, "skipped")) 1 else 0));
+    try statement.bind(6, name);
+    _ = try statement.step();
 }
 
 test "tick runs a due routine through agent.turn and updates next/last" {
@@ -314,7 +314,7 @@ test "tick runs a due routine through agent.turn and updates next/last" {
         \\Summarize overnight mail.
     );
 
-    var a: agent.Agent = .{
+    var assistant: agent.Agent = .{
         .gpa = testing.allocator,
         .io = io,
         .db = &db,
@@ -326,19 +326,19 @@ test "tick runs a due routine through agent.turn and updates next/last" {
     };
 
     const now: i64 = 1_000;
-    try tick(&a, now);
-    try testing.expectEqual(@as(usize, 0), fake.i);
+    try tick(&assistant, now);
+    try testing.expectEqual(@as(usize, 0), fake.index);
 
     try db.exec("UPDATE routines SET next = 500 WHERE name = 'morning-brief'");
-    try tick(&a, now);
-    try testing.expectEqual(@as(usize, 1), fake.i);
+    try tick(&assistant, now);
+    try testing.expectEqual(@as(usize, 1), fake.index);
 
-    var q = try db.prepare("SELECT last, next, status FROM routines WHERE name = 'morning-brief'");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqual(@as(i64, now), q.int(0));
-    try testing.expectEqual(@as(i64, now + 3600), q.int(1));
-    try testing.expectEqualStrings("ok", q.text(2));
+    var statement = try db.prepare("SELECT last, next, status FROM routines WHERE name = 'morning-brief'");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqual(@as(i64, now), statement.int(0));
+    try testing.expectEqual(@as(i64, now + 3600), statement.int(1));
+    try testing.expectEqualStrings("ok", statement.text(2));
 }
 
 test "a routine whose skill vanished backs off instead of hot-looping" {
@@ -351,11 +351,11 @@ test "a routine whose skill vanished backs off instead of hot-looping" {
     try insertRoutine(&db, "ghost", 0, .notify);
     try record(&db, "ghost", 100, 100 + 3600, "failed");
 
-    var q = try db.prepare("SELECT next, status FROM routines WHERE name = 'ghost'");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqual(@as(i64, 100 + 3600), q.int(0));
-    try testing.expectEqualStrings("failed", q.text(1));
+    var statement = try db.prepare("SELECT next, status FROM routines WHERE name = 'ghost'");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqual(@as(i64, 100 + 3600), statement.int(0));
+    try testing.expectEqualStrings("failed", statement.text(1));
 }
 
 const Rig = struct {
@@ -365,7 +365,7 @@ const Rig = struct {
     fake: FakeHttp,
     dir_buf: [128]u8 = undefined,
     dir: []const u8 = &.{},
-    a: agent.Agent = undefined,
+    assistant: agent.Agent = undefined,
 
     fn init(self: *Rig, bodies: []const []const u8) !void {
         self.tmp = testing.tmpDir(.{});
@@ -375,7 +375,7 @@ const Rig = struct {
         self.db = try testkit.tmpDb(&self.tmp, &path_buf);
         self.fake = .{ .bodies = bodies };
         self.dir = try std.fmt.bufPrint(&self.dir_buf, ".zig-cache/tmp/{s}/skills", .{self.tmp.sub_path});
-        self.a = .{
+        self.assistant = .{
             .gpa = testing.allocator,
             .io = self.threaded.io(),
             .db = &self.db,
@@ -393,28 +393,28 @@ const Rig = struct {
     }
 
     fn routine(self: *Rig, name: []const u8) !struct { enabled: i64, skips: i64, next: i64 } {
-        var q = try self.db.prepare("SELECT enabled, skips, COALESCE(next, 0) FROM routines WHERE name = ?");
-        defer q.finalize();
-        try q.bind(1, name);
-        if (!try q.step()) return error.NoRoutine;
-        return .{ .enabled = q.int(0), .skips = q.int(1), .next = q.int(2) };
+        var statement = try self.db.prepare("SELECT enabled, skips, COALESCE(next, 0) FROM routines WHERE name = ?");
+        defer statement.finalize();
+        try statement.bind(1, name);
+        if (!try statement.step()) return error.NoRoutine;
+        return .{ .enabled = statement.int(0), .skips = statement.int(1), .next = statement.int(2) };
     }
 
     /// Column slices die at the next step, so the caller supplies the storage.
     fn status(self: *Rig, name: []const u8, buf: []u8) ![]const u8 {
-        var q = try self.db.prepare("SELECT COALESCE(status, '') FROM routines WHERE name = ?");
-        defer q.finalize();
-        try q.bind(1, name);
-        if (!try q.step()) return error.NoRoutine;
-        return std.fmt.bufPrint(buf, "{s}", .{q.text(0)});
+        var statement = try self.db.prepare("SELECT COALESCE(status, '') FROM routines WHERE name = ?");
+        defer statement.finalize();
+        try statement.bind(1, name);
+        if (!try statement.step()) return error.NoRoutine;
+        return std.fmt.bufPrint(buf, "{s}", .{statement.text(0)});
     }
 
     fn approve(self: *Rig, tool: []const u8, name: []const u8) !void {
-        var q = try self.db.prepare("UPDATE approvals SET status = 'approved' WHERE tool = ? AND target = ?");
-        defer q.finalize();
-        try q.bind(1, tool);
-        try q.bind(2, name);
-        _ = try q.step();
+        var statement = try self.db.prepare("UPDATE approvals SET status = 'approved' WHERE tool = ? AND target = ?");
+        defer statement.finalize();
+        try statement.bind(1, tool);
+        try statement.bind(2, name);
+        _ = try statement.step();
     }
 
     fn deinit(self: *Rig) void {
@@ -454,13 +454,13 @@ test "a mutating routine stays off until the owner approves it" {
     defer rig.deinit();
     try rig.write(critical_skill);
 
-    try tick(&rig.a, 1000);
+    try tick(&rig.assistant, 1000);
     const before = try rig.routine("payer");
     try testing.expectEqual(@as(i64, 0), before.enabled);
 
-    try tick(&rig.a, 1001);
+    try tick(&rig.assistant, 1001);
     try testing.expectEqual(@as(usize, 1), try tasks.pendingCount(&rig.db));
-    try testing.expectEqual(@as(usize, 0), rig.fake.i);
+    try testing.expectEqual(@as(usize, 0), rig.fake.index);
 }
 
 test "rewriting notify to critical switches the routine back off" {
@@ -468,7 +468,7 @@ test "rewriting notify to critical switches the routine back off" {
     try rig.init(&.{});
     defer rig.deinit();
     try rig.write(notify_skill);
-    try tick(&rig.a, 1000);
+    try tick(&rig.assistant, 1000);
     try testing.expectEqual(@as(i64, 1), (try rig.routine("brief")).enabled);
 
     try rig.write(
@@ -482,7 +482,7 @@ test "rewriting notify to critical switches the routine back off" {
         \\
         \\Summarize overnight mail.
     );
-    try tick(&rig.a, 1001);
+    try tick(&rig.assistant, 1001);
     try testing.expectEqual(@as(i64, 0), (try rig.routine("brief")).enabled);
     try testing.expectEqual(@as(usize, 1), try tasks.pendingCount(&rig.db));
 }
@@ -492,11 +492,11 @@ test "a notify routine is handed no tool that can mutate" {
     try rig.init(&.{"{\"choices\":[{\"message\":{\"content\":\"briefed\"}}]}"});
     defer rig.deinit();
     try rig.write(notify_skill);
-    try tick(&rig.a, 1000);
+    try tick(&rig.assistant, 1000);
     try rig.db.exec("UPDATE routines SET next = 500 WHERE name = 'brief'");
-    try tick(&rig.a, 1000);
+    try tick(&rig.assistant, 1000);
 
-    try testing.expectEqual(@as(usize, 1), rig.fake.i);
+    try testing.expectEqual(@as(usize, 1), rig.fake.index);
     const sent = rig.fake.sent();
     try testing.expect(std.mem.indexOf(u8, sent, "\"recall\"") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "\"remember\"") == null);
@@ -508,18 +508,18 @@ test "a critical routine asks first and only runs once approved" {
     try rig.init(&.{"{\"choices\":[{\"message\":{\"content\":\"paid\"}}]}"});
     defer rig.deinit();
     try rig.write(critical_skill);
-    try tick(&rig.a, 1000);
+    try tick(&rig.assistant, 1000);
     try rig.approve("enable_routine", "payer");
     try rig.db.exec("UPDATE routines SET enabled = 1, next = 900 WHERE name = 'payer'");
 
     var buf: [32]u8 = undefined;
-    try tick(&rig.a, 1000);
-    try testing.expectEqual(@as(usize, 0), rig.fake.i);
+    try tick(&rig.assistant, 1000);
+    try testing.expectEqual(@as(usize, 0), rig.fake.index);
     try testing.expectEqualStrings("awaiting-approval", try rig.status("payer", &buf));
 
     try rig.db.exec("UPDATE routines SET next = 0, status = 'approved' WHERE name = 'payer'");
-    try tick(&rig.a, 1100);
-    try testing.expectEqual(@as(usize, 1), rig.fake.i);
+    try tick(&rig.assistant, 1100);
+    try testing.expectEqual(@as(usize, 1), rig.fake.index);
     try testing.expectEqualStrings("ok", try rig.status("payer", &buf));
 }
 
@@ -531,12 +531,12 @@ test "a day of downtime is one catch-up run, and a missed critical is skipped" {
     try rig.write(critical_skill);
 
     const now: i64 = 2_000_000;
-    try tick(&rig.a, now - 86400);
+    try tick(&rig.assistant, now - 86400);
     try rig.approve("enable_routine", "payer");
     try rig.db.exec("UPDATE routines SET enabled = 1");
 
-    try tick(&rig.a, now);
-    try testing.expectEqual(@as(usize, 1), rig.fake.i);
+    try tick(&rig.assistant, now);
+    try testing.expectEqual(@as(usize, 1), rig.fake.index);
 
     const brief = try rig.routine("brief");
     try testing.expect(brief.next > now);
@@ -546,8 +546,8 @@ test "a day of downtime is one catch-up run, and a missed critical is skipped" {
     try testing.expectEqual(@as(i64, 1), payer.skips);
     try testing.expect(payer.next > now);
 
-    try tick(&rig.a, now + 1);
-    try testing.expectEqual(@as(usize, 1), rig.fake.i);
+    try tick(&rig.assistant, now + 1);
+    try testing.expectEqual(@as(usize, 1), rig.fake.index);
 }
 
 test "an unanswered critical routine asks once, not once per firing" {
@@ -555,18 +555,18 @@ test "an unanswered critical routine asks once, not once per firing" {
     try rig.init(&.{});
     defer rig.deinit();
     try rig.write(critical_skill);
-    try tick(&rig.a, 1000);
+    try tick(&rig.assistant, 1000);
     try rig.approve("enable_routine", "payer");
     try rig.db.exec("UPDATE routines SET enabled = 1, next = 900 WHERE name = 'payer'");
 
-    try tick(&rig.a, 1000);
-    try tick(&rig.a, 1000);
-    try tick(&rig.a, 1000);
+    try tick(&rig.assistant, 1000);
+    try tick(&rig.assistant, 1000);
+    try tick(&rig.assistant, 1000);
 
-    var q = try rig.db.prepare("SELECT count(*) FROM approvals WHERE tool = 'run_routine' AND target = 'payer'");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqual(@as(i64, 1), q.int(0));
+    var statement = try rig.db.prepare("SELECT count(*) FROM approvals WHERE tool = 'run_routine' AND target = 'payer'");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqual(@as(i64, 1), statement.int(0));
 }
 
 test "yesterday is compacted once, and the diary the owner can read appears" {
@@ -575,7 +575,7 @@ test "yesterday is compacted once, and the diary the owner can read appears" {
     defer rig.deinit();
 
     var dir_buf: [128]u8 = undefined;
-    rig.a.diary_dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}/diary", .{rig.tmp.sub_path});
+    rig.assistant.diary_dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}/diary", .{rig.tmp.sub_path});
 
     const today: i64 = 1_787_270_400;
     const yesterday = today - 86_400;
@@ -584,21 +584,21 @@ test "yesterday is compacted once, and the diary the owner can read appears" {
     try ins.bind(1, yesterday + 3600);
     _ = try ins.step();
 
-    try tick(&rig.a, today);
+    try tick(&rig.assistant, today);
 
-    const text = (try memory.readDiary(testing.allocator, rig.a.io, rig.a.diary_dir, "2026-08-20")).?;
+    const text = (try memory.readDiary(testing.allocator, rig.assistant.io, rig.assistant.diary_dir, "2026-08-20")).?;
     defer testing.allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "walked the dog") != null);
 
-    var q = try rig.db.prepare("SELECT count(*) FROM messages");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqual(@as(i64, 0), q.int(0));
+    var statement = try rig.db.prepare("SELECT count(*) FROM messages");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqual(@as(i64, 0), statement.int(0));
 
     try ins.reset();
     try ins.bind(1, yesterday + 7200);
     _ = try ins.step();
-    try tick(&rig.a, today + 60);
+    try tick(&rig.assistant, today + 60);
     var again = try rig.db.prepare("SELECT count(*) FROM messages");
     defer again.finalize();
     try testing.expect(try again.step());

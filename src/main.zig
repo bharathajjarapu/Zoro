@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("c");
+const sqlite = @import("c");
 const config = @import("app/config.zig");
 const Db = @import("data/db.zig").Db;
 const task_data = @import("data/tasks.zig");
@@ -98,16 +98,16 @@ fn daemon(init: std.process.Init) !void {
     try crew.init(init, cfg, &db, &limiter);
     defer crew.deinit();
 
-    var a = makeAgent(init, cfg, &db, &client, diary_dir, &limiter);
-    a.workers = &crew.pool.state;
-    a.pool = &crew.pool;
+    var assistant = makeAgent(init, cfg, &db, &client, diary_dir, &limiter);
+    assistant.workers = &crew.pool.state;
+    assistant.pool = &crew.pool;
     var bot: telegram.Bot = .{
         .gpa = init.gpa,
         .io = init.io,
         .http = client.http(),
         .live_http = live_client.http(),
         .db = &db,
-        .agent = &a,
+        .agent = &assistant,
         .token = token,
         .owner_id = owner_id,
         .chat_id = chat_id,
@@ -146,19 +146,19 @@ fn cmdRun(init: std.process.Init, args: anytype) !void {
         std.process.exit(2);
     };
 
-    var t: Terminal = undefined;
-    try t.init(init);
-    defer t.deinit();
+    var terminal: Terminal = undefined;
+    try terminal.init(init);
+    defer terminal.deinit();
 
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &out_buf);
-    try cli.oneShot(&t.agent, prompt, &out.interface);
+    try cli.oneShot(&terminal.agent, prompt, &out.interface);
 }
 
 fn cmdChat(init: std.process.Init) !void {
-    var t: Terminal = undefined;
-    try t.init(init);
-    defer t.deinit();
+    var terminal: Terminal = undefined;
+    try terminal.init(init);
+    defer terminal.deinit();
 
     var in_buf: [cli.max_prompt]u8 = undefined;
     var in = std.Io.File.stdin().readerStreaming(init.io, &in_buf);
@@ -166,18 +166,18 @@ fn cmdChat(init: std.process.Init) !void {
     var out = std.Io.File.stdout().writer(init.io, &out_buf);
     var err_buf: [256]u8 = undefined;
     var err_out = std.Io.File.stderr().writer(init.io, &err_buf);
-    try cli.chat(&t.agent, &in.interface, &out.interface, &err_out.interface);
+    try cli.chat(&terminal.agent, &in.interface, &out.interface, &err_out.interface);
 }
 
 /// Inspection only: WAL lets this run while the daemon holds the poller lock.
 fn cmdDiary(init: std.process.Init, args: anytype) !void {
-    var s: Store = undefined;
-    var out = try s.open(init);
-    defer s.deinit();
+    var store: Store = undefined;
+    var out = try store.open(init);
+    defer store.deinit();
 
     const date = args.next();
     const now = std.Io.Timestamp.now(init.io, .real).toSeconds();
-    try cli.printDiary(init.gpa, init.io, try diaryDir(init, s.cfg), date, now, &out.interface);
+    try cli.printDiary(init.gpa, init.io, try diaryDir(init, store.cfg), date, now, &out.interface);
 }
 
 fn cmdMemory(init: std.process.Init, args: anytype) !void {
@@ -190,33 +190,33 @@ fn cmdMemory(init: std.process.Init, args: anytype) !void {
         std.process.exit(2);
     };
 
-    var s: Store = undefined;
-    var out = try s.open(init);
-    defer s.deinit();
+    var store: Store = undefined;
+    var out = try store.open(init);
+    defer store.deinit();
 
     const now = std.Io.Timestamp.now(init.io, .real).toSeconds();
-    try cli.printMemory(&s.db, init.gpa, query, now, &out.interface);
+    try cli.printMemory(&store.db, init.gpa, query, now, &out.interface);
 }
 
 fn cmdTasks(init: std.process.Init) !void {
-    var s: Store = undefined;
-    var out = try s.open(init);
-    defer s.deinit();
-    try cli.printTasks(&s.db, init.gpa, &out.interface);
+    var store: Store = undefined;
+    var out = try store.open(init);
+    defer store.deinit();
+    try cli.printTasks(&store.db, init.gpa, &out.interface);
 }
 
 fn cmdRoutines(init: std.process.Init) !void {
-    var s: Store = undefined;
-    var out = try s.open(init);
-    defer s.deinit();
-    try cli.printRoutines(&s.db, &out.interface);
+    var store: Store = undefined;
+    var out = try store.open(init);
+    defer store.deinit();
+    try cli.printRoutines(&store.db, &out.interface);
 }
 
 fn cmdStatus(init: std.process.Init) !void {
-    var s: Store = undefined;
-    var out = try s.open(init);
-    defer s.deinit();
-    try cli.printStatus(&s.db, &out.interface);
+    var store: Store = undefined;
+    var out = try store.open(init);
+    defer store.deinit();
+    try cli.printStatus(&store.db, &out.interface);
 }
 
 /// Each worker owns its database and HTTP client.
@@ -226,19 +226,19 @@ const Crew = struct {
     open: usize = 0,
     pool: worker.Pool = undefined,
 
-    fn init(self: *Crew, p: std.process.Init, cfg: config.Config, db: *Db, limiter: *@import("net/web.zig").Limiter) !void {
+    fn init(self: *Crew, process: std.process.Init, cfg: config.Config, db: *Db, limiter: *@import("net/web.zig").Limiter) !void {
         self.open = 0;
         errdefer self.closeOpen();
-        const diary_dir = try diaryDir(p, cfg);
+        const diary_dir = try diaryDir(process, cfg);
 
         var protos: [worker.max_live]agent.Agent = undefined;
-        for (&self.dbs, &self.https, &protos) |*wdb, *h, *proto| {
-            wdb.* = try openDb(p.io, cfg.data_dir);
+        for (&self.dbs, &self.https, &protos) |*database, *client, *proto| {
+            database.* = try openDb(process.io, cfg.data_dir);
             self.open += 1;
-            h.* = http.StdHttp.init(p.gpa, p.io);
-            proto.* = makeAgent(p, cfg, wdb, h, diary_dir, limiter);
+            client.* = http.StdHttp.init(process.gpa, process.io);
+            proto.* = makeAgent(process, cfg, database, client, diary_dir, limiter);
         }
-        self.pool = worker.Pool.init(p.gpa, db, protos);
+        self.pool = worker.Pool.init(process.gpa, db, protos);
     }
 
     fn deinit(self: *Crew) void {
@@ -247,9 +247,9 @@ const Crew = struct {
     }
 
     fn closeOpen(self: *Crew) void {
-        for (self.dbs[0..self.open], self.https[0..self.open]) |*wdb, *h| {
-            h.deinit();
-            wdb.close();
+        for (self.dbs[0..self.open], self.https[0..self.open]) |*database, *client| {
+            client.deinit();
+            database.close();
         }
         self.open = 0;
     }
@@ -264,25 +264,25 @@ const Terminal = struct {
     limiter: @import("net/web.zig").Limiter,
     agent: agent.Agent,
 
-    fn init(self: *Terminal, p: std.process.Init) !void {
-        self.io = p.io;
-        try self.store.init(p);
+    fn init(self: *Terminal, process: std.process.Init) !void {
+        self.io = process.io;
+        try self.store.init(process);
         errdefer self.store.deinit();
-        self.lock = try telegram.tryLock(p.io, self.store.cfg.data_dir) orelse return error.AlreadyRunning;
-        errdefer self.lock.close(p.io);
+        self.lock = try telegram.tryLock(process.io, self.store.cfg.data_dir) orelse return error.AlreadyRunning;
+        errdefer self.lock.close(process.io);
         try task_data.recoverApprovals(&self.store.db, std.math.maxInt(i64));
-        try learning_tools.reconcile(&self.store.db, p.gpa, p.io, self.store.cfg.workspace, self.store.cfg.skills_dir, std.Io.Timestamp.now(p.io, .real).toSeconds());
+        try learning_tools.reconcile(&self.store.db, process.gpa, process.io, self.store.cfg.workspace, self.store.cfg.skills_dir, std.Io.Timestamp.now(process.io, .real).toSeconds());
         if (self.store.cfg.api_key == null) return config.missing("LLM_API_KEY");
         if (self.store.cfg.model == null) return config.missing("LLM_MODEL");
 
-        self.http = http.StdHttp.init(p.gpa, p.io);
+        self.http = http.StdHttp.init(process.gpa, process.io);
         errdefer self.http.deinit();
 
         self.limiter = .{};
-        try self.crew.init(p, self.store.cfg, &self.store.db, &self.limiter);
+        try self.crew.init(process, self.store.cfg, &self.store.db, &self.limiter);
         errdefer self.crew.deinit();
 
-        self.agent = makeAgent(p, self.store.cfg, &self.store.db, &self.http, try diaryDir(p, self.store.cfg), &self.limiter);
+        self.agent = makeAgent(process, self.store.cfg, &self.store.db, &self.http, try diaryDir(process, self.store.cfg), &self.limiter);
         self.agent.workers = &self.crew.pool.state;
         self.agent.pool = &self.crew.pool;
     }
@@ -302,20 +302,20 @@ const Store = struct {
     db: Db,
     out_buf: [4096]u8 = undefined,
 
-    fn init(self: *Store, p: std.process.Init) !void {
-        self.gpa = p.gpa;
-        self.cfg = try config.loadRuntime(p.gpa, p.io, p.environ_map);
+    fn init(self: *Store, process: std.process.Init) !void {
+        self.gpa = process.gpa;
+        self.cfg = try config.loadRuntime(process.gpa, process.io, process.environ_map);
         errdefer self.cfg.deinit(self.gpa);
-        try createRuntimeDirs(p.gpa, p.io, self.cfg);
-        self.db = try openDb(p.io, self.cfg.data_dir);
+        try createRuntimeDirs(process.gpa, process.io, self.cfg);
+        self.db = try openDb(process.io, self.cfg.data_dir);
         errdefer self.db.close();
         try self.db.initSchema();
     }
 
     /// The returned writer borrows `self.out_buf`.
-    fn open(self: *Store, p: std.process.Init) !std.Io.File.Writer {
-        try self.init(p);
-        return std.Io.File.stdout().writer(p.io, &self.out_buf);
+    fn open(self: *Store, process: std.process.Init) !std.Io.File.Writer {
+        try self.init(process);
+        return std.Io.File.stdout().writer(process.io, &self.out_buf);
     }
 
     fn deinit(self: *Store) void {
@@ -326,15 +326,15 @@ const Store = struct {
 };
 
 /// The process arena owns the returned path.
-fn diaryDir(p: std.process.Init, cfg: config.Config) ![]const u8 {
-    return std.fmt.allocPrint(p.arena.allocator(), "{s}/diary", .{cfg.data_dir});
+fn diaryDir(process: std.process.Init, cfg: config.Config) ![]const u8 {
+    return std.fmt.allocPrint(process.arena.allocator(), "{s}/diary", .{cfg.data_dir});
 }
 
 /// Requires checked API key and model values.
-fn makeAgent(p: std.process.Init, cfg: config.Config, db: *Db, client: *http.StdHttp, diary: []const u8, limiter: *@import("net/web.zig").Limiter) agent.Agent {
+fn makeAgent(process: std.process.Init, cfg: config.Config, db: *Db, client: *http.StdHttp, diary: []const u8, limiter: *@import("net/web.zig").Limiter) agent.Agent {
     return .{
-        .gpa = p.gpa,
-        .io = p.io,
+        .gpa = process.gpa,
+        .io = process.io,
         .db = db,
         .http = client.http(),
         .api_key = cfg.api_key.?,
@@ -410,31 +410,31 @@ const stop = struct {
 
 /// SQLITE_OMIT_AUTOINIT means nothing initialises SQLite for us.
 fn sqliteVersion() []const u8 {
-    _ = c.sqlite3_initialize();
-    return std.mem.span(c.sqlite3_libversion());
+    _ = sqlite.sqlite3_initialize();
+    return std.mem.span(sqlite.sqlite3_libversion());
 }
 
 test "sqlite is linked with fts5 and bm25" {
-    _ = c.sqlite3_initialize();
+    _ = sqlite.sqlite3_initialize();
 
-    var db: ?*c.sqlite3 = null;
-    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_open(":memory:", &db));
-    defer _ = c.sqlite3_close(db);
+    var db: ?*sqlite.sqlite3 = null;
+    try std.testing.expectEqual(sqlite.SQLITE_OK, sqlite.sqlite3_open(":memory:", &db));
+    defer _ = sqlite.sqlite3_close(db);
 
     const setup =
         \\CREATE VIRTUAL TABLE chunks USING fts5(text, tokenize='porter');
         \\INSERT INTO chunks(text) VALUES('booked the appointment for tuesday');
     ;
-    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(db, setup, null, null, null));
+    try std.testing.expectEqual(sqlite.SQLITE_OK, sqlite.sqlite3_exec(db, setup, null, null, null));
 
     // Porter handles inflections, not synonyms.
-    var stmt: ?*c.sqlite3_stmt = null;
+    var stmt: ?*sqlite.sqlite3_stmt = null;
     const sql = "SELECT bm25(chunks) FROM chunks WHERE chunks MATCH 'appointments'";
-    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db, sql, -1, &stmt, null));
-    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(sqlite.SQLITE_OK, sqlite.sqlite3_prepare_v2(db, sql, -1, &stmt, null));
+    defer _ = sqlite.sqlite3_finalize(stmt);
 
-    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
-    try std.testing.expect(c.sqlite3_column_double(stmt, 0) < 0); // bm25 scores are negative
+    try std.testing.expectEqual(sqlite.SQLITE_ROW, sqlite.sqlite3_step(stmt));
+    try std.testing.expect(sqlite.sqlite3_column_double(stmt, 0) < 0); // bm25 scores are negative
 }
 
 test "sqlite reports the pinned version" {

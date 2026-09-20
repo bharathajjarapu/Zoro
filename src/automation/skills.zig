@@ -21,9 +21,9 @@ pub const Authority = enum {
     critical,
 
     pub fn of(text: ?[]const u8) Authority {
-        const t = text orelse return .notify;
-        inline for (std.meta.fields(Authority)) |f| {
-            if (std.ascii.eqlIgnoreCase(t, f.name)) return @field(Authority, f.name);
+        const value = text orelse return .notify;
+        inline for (std.meta.fields(Authority)) |field| {
+            if (std.ascii.eqlIgnoreCase(value, field.name)) return @field(Authority, field.name);
         }
         return .notify;
     }
@@ -131,9 +131,9 @@ pub fn save(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, markdown: []con
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const sub = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, skill.name });
     try std.Io.Dir.cwd().createDirPath(io, sub);
-    var d = try std.Io.Dir.cwd().openDir(io, sub, .{});
-    defer d.close(io);
-    var atomic = try d.createFileAtomic(io, "SKILL.md", .{ .replace = true });
+    var folder = try std.Io.Dir.cwd().openDir(io, sub, .{});
+    defer folder.close(io);
+    var atomic = try folder.createFileAtomic(io, "SKILL.md", .{ .replace = true });
     defer atomic.deinit(io);
     try atomic.file.writeStreamingAll(io, markdown);
     try atomic.replace(io);
@@ -145,9 +145,9 @@ pub fn remove(io: std.Io, dir: []const u8, name: []const u8) !void {
     if (!validName(name)) return error.BadName;
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const sub = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name });
-    var d = try std.Io.Dir.cwd().openDir(io, sub, .{});
-    defer d.close(io);
-    try d.deleteFile(io, "SKILL.md");
+    var folder = try std.Io.Dir.cwd().openDir(io, sub, .{});
+    defer folder.close(io);
+    try folder.deleteFile(io, "SKILL.md");
 }
 
 fn readSkill(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]u8 {
@@ -156,17 +156,17 @@ fn readSkill(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const 
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024));
 }
 
-fn unquote(s: []const u8) []const u8 {
-    if (s.len >= 2 and ((s[0] == '"' and s[s.len - 1] == '"') or (s[0] == '\'' and s[s.len - 1] == '\''))) {
-        return s[1 .. s.len - 1];
+fn unquote(text: []const u8) []const u8 {
+    if (text.len >= 2 and ((text[0] == '"' and text[text.len - 1] == '"') or (text[0] == '\'' and text[text.len - 1] == '\''))) {
+        return text[1 .. text.len - 1];
     }
-    return s;
+    return text;
 }
 
 pub fn validName(name: []const u8) bool {
     if (name.len == 0 or name.len > 64) return false;
-    for (name) |c| {
-        const ok = std.ascii.isAlphanumeric(c) or c == '-' or c == '_';
+    for (name) |byte| {
+        const ok = std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_';
         if (!ok) return false;
     }
     return name[0] != '-' and name[0] != '_';
@@ -225,7 +225,7 @@ test "parse requires name and description" {
 }
 
 test "parse reads required fields, body, and a schedule" {
-    const s = try parse(
+    const skill = try parse(
         \\---
         \\name: morning-brief
         \\description: Summarize overnight mail
@@ -235,11 +235,11 @@ test "parse reads required fields, body, and a schedule" {
         \\
         \\Check mail first.
     );
-    try testing.expectEqualStrings("morning-brief", s.name);
-    try testing.expectEqualStrings("Summarize overnight mail", s.description);
-    try testing.expectEqualStrings("0 7 * * *", s.schedule.?);
-    try testing.expectEqualStrings("fetch_url remember", s.allowed_tools.?);
-    try testing.expectEqualStrings("Check mail first.", s.body);
+    try testing.expectEqualStrings("morning-brief", skill.name);
+    try testing.expectEqualStrings("Summarize overnight mail", skill.description);
+    try testing.expectEqualStrings("0 7 * * *", skill.schedule.?);
+    try testing.expectEqualStrings("fetch_url remember", skill.allowed_tools.?);
+    try testing.expectEqualStrings("Check mail first.", skill.body);
 }
 
 test "learned skills cannot grant runtime authority" {

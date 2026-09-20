@@ -33,7 +33,7 @@ pub const Batch = struct {
     next_offset: ?i64 = null,
 
     pub fn deinit(self: *Batch, gpa: std.mem.Allocator) void {
-        for (self.items) |*u| u.deinit(gpa);
+        for (self.items) |*update| update.deinit(gpa);
         gpa.free(self.items);
         self.* = undefined;
     }
@@ -48,10 +48,8 @@ pub const Update = struct {
     reply_id: ?i64 = null,
     reply_text: ?[]u8 = null,
     kind: Kind = .text,
-    /// Text, caption, or attachment description.
     text: []u8,
     owner_text: ?[]u8 = null,
-    /// Photo selected for the model.
     photo: ?[]u8 = null,
     preview_id: ?[]u8 = null,
     file_id: ?[]u8 = null,
@@ -69,18 +67,18 @@ pub const Update = struct {
     pub fn deinit(self: *Update, gpa: std.mem.Allocator) void {
         gpa.free(self.chat_type);
         gpa.free(self.text);
-        if (self.owner_text) |s| gpa.free(s);
-        if (self.photo) |p| gpa.free(p);
-        if (self.preview_id) |p| gpa.free(p);
-        if (self.reply_text) |s| gpa.free(s);
-        if (self.file_id) |s| gpa.free(s);
-        if (self.file_name) |s| gpa.free(s);
-        if (self.mime) |s| gpa.free(s);
-        if (self.unique_id) |s| gpa.free(s);
-        if (self.emoji) |s| gpa.free(s);
-        if (self.sticker_type) |s| gpa.free(s);
-        if (self.callback_id) |s| gpa.free(s);
-        if (self.callback_data) |s| gpa.free(s);
+        if (self.owner_text) |text| gpa.free(text);
+        if (self.photo) |photo| gpa.free(photo);
+        if (self.preview_id) |preview| gpa.free(preview);
+        if (self.reply_text) |text| gpa.free(text);
+        if (self.file_id) |id| gpa.free(id);
+        if (self.file_name) |name| gpa.free(name);
+        if (self.mime) |mime| gpa.free(mime);
+        if (self.unique_id) |id| gpa.free(id);
+        if (self.emoji) |emoji| gpa.free(emoji);
+        if (self.sticker_type) |kind| gpa.free(kind);
+        if (self.callback_id) |id| gpa.free(id);
+        if (self.callback_data) |data| gpa.free(data);
         self.* = undefined;
     }
 };
@@ -161,23 +159,23 @@ const RawReaction = struct {
 /// Selects the largest photo under the cap.
 fn largest(sizes: []const RawPhoto) ?RawPhoto {
     var best: ?RawPhoto = null;
-    for (sizes) |p| {
-        if (p.file_id.len == 0 or (p.file_size orelse 0) > max_file) continue;
-        const area = @as(i128, @max(p.width, 0)) * @as(i128, @max(p.height, 0));
-        const best_area = if (best) |b| @as(i128, @max(b.width, 0)) * @as(i128, @max(b.height, 0)) else -1;
-        if (best == null or area > best_area or (area == best_area and (p.file_size orelse 0) > (best.?.file_size orelse 0))) best = p;
+    for (sizes) |photo| {
+        if (photo.file_id.len == 0 or (photo.file_size orelse 0) > max_file) continue;
+        const area = @as(i128, @max(photo.width, 0)) * @as(i128, @max(photo.height, 0));
+        const best_area = if (best) |current| @as(i128, @max(current.width, 0)) * @as(i128, @max(current.height, 0)) else -1;
+        if (best == null or area > best_area or (area == best_area and (photo.file_size orelse 0) > (best.?.file_size orelse 0))) best = photo;
     }
     return best;
 }
 
 /// Adds bounded attachment metadata before download.
-fn describe(gpa: std.mem.Allocator, caption: []const u8, f: RawFile) ![]u8 {
+fn describe(gpa: std.mem.Allocator, caption: []const u8, file: RawFile) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}{s}[attachment: {s}, {s}, {d} bytes]", .{
         caption,
         if (caption.len == 0) "" else "\n",
-        f.file_name orelse "unnamed",
-        f.mime_type orelse "unknown type",
-        f.file_size orelse 0,
+        file.file_name orelse "unnamed",
+        file.mime_type orelse "unknown type",
+        file.file_size orelse 0,
     });
 }
 
@@ -200,7 +198,7 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
 
     var items: std.ArrayList(Update) = .empty;
     errdefer {
-        for (items.items) |*u| u.deinit(gpa);
+        for (items.items) |*update| update.deinit(gpa);
         items.deinit(gpa);
     }
 
@@ -213,39 +211,39 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
         if (raw.callback_query) |cb| {
             if (cb.from.is_bot or cb.id.len == 0) continue;
             const msg = cb.message;
-            var u: Update = undefined;
+            var update: Update = undefined;
             {
-                const chat_type = try gpa.dupe(u8, if (msg) |m| m.chat.type else "");
+                const chat_type = try gpa.dupe(u8, if (msg) |message| message.chat.type else "");
                 errdefer gpa.free(chat_type);
                 const text = try gpa.dupe(u8, "");
                 errdefer gpa.free(text);
-                u = .{
+                update = .{
                     .update_id = raw.update_id,
                     .from_id = cb.from.id,
-                    .chat_id = if (msg) |m| m.chat.id else 0,
+                    .chat_id = if (msg) |message| message.chat.id else 0,
                     .chat_type = chat_type,
-                    .message_id = if (msg) |m| m.message_id else 0,
+                    .message_id = if (msg) |message| message.message_id else 0,
                     .kind = .callback,
                     .text = text,
                 };
             }
-            errdefer u.deinit(gpa);
-            u.callback_id = try gpa.dupe(u8, cb.id[0..@min(cb.id.len, max_callback)]);
+            errdefer update.deinit(gpa);
+            update.callback_id = try gpa.dupe(u8, cb.id[0..@min(cb.id.len, max_callback)]);
             const data = cb.data orelse "";
-            if (data.len <= max_callback) u.callback_data = try gpa.dupe(u8, data);
-            try items.append(gpa, u);
+            if (data.len <= max_callback) update.callback_data = try gpa.dupe(u8, data);
+            try items.append(gpa, update);
             continue;
         }
         if (raw.message_reaction) |reaction| {
             const from = reaction.user orelse continue;
             if (from.is_bot) continue;
-            var u: Update = undefined;
+            var update: Update = undefined;
             {
                 const chat_type = try gpa.dupe(u8, reaction.chat.type);
                 errdefer gpa.free(chat_type);
                 const text = try gpa.dupe(u8, "");
                 errdefer gpa.free(text);
-                u = .{
+                update = .{
                     .update_id = raw.update_id,
                     .from_id = from.id,
                     .chat_id = reaction.chat.id,
@@ -255,8 +253,8 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
                     .text = text,
                 };
             }
-            errdefer u.deinit(gpa);
-            try items.append(gpa, u);
+            errdefer update.deinit(gpa);
+            try items.append(gpa, update);
             continue;
         }
 
@@ -269,27 +267,27 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
         const picture = if (msg.photo) |sizes| largest(sizes) else null;
         var file: ?RawFile = null;
         var kind: Kind = if (picture != null) .photo else .text;
-        if (msg.document) |f| {
-            file = f;
+        if (msg.document) |document| {
+            file = document;
             kind = .document;
         }
-        if (msg.audio) |f| {
-            file = f;
+        if (msg.audio) |audio| {
+            file = audio;
             kind = .audio;
         }
-        if (msg.voice) |f| {
-            file = f;
+        if (msg.voice) |voice| {
+            file = voice;
             kind = .voice;
         }
-        if (msg.video) |f| {
-            file = f;
+        if (msg.video) |video| {
+            file = video;
             kind = .video;
         }
-        if (msg.animation) |f| {
-            file = f;
+        if (msg.animation) |animation| {
+            file = animation;
             kind = .animation;
         }
-        if (file) |f| if (f.file_id.len == 0) {
+        if (file) |value| if (value.file_id.len == 0) {
             file = null;
             kind = .text;
         };
@@ -298,7 +296,7 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
         if (msg.location != null) kind = .location;
         if (caption.len == 0 and picture == null and file == null and sticker == null and msg.location == null) continue;
 
-        var u: Update = undefined;
+        var update: Update = undefined;
         {
             const chat_type = try gpa.dupe(u8, msg.chat.type);
             errdefer gpa.free(chat_type);
@@ -307,11 +305,11 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
                 break :blk if (text.len <= max_text) try gpa.dupe(u8, text) else null;
             } else null;
             errdefer if (reply_text) |text| gpa.free(text);
-            const text = if (file) |f| try describe(gpa, caption, f) else try gpa.dupe(u8, caption);
+            const text = if (file) |value| try describe(gpa, caption, value) else try gpa.dupe(u8, caption);
             errdefer gpa.free(text);
             const owner_text = if (caption.len == 0) null else try gpa.dupe(u8, caption);
             errdefer if (owner_text) |owner| gpa.free(owner);
-            u = .{
+            update = .{
                 .update_id = raw.update_id,
                 .from_id = from.id,
                 .chat_id = msg.chat.id,
@@ -324,39 +322,39 @@ pub fn parseUpdates(gpa: std.mem.Allocator, body: []const u8) !Batch {
                 .owner_text = owner_text,
             };
         }
-        errdefer u.deinit(gpa);
-        if (picture) |p| {
-            u.photo = try gpa.dupe(u8, p.file_id);
-            u.file_size = p.file_size;
+        errdefer update.deinit(gpa);
+        if (picture) |photo| {
+            update.photo = try gpa.dupe(u8, photo.file_id);
+            update.file_size = photo.file_size;
         }
-        if (file) |f| {
-            u.file_id = try gpa.dupe(u8, f.file_id);
-            u.file_name = if (f.file_name) |s| try gpa.dupe(u8, s) else null;
-            u.mime = if (f.mime_type) |s| try gpa.dupe(u8, s) else null;
-            u.file_size = f.file_size;
-            if (f.thumbnail) |p| {
-                if (p.file_id.len != 0) u.preview_id = try gpa.dupe(u8, p.file_id);
+        if (file) |value| {
+            update.file_id = try gpa.dupe(u8, value.file_id);
+            update.file_name = if (value.file_name) |name| try gpa.dupe(u8, name) else null;
+            update.mime = if (value.mime_type) |mime| try gpa.dupe(u8, mime) else null;
+            update.file_size = value.file_size;
+            if (value.thumbnail) |photo| {
+                if (photo.file_id.len != 0) update.preview_id = try gpa.dupe(u8, photo.file_id);
             }
         }
-        if (sticker) |s| {
-            if (s.file_id.len == 0) {
-                u.deinit(gpa);
+        if (sticker) |value| {
+            if (value.file_id.len == 0) {
+                update.deinit(gpa);
                 continue;
             }
-            u.file_id = try gpa.dupe(u8, s.file_id);
-            u.unique_id = try gpa.dupe(u8, s.file_unique_id);
-            u.emoji = if (s.emoji) |emoji| try gpa.dupe(u8, emoji) else null;
-            u.file_size = s.file_size;
-            u.sticker_type = try gpa.dupe(u8, if (s.is_video) "video" else if (s.is_animated) "animated" else "static");
-            if (s.thumbnail) |p| {
-                if (p.file_id.len != 0) u.preview_id = try gpa.dupe(u8, p.file_id);
+            update.file_id = try gpa.dupe(u8, value.file_id);
+            update.unique_id = try gpa.dupe(u8, value.file_unique_id);
+            update.emoji = if (value.emoji) |emoji| try gpa.dupe(u8, emoji) else null;
+            update.file_size = value.file_size;
+            update.sticker_type = try gpa.dupe(u8, if (value.is_video) "video" else if (value.is_animated) "animated" else "static");
+            if (value.thumbnail) |photo| {
+                if (photo.file_id.len != 0) update.preview_id = try gpa.dupe(u8, photo.file_id);
             }
         }
         if (msg.location) |loc| {
-            u.latitude = loc.latitude;
-            u.longitude = loc.longitude;
+            update.latitude = loc.latitude;
+            update.longitude = loc.longitude;
         }
-        try items.append(gpa, u);
+        try items.append(gpa, update);
     }
 
     return .{

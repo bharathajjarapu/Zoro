@@ -1,4 +1,3 @@
-//! Fixed-buffer test scaffolding.
 const std = @import("std");
 const agent = @import("../agent/root.zig");
 const Db = @import("../data/db.zig").Db;
@@ -6,13 +5,12 @@ const testing = std.testing;
 
 pub const max_calls = 32;
 
-/// Returns canned HTTP responses in order.
 pub const FakeHttp = struct {
     bodies: []const []const u8 = &.{},
     /// Per-call status codes; falls back to `status` once exhausted.
     statuses: []const u16 = &.{},
     status: u16 = 200,
-    i: usize = 0,
+    index: usize = 0,
     /// Cancels workers on the first call.
     trip: ?*agent.Workers = null,
     /// Parks inside the call so a test can observe several in flight at once.
@@ -23,43 +21,41 @@ pub const FakeHttp = struct {
     body_len: usize = 0,
     urls: [max_calls][160]u8 = undefined,
     url_lens: [max_calls]usize = @splat(0),
-    n: usize = 0,
+    count: usize = 0,
 
     pub fn http(self: *FakeHttp) agent.Http {
         return .{ .ptr = self, .post_fn = post };
     }
 
-    /// The request body of the most recent call.
     pub fn sent(self: *FakeHttp) []const u8 {
         return self.body[0..self.body_len];
     }
 
-    /// The URL of call `i`, in order.
-    pub fn url(self: *FakeHttp, i: usize) []const u8 {
-        return self.urls[i][0..self.url_lens[i]];
+    pub fn url(self: *FakeHttp, index: usize) []const u8 {
+        return self.urls[index][0..self.url_lens[index]];
     }
 
     pub fn sentUrl(self: *FakeHttp) []const u8 {
-        return if (self.n == 0) "" else self.url(self.n - 1);
+        return if (self.count == 0) "" else self.url(self.count - 1);
     }
 
     fn post(ptr: *anyopaque, gpa: std.mem.Allocator, req: agent.Http.Request) anyerror!agent.Http.Response {
         const self: *FakeHttp = @ptrCast(@alignCast(ptr));
         self.body_len = @min(req.body.len, self.body.len);
         @memcpy(self.body[0..self.body_len], req.body[0..self.body_len]);
-        if (self.n < max_calls) {
-            const k = @min(req.url.len, self.urls[self.n].len);
-            @memcpy(self.urls[self.n][0..k], req.url[0..k]);
-            self.url_lens[self.n] = k;
-            self.n += 1;
+        if (self.count < max_calls) {
+            const size = @min(req.url.len, self.urls[self.count].len);
+            @memcpy(self.urls[self.count][0..size], req.url[0..size]);
+            self.url_lens[self.count] = size;
+            self.count += 1;
         }
-        if (self.trip) |w| w.stop.store(true, .release);
-        if (self.hold) |h| while (h.load(.acquire)) std.atomic.spinLoopHint();
-        if (self.i >= self.bodies.len) return error.TooManyCalls;
-        const st: u16 = if (self.i < self.statuses.len) self.statuses[self.i] else self.status;
-        const body = try gpa.dupe(u8, self.bodies[self.i]);
-        self.i += 1;
-        return .{ .status = st, .body = body };
+        if (self.trip) |workers| workers.stop.store(true, .release);
+        if (self.hold) |gate| while (gate.load(.acquire)) std.atomic.spinLoopHint();
+        if (self.index >= self.bodies.len) return error.TooManyCalls;
+        const status: u16 = if (self.index < self.statuses.len) self.statuses[self.index] else self.status;
+        const body = try gpa.dupe(u8, self.bodies[self.index]);
+        self.index += 1;
+        return .{ .status = status, .body = body };
     }
 };
 

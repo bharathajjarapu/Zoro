@@ -74,10 +74,10 @@ fn runSearch(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     try allow(ctx, "api.search.tinyfish.ai");
 
     var url_buf: [1024]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&url_buf);
-    try w.writeAll(search_url);
-    try std.Uri.Component.percentEncode(&w, query, isUnreserved);
-    return call(ctx, .GET, w.buffered(), null);
+    var writer: std.Io.Writer = .fixed(&url_buf);
+    try writer.writeAll(search_url);
+    try std.Uri.Component.percentEncode(&writer, query, isUnreserved);
+    return call(ctx, .GET, writer.buffered(), null);
 }
 
 fn runWatch(ctx: *Ctx, args: []const u8) ![]u8 {
@@ -97,11 +97,11 @@ fn runWatch(ctx: *Ctx, args: []const u8) ![]u8 {
     const hex = std.fmt.bytesToHex(digest, .lower);
     var key_buf: [72]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "watch:{s}", .{parsed.value.key});
-    var q = try ctx.db.prepare("SELECT value FROM kv WHERE key = ?");
-    defer q.finalize();
-    try q.bind(1, key);
-    const found = try q.step();
-    const same = found and std.mem.eql(u8, q.text(0), &hex);
+    var statement = try ctx.db.prepare("SELECT value FROM kv WHERE key = ?");
+    defer statement.finalize();
+    try statement.bind(1, key);
+    const found = try statement.step();
+    const same = found and std.mem.eql(u8, statement.text(0), &hex);
     if (same) return ctx.gpa.dupe(u8, "unchanged");
 
     var upsert = try ctx.db.prepare("INSERT INTO kv(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
@@ -114,7 +114,7 @@ fn runWatch(ctx: *Ctx, args: []const u8) ![]u8 {
 
 fn validWatchKey(key: []const u8) bool {
     if (key.len == 0 or key.len > 64 or !std.ascii.isLower(key[0])) return false;
-    for (key[1..]) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_' or c == '-')) return false;
+    for (key[1..]) |byte| if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '_' or byte == '-')) return false;
     return true;
 }
 
@@ -149,8 +149,8 @@ fn fetchText(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
     return gpa.dupe(u8, parsed.value.results[0].text);
 }
 
-fn isUnreserved(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
+fn isUnreserved(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~';
 }
 
 const FakeApi = struct {

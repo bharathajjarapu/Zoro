@@ -39,8 +39,8 @@ fn runNow(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
 }
 
 fn update(db: *Db, sql: [:0]const u8, name: []const u8) !void {
-    var q = try db.prepare(sql);
-    defer q.finalize();
-    try q.bind(1, name);
-    _ = try q.step();
+    var statement = try db.prepare(sql);
+    defer statement.finalize();
+    try statement.bind(1, name);
+    _ = try statement.step();
 }

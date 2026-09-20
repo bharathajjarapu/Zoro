@@ -42,7 +42,7 @@ const Slot = struct {
     fn release(self: *Slot, gpa: std.mem.Allocator) void {
         gpa.free(self.summary);
         gpa.free(self.goal);
-        if (self.allowed) |a| gpa.free(a);
+        if (self.allowed) |allowed| gpa.free(allowed);
         self.summary = &.{};
         self.goal = &.{};
         self.allowed = null;
@@ -59,12 +59,11 @@ pub const Pool = struct {
     root_id: i64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, db: *Db, protos: [max_live]agent.Agent) Pool {
-        var p: Pool = .{ .gpa = gpa, .db = db, .slots = undefined };
-        for (&p.slots, protos) |*slot, proto| slot.* = .{ .proto = proto };
-        return p;
+        var pool: Pool = .{ .gpa = gpa, .db = db, .slots = undefined };
+        for (&pool.slots, protos) |*slot, proto| slot.* = .{ .proto = proto };
+        return pool;
     }
 
-    /// Cancels and joins every worker.
     pub fn deinit(self: *Pool) void {
         self.state.stop.store(true, .release);
         self.join();
@@ -73,7 +72,7 @@ pub const Pool = struct {
 
     pub fn join(self: *Pool) void {
         for (&self.slots) |*slot| {
-            if (slot.thread) |t| t.join();
+            if (slot.thread) |thread| thread.join();
             slot.thread = null;
             slot.release(self.gpa);
         }
@@ -92,7 +91,6 @@ pub const Pool = struct {
         return false;
     }
 
-    /// Queues work and starts it when a slot is free.
     pub fn spawn(self: *Pool, summary: []const u8, goal: []const u8, allowed: ?[]const u8, now: i64) !i64 {
         const parent = try self.rootTask(now);
         try self.pump(now);
@@ -104,19 +102,18 @@ pub const Pool = struct {
         return id;
     }
 
-    /// Starts queued work in free slots.
     pub fn pump(self: *Pool, now: i64) !void {
         if (self.root_id == 0) return;
-        var q = try self.db.prepare(
+        var statement = try self.db.prepare(
             \\SELECT id, summary, goal FROM tasks
             \\WHERE parent = ? AND status = 'queued' AND (due IS NULL OR due <= ?)
             \\ORDER BY prio DESC, id
         );
-        defer q.finalize();
-        try q.bind(1, self.root_id);
-        try q.bind(2, now);
-        while (try q.step()) {
-            self.start(q.int(0), q.text(1), q.text(2), null) catch |err| switch (err) {
+        defer statement.finalize();
+        try statement.bind(1, self.root_id);
+        try statement.bind(2, now);
+        while (try statement.step()) {
+            self.start(statement.int(0), statement.text(1), statement.text(2), null) catch |err| switch (err) {
                 error.Busy => return,
                 else => return err,
             };
@@ -131,14 +128,14 @@ pub const Pool = struct {
 
     /// The primary thread alone updates slots.
     fn start(self: *Pool, id: i64, summary: []const u8, goal: []const u8, allowed: ?[]const u8) !void {
-        const i = try self.freeSlot();
+        const index = try self.freeSlot();
         // Clear cancellation after the stopped batch exits.
         if (self.state.count() == 0) self.state.stop.store(false, .release);
-        const slot = &self.slots[i];
+        const slot = &self.slots[index];
         slot.summary = try self.gpa.dupe(u8, summary);
         errdefer slot.release(self.gpa);
         slot.goal = try self.gpa.dupe(u8, goal);
-        slot.allowed = if (allowed) |a| try self.gpa.dupe(u8, a) else null;
+        slot.allowed = if (allowed) |list| try self.gpa.dupe(u8, list) else null;
         slot.task = id;
         slot.done.store(false, .release);
         slot.cancel.stop.store(false, .release);
@@ -147,7 +144,7 @@ pub const Pool = struct {
 
         try tasks.setStatus(self.db, id, .running);
         _ = self.state.live.fetchAdd(1, .release);
-        slot.thread = std.Thread.spawn(.{}, work, .{ self, i }) catch |err| {
+        slot.thread = std.Thread.spawn(.{}, work, .{ self, index }) catch |err| {
             _ = self.state.live.fetchSub(1, .release);
             return err;
         };
@@ -155,20 +152,20 @@ pub const Pool = struct {
 
     /// Joins a finished thread before reuse.
     fn freeSlot(self: *Pool) !usize {
-        for (&self.slots, 0..) |*slot, i| {
-            if (slot.thread == null) return i;
+        for (&self.slots, 0..) |*slot, index| {
+            if (slot.thread == null) return index;
             if (!slot.done.load(.acquire)) continue;
             slot.thread.?.join();
             slot.thread = null;
             slot.release(self.gpa);
-            return i;
+            return index;
         }
         return error.Busy;
     }
 };
 
-fn work(self: *Pool, i: usize) void {
-    const slot = &self.slots[i];
+fn work(self: *Pool, index: usize) void {
+    const slot = &self.slots[index];
     defer {
         _ = self.state.live.fetchSub(1, .release);
         slot.done.store(true, .release);
@@ -206,7 +203,6 @@ fn work(self: *Pool, i: usize) void {
     };
 }
 
-/// Checks consequential work before reporting success.
 fn finish(self: *Pool, slot: *Slot, reply: []const u8, now: i64) !void {
     const db = slot.proto.db;
     if (!consequential(slot.goal)) return store(self.gpa, db, slot.task, .done, "unverified (bounded research)", reply);
@@ -243,7 +239,6 @@ fn followUp(self: *Pool, slot: *Slot, why: []const u8, now: i64) !void {
     _ = try tasks.create(slot.proto.db, summary, goal, now, self.root_id, 1);
 }
 
-/// Detects goals with external consequences.
 fn consequential(goal: []const u8) bool {
     const acts = [_][]const u8{
         "send",   "email",  "post",     "message", "reply",  "buy",
@@ -251,16 +246,16 @@ fn consequential(goal: []const u8) bool {
         "update", "cancel", "transfer", "publish", "deploy", "install",
         "commit", "upload", "schedule", "routine",
     };
-    for (acts) |w| if (hasWord(goal, w)) return true;
+    for (acts) |word| if (hasWord(goal, word)) return true;
     return false;
 }
 
 fn hasWord(text: []const u8, word: []const u8) bool {
     var at: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(text, at, word)) |i| {
-        at = i + 1;
-        const before_ok = i == 0 or !std.ascii.isAlphanumeric(text[i - 1]);
-        const end = i + word.len;
+    while (std.ascii.indexOfIgnoreCasePos(text, at, word)) |index| {
+        at = index + 1;
+        const before_ok = index == 0 or !std.ascii.isAlphanumeric(text[index - 1]);
+        const end = index + word.len;
         // Allows the inflections a goal is actually written in: sends, sending, emailed.
         const after_ok = end == text.len or !std.ascii.isAlphanumeric(text[end]);
         if (before_ok and (after_ok or trailing(text[end..]))) return true;
@@ -295,11 +290,11 @@ fn giveUp(db: *Db, id: i64, why: []const u8) void {
 }
 
 fn setResult(db: *Db, id: i64, text: []const u8) !void {
-    var q = try db.prepare("UPDATE tasks SET result = ? WHERE id = ?");
-    defer q.finalize();
-    try q.bind(1, text);
-    try q.bind(2, id);
-    _ = try q.step();
+    var statement = try db.prepare("UPDATE tasks SET result = ? WHERE id = ?");
+    defer statement.finalize();
+    try statement.bind(1, text);
+    try statement.bind(2, id);
+    _ = try statement.step();
 }
 
 const delegate_params = [_]tools.Param{
@@ -365,12 +360,10 @@ fn runCheck(ctx: *tools.Ctx, _: []const u8) anyerror![]u8 {
     return tasks.formatList(ctx.gpa, items);
 }
 
-/// One fake HTTP client per worker slot.
 const said_done = "{\"choices\":[{\"message\":{\"content\":\"DONE\"}}]}";
 const said_failed = "{\"choices\":[{\"message\":{\"content\":\"FAILED nothing was actually sent\"}}]}";
 const said_ok = "{\"choices\":[{\"message\":{\"content\":\"finished\"}}]}";
 
-/// Mirrors production worker ownership in tests.
 const Rig = struct {
     tmp: testing.TmpDir,
     threaded: std.Io.Threaded,
@@ -429,9 +422,9 @@ const Rig = struct {
     }
 
     fn statusOf(self: *Rig, id: i64) ![]const u8 {
-        var t = (try tasks.get(&self.main_db, testing.allocator, id)) orelse return error.NoTask;
-        defer t.deinit(testing.allocator);
-        return @tagName(t.status);
+        var task = (try tasks.get(&self.main_db, testing.allocator, id)) orelse return error.NoTask;
+        defer task.deinit(testing.allocator);
+        return @tagName(task.status);
     }
 };
 
@@ -457,11 +450,11 @@ test "at most three subagents run at once; the fourth waits its turn" {
     defer rig.deinit();
 
     var held: std.atomic.Value(bool) = .init(true);
-    for (&rig.fakes) |*f| f.hold = &held;
+    for (&rig.fakes) |*fake| fake.hold = &held;
 
-    for (0..3) |i| {
+    for (0..3) |index| {
         var buf: [16]u8 = undefined;
-        _ = try rig.pool.spawn(try std.fmt.bufPrint(&buf, "job{d}", .{i}), "Summarize the news.", null, 100);
+        _ = try rig.pool.spawn(try std.fmt.bufPrint(&buf, "job{d}", .{index}), "Summarize the news.", null, 100);
     }
     try testing.expectEqual(max_live, rig.pool.live());
 
@@ -472,7 +465,7 @@ test "at most three subagents run at once; the fourth waits its turn" {
     rig.pool.join();
     try testing.expectEqual(@as(usize, 0), rig.pool.live());
 
-    for (&rig.fakes) |*f| f.i = 0;
+    for (&rig.fakes) |*fake| fake.index = 0;
     try rig.pool.pump(100);
     rig.pool.join();
     try testing.expectEqualStrings("done", try rig.statusOf(fourth));
@@ -481,12 +474,12 @@ test "at most three subagents run at once; the fourth waits its turn" {
 test "a subagent is handed no way to delegate and no tool that reaches Telegram" {
     const list = try tools.subset(testing.allocator, &tools.builtins, false, null);
     defer testing.allocator.free(list);
-    for (list) |t| {
-        try testing.expect(!std.mem.eql(u8, t.name, "delegate"));
-        try testing.expect(!std.mem.eql(u8, t.name, "notify_owner"));
-        try testing.expect(!std.mem.eql(u8, t.name, "attach_file"));
-        try testing.expect(!std.mem.eql(u8, t.name, "send_sticker"));
-        try testing.expect(std.mem.indexOf(u8, t.name, "telegram") == null);
+    for (list) |tool| {
+        try testing.expect(!std.mem.eql(u8, tool.name, "delegate"));
+        try testing.expect(!std.mem.eql(u8, tool.name, "notify_owner"));
+        try testing.expect(!std.mem.eql(u8, tool.name, "attach_file"));
+        try testing.expect(!std.mem.eql(u8, tool.name, "send_sticker"));
+        try testing.expect(std.mem.indexOf(u8, tool.name, "telegram") == null);
     }
 }
 
@@ -516,12 +509,12 @@ test "stop halts a subagent between rounds and the task lands cancelled" {
     const id = try rig.pool.spawn("slow", "Summarize the news.", null, 100);
     rig.pool.join();
 
-    try testing.expectEqual(@as(usize, 1), rig.fakes[0].i); // it never asked again
+    try testing.expectEqual(@as(usize, 1), rig.fakes[0].index);
     try testing.expectEqualStrings("cancelled", try rig.statusOf(id));
 
-    var t = (try tasks.get(&rig.main_db, testing.allocator, id)).?;
-    defer t.deinit(testing.allocator);
-    try testing.expectEqualStrings("cancelled by the owner", t.result.?);
+    var task = (try tasks.get(&rig.main_db, testing.allocator, id)).?;
+    defer task.deinit(testing.allocator);
+    try testing.expectEqualStrings("cancelled by the owner", task.result.?);
 }
 
 test "bounded research is taken at its word; a consequential goal is checked" {
@@ -538,13 +531,13 @@ test "bounded research is taken at its word; a consequential goal is checked" {
     held.store(false, .release);
     rig.pool.join();
 
-    try testing.expectEqual(@as(usize, 1), rig.fakes[0].i); // no second call: not verified
-    try testing.expectEqual(@as(usize, 2), rig.fakes[1].i); // work, then the check
+    try testing.expectEqual(@as(usize, 1), rig.fakes[0].index);
+    try testing.expectEqual(@as(usize, 2), rig.fakes[1].index);
     try testing.expectEqualStrings("done", try rig.statusOf(acted));
 
-    var t = (try tasks.get(&rig.main_db, testing.allocator, acted)).?;
-    defer t.deinit(testing.allocator);
-    try testing.expect(std.mem.startsWith(u8, t.result.?, "verified"));
+    var task = (try tasks.get(&rig.main_db, testing.allocator, acted)).?;
+    defer task.deinit(testing.allocator);
+    try testing.expect(std.mem.startsWith(u8, task.result.?, "verified"));
 }
 
 test "a subagent that fails its criterion spawns a follow-up, not a false success" {
@@ -560,15 +553,15 @@ test "a subagent that fails its criterion spawns a follow-up, not a false succes
     const items = try tasks.list(&rig.main_db, testing.allocator);
     defer tasks.freeTasks(testing.allocator, items);
     var follow: ?i64 = null;
-    for (items) |t| {
-        if (std.mem.startsWith(u8, t.summary, follow_mark)) follow = t.id;
+    for (items) |task| {
+        if (std.mem.startsWith(u8, task.summary, follow_mark)) follow = task.id;
     }
     try testing.expect(follow != null);
 
-    var f = (try tasks.get(&rig.main_db, testing.allocator, follow.?)).?;
-    defer f.deinit(testing.allocator);
-    try testing.expectEqual(rig.pool.root_id, f.parent.?);
-    try testing.expect(std.mem.indexOf(u8, f.goal, "nothing was actually sent") != null);
+    var task = (try tasks.get(&rig.main_db, testing.allocator, follow.?)).?;
+    defer task.deinit(testing.allocator);
+    try testing.expectEqual(rig.pool.root_id, task.parent.?);
+    try testing.expect(std.mem.indexOf(u8, task.goal, "nothing was actually sent") != null);
 }
 
 test "consequential goals are told apart from bounded research" {
@@ -588,10 +581,10 @@ test "the owner is answered while subagents keep running, and stop cancels them"
     rig.owner_fake.bodies = &.{said_ok};
 
     var held: std.atomic.Value(bool) = .init(true);
-    for (&rig.fakes) |*f| f.hold = &held;
-    for (0..3) |i| {
+    for (&rig.fakes) |*fake| fake.hold = &held;
+    for (0..3) |index| {
         var buf: [16]u8 = undefined;
-        _ = try rig.pool.spawn(try std.fmt.bufPrint(&buf, "job{d}", .{i}), "Summarize the news.", null, 100);
+        _ = try rig.pool.spawn(try std.fmt.bufPrint(&buf, "job{d}", .{index}), "Summarize the news.", null, 100);
     }
 
     const answer = try rig.primary.turn("what is the weather");
@@ -602,7 +595,7 @@ test "the owner is answered while subagents keep running, and stop cancels them"
     const stopped = try rig.primary.turn("stop");
     defer testing.allocator.free(stopped);
     try testing.expect(std.mem.indexOf(u8, stopped, "Stopping 3") != null);
-    try testing.expectEqual(@as(usize, 1), rig.owner_fake.i); // "stop" spent no model call
+    try testing.expectEqual(@as(usize, 1), rig.owner_fake.index);
 
     held.store(false, .release);
     rig.pool.join();
@@ -615,7 +608,7 @@ test "one task is called off without touching the other two" {
     defer rig.deinit();
 
     var held: std.atomic.Value(bool) = .init(true);
-    for (&rig.fakes) |*f| f.hold = &held;
+    for (&rig.fakes) |*fake| fake.hold = &held;
 
     const doomed = try rig.pool.spawn("job0", "Summarize the news.", null, 100);
     const spared = try rig.pool.spawn("job1", "Summarize the news.", null, 100);
@@ -691,18 +684,18 @@ test "a subagent that could act is never retried; research is re-queued with bac
     held.store(false, .release);
     rig.pool.join();
 
-    var a = (try tasks.get(&rig.main_db, testing.allocator, acted)).?;
-    defer a.deinit(testing.allocator);
-    try testing.expectEqual(tasks.Status.failed, a.status);
-    try testing.expect(std.mem.indexOf(u8, a.result.?, "do not retry") != null);
+    var action = (try tasks.get(&rig.main_db, testing.allocator, acted)).?;
+    defer action.deinit(testing.allocator);
+    try testing.expectEqual(tasks.Status.failed, action.status);
+    try testing.expect(std.mem.indexOf(u8, action.result.?, "do not retry") != null);
 
-    var r = (try tasks.get(&rig.main_db, testing.allocator, research)).?;
-    defer r.deinit(testing.allocator);
-    try testing.expectEqual(tasks.Status.queued, r.status);
-    try testing.expectEqual(@as(i64, 1), r.tries);
+    var task = (try tasks.get(&rig.main_db, testing.allocator, research)).?;
+    defer task.deinit(testing.allocator);
+    try testing.expectEqual(tasks.Status.queued, task.status);
+    try testing.expectEqual(@as(i64, 1), task.tries);
     // Real time makes the exact retry deadline nondeterministic.
-    try testing.expect(r.due.? > 100);
+    try testing.expect(task.due.? > 100);
 
-    try rig.pool.pump(r.due.? - 1);
+    try rig.pool.pump(task.due.? - 1);
     try testing.expectEqualStrings("queued", try rig.statusOf(research));
 }

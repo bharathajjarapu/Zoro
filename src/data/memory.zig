@@ -9,8 +9,8 @@ pub const Source = enum {
     owner,
     inferred,
 
-    fn parse(s: []const u8) Source {
-        return if (std.mem.eql(u8, s, "owner")) .owner else .inferred;
+    fn parse(text: []const u8) Source {
+        return if (std.mem.eql(u8, text, "owner")) .owner else .inferred;
     }
 };
 
@@ -36,28 +36,28 @@ pub fn put(db: *Db, key: []const u8, value: []const u8, source: Source, now: i64
     try db.exec("BEGIN");
     errdefer db.exec("ROLLBACK") catch {};
 
-    var q = try db.prepare("SELECT value, source FROM facts WHERE key = ?");
-    defer q.finalize();
-    try q.bind(1, key);
-    if (try q.step()) {
-        if (Source.parse(q.text(1)) == .owner and source == .inferred) {
+    var statement = try db.prepare("SELECT value, source FROM facts WHERE key = ?");
+    defer statement.finalize();
+    try statement.bind(1, key);
+    if (try statement.step()) {
+        if (Source.parse(statement.text(1)) == .owner and source == .inferred) {
             try db.exec("COMMIT");
             return;
         }
-        if (source == .inferred and !std.mem.eql(u8, q.text(0), value)) {
+        if (source == .inferred and !std.mem.eql(u8, statement.text(0), value)) {
             try db.exec("COMMIT");
             return;
         }
-        var u = try db.prepare(
+        var update = try db.prepare(
             "UPDATE facts SET value = ?, source = ?, updated = ?, expires = ? WHERE key = ?",
         );
-        defer u.finalize();
-        try u.bind(1, value);
-        try u.bind(2, @tagName(source));
-        try u.bind(3, now);
-        try u.bind(4, expires);
-        try u.bind(5, key);
-        _ = try u.step();
+        defer update.finalize();
+        try update.bind(1, value);
+        try update.bind(2, @tagName(source));
+        try update.bind(3, now);
+        try update.bind(4, expires);
+        try update.bind(5, key);
+        _ = try update.step();
     } else {
         var ins = try db.prepare(
             \\INSERT INTO facts(key, value, source, confidence, created, updated, expires)
@@ -98,27 +98,27 @@ fn reindex(db: *Db, kind: []const u8, ref: []const u8, text: []const u8) !void {
 
 /// Returns null when missing or expired. Caller owns the fact.
 pub fn get(db: *Db, gpa: std.mem.Allocator, key: []const u8, now: i64) !?Fact {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\SELECT key, value, source, confidence, created, updated, expires
         \\FROM facts WHERE key = ? AND (expires IS NULL OR expires > ?)
     );
-    defer q.finalize();
-    try q.bind(1, key);
-    try q.bind(2, now);
-    if (!try q.step()) return null;
+    defer statement.finalize();
+    try statement.bind(1, key);
+    try statement.bind(2, now);
+    if (!try statement.step()) return null;
 
-    const k = try gpa.dupe(u8, q.text(0));
-    errdefer gpa.free(k);
-    const v = try gpa.dupe(u8, q.text(1));
-    errdefer gpa.free(v);
+    const owned_key = try gpa.dupe(u8, statement.text(0));
+    errdefer gpa.free(owned_key);
+    const owned_value = try gpa.dupe(u8, statement.text(1));
+    errdefer gpa.free(owned_value);
     return .{
-        .key = k,
-        .value = v,
-        .source = .parse(q.text(2)),
-        .confidence = q.float(3),
-        .created = q.int(4),
-        .updated = q.int(5),
-        .expires = if (q.isNull(6)) null else q.int(6),
+        .key = owned_key,
+        .value = owned_value,
+        .source = .parse(statement.text(2)),
+        .confidence = statement.float(3),
+        .created = statement.int(4),
+        .updated = statement.int(5),
+        .expires = if (statement.isNull(6)) null else statement.int(6),
     };
 }
 
@@ -150,7 +150,7 @@ pub const Hit = struct {
 };
 
 pub fn freeHits(gpa: std.mem.Allocator, hits: []Hit) void {
-    for (hits) |h| h.deinit(gpa);
+    for (hits) |hit| hit.deinit(gpa);
     gpa.free(hits);
 }
 
@@ -169,7 +169,7 @@ fn searchJoin(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64, limi
     defer gpa.free(match);
     if (match.len == 0 or limit <= 0) return &.{};
 
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\SELECT chunks.text, chunks.kind, chunks.ref, bm25(chunks),
         \\       COALESCE(facts.source, ''),
         \\       COALESCE(facts.updated, diary.created, 0),
@@ -181,32 +181,32 @@ fn searchJoin(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64, limi
         \\  AND (chunks.kind = 'diary' OR (facts.key IS NOT NULL AND (facts.expires IS NULL OR facts.expires > ?)))
         \\LIMIT ?
     );
-    defer q.finalize();
-    try q.bind(1, match);
-    try q.bind(2, now);
+    defer statement.finalize();
+    try statement.bind(1, match);
+    try statement.bind(2, now);
     // ponytail: raise 64 if relevant facts get cut before reranking.
-    try q.bind(3, @max(limit, 64));
+    try statement.bind(3, @max(limit, 64));
 
     var out: std.ArrayList(Hit) = .empty;
     errdefer {
-        for (out.items) |h| h.deinit(gpa);
+        for (out.items) |hit| hit.deinit(gpa);
         out.deinit(gpa);
     }
-    while (try q.step()) {
-        const hit = try readHit(&q, gpa, reweight(q.float(3), q.text(4), q.int(5), q.float(6), now));
+    while (try statement.step()) {
+        const hit = try readHit(&statement, gpa, reweight(statement.float(3), statement.text(4), statement.int(5), statement.float(6), now));
         out.append(gpa, hit) catch |err| {
             hit.deinit(gpa);
             return err;
         };
     }
     std.mem.sort(Hit, out.items, {}, struct {
-        fn lt(_: void, a: Hit, b: Hit) bool {
-            return a.score < b.score;
+        fn lt(_: void, left: Hit, right: Hit) bool {
+            return left.score < right.score;
         }
     }.lt);
     const cap: usize = @intCast(limit);
     if (out.items.len > cap) {
-        for (out.items[cap..]) |h| h.deinit(gpa);
+        for (out.items[cap..]) |hit| hit.deinit(gpa);
         out.items.len = cap;
     }
     return out.toOwnedSlice(gpa);
@@ -219,12 +219,12 @@ fn reweight(bm25: f64, source: []const u8, updated: i64, confidence: f64, now: i
     return bm25 * src * recency * confidence;
 }
 
-fn readHit(q: *Stmt, gpa: std.mem.Allocator, score: f64) !Hit {
-    const text = try gpa.dupe(u8, q.text(0));
+fn readHit(statement: *Stmt, gpa: std.mem.Allocator, score: f64) !Hit {
+    const text = try gpa.dupe(u8, statement.text(0));
     errdefer gpa.free(text);
-    const kind = try gpa.dupe(u8, q.text(1));
+    const kind = try gpa.dupe(u8, statement.text(1));
     errdefer gpa.free(kind);
-    const ref = try gpa.dupe(u8, q.text(2));
+    const ref = try gpa.dupe(u8, statement.text(2));
     errdefer gpa.free(ref);
     return .{ .text = text, .kind = kind, .ref = ref, .score = score };
 }
@@ -282,7 +282,7 @@ fn compactAt(
     defer gpa.free(summary);
 
     if (fail == .facts) return error.Injected;
-    for (facts) |f| try put(db, f.key, f.value, .inferred, now, null);
+    for (facts) |fact| try put(db, fact.key, fact.value, .inferred, now, null);
 
     if (fail == .write) return error.Injected;
     try writeDiaryFile(io, dir, day, summary);
@@ -296,14 +296,14 @@ fn compactAt(
 
 /// Caller owns the bytes. Null when the file is missing.
 pub fn readDiary(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, day: []const u8) !?[]u8 {
-    var d = std.Io.Dir.cwd().openDir(io, dir, .{}) catch |err| switch (err) {
+    var folder = std.Io.Dir.cwd().openDir(io, dir, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer d.close(io);
+    defer folder.close(io);
     var name: [16]u8 = undefined;
     const file_name = try std.fmt.bufPrint(&name, "{s}.md", .{day});
-    return d.readFileAlloc(io, file_name, gpa, .limited(1 * 1024 * 1024)) catch |err| switch (err) {
+    return folder.readFileAlloc(io, file_name, gpa, .limited(1 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => null,
         else => err,
     };
@@ -322,49 +322,49 @@ pub fn formatDay(buf: []u8, ts: i64) []const u8 {
     }) catch unreachable;
 }
 
-pub fn parseDay(s: []const u8) !i64 {
-    if (s.len != 10 or s[4] != '-' or s[7] != '-') return error.BadDay;
-    const y = try std.fmt.parseInt(u16, s[0..4], 10);
-    const m = try std.fmt.parseInt(u4, s[5..7], 10);
-    const d = try std.fmt.parseInt(u8, s[8..10], 10);
-    if (m < 1 or m > 12 or d < 1 or y < 1970) return error.BadDay;
-    const month: std.time.epoch.Month = @enumFromInt(m);
-    if (d > std.time.epoch.getDaysInMonth(y, month)) return error.BadDay;
+pub fn parseDay(text: []const u8) !i64 {
+    if (text.len != 10 or text[4] != '-' or text[7] != '-') return error.BadDay;
+    const parsed_year = try std.fmt.parseInt(u16, text[0..4], 10);
+    const parsed_month = try std.fmt.parseInt(u4, text[5..7], 10);
+    const parsed_day = try std.fmt.parseInt(u8, text[8..10], 10);
+    if (parsed_month < 1 or parsed_month > 12 or parsed_day < 1 or parsed_year < 1970) return error.BadDay;
+    const month: std.time.epoch.Month = @enumFromInt(parsed_month);
+    if (parsed_day > std.time.epoch.getDaysInMonth(parsed_year, month)) return error.BadDay;
 
     var days: i64 = 0;
     var year: u16 = 1970;
-    while (year < y) : (year += 1) {
+    while (year < parsed_year) : (year += 1) {
         days += std.time.epoch.getDaysInYear(year);
     }
-    var i: u4 = 1;
-    while (i < m) : (i += 1) {
-        days += std.time.epoch.getDaysInMonth(y, @enumFromInt(i));
+    var month_index: u4 = 1;
+    while (month_index < parsed_month) : (month_index += 1) {
+        days += std.time.epoch.getDaysInMonth(parsed_year, @enumFromInt(month_index));
     }
-    days += d - 1;
+    days += parsed_day - 1;
     return days * 86_400;
 }
 
 fn summarizeDay(db: *Db, gpa: std.mem.Allocator, start: i64) ![]u8 {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\SELECT role, content FROM messages
         \\WHERE created >= ? AND created < ?
         \\ORDER BY id
     );
-    defer q.finalize();
-    try q.bind(1, start);
-    try q.bind(2, start + 86_400);
+    defer statement.finalize();
+    try statement.bind(1, start);
+    try statement.bind(2, start + 86_400);
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    var w = &out.writer;
+    const writer = &out.writer;
     var any = false;
-    while (try q.step()) {
+    while (try statement.step()) {
         if (!any) {
             var buf: [10]u8 = undefined;
-            try w.print("# {s}\n\n", .{formatDay(&buf, start)});
+            try writer.print("# {s}\n\n", .{formatDay(&buf, start)});
             any = true;
         }
-        try w.print("**{s}:** {s}\n\n", .{ q.text(0), q.text(1) });
+        try writer.print("**{s}:** {s}\n\n", .{ statement.text(0), statement.text(1) });
     }
     if (!any) return try gpa.dupe(u8, "");
     return try out.toOwnedSlice();
@@ -372,22 +372,22 @@ fn summarizeDay(db: *Db, gpa: std.mem.Allocator, start: i64) ![]u8 {
 
 fn writeDiaryFile(io: std.Io, dir: []const u8, day: []const u8, summary: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, dir);
-    var d = try std.Io.Dir.cwd().openDir(io, dir, .{});
-    defer d.close(io);
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
     var name: [16]u8 = undefined;
     const file_name = try std.fmt.bufPrint(&name, "{s}.md", .{day});
-    var f = try d.createFile(io, file_name, .{});
-    defer f.close(io);
-    try f.writeStreamingAll(io, summary);
-    try f.sync(io);
+    var file = try folder.createFile(io, file_name, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, summary);
+    try file.sync(io);
 }
 
 fn deleteDay(db: *Db, start: i64) !void {
-    var q = try db.prepare("DELETE FROM messages WHERE created >= ? AND created < ?");
-    defer q.finalize();
-    try q.bind(1, start);
-    try q.bind(2, start + 86_400);
-    _ = try q.step();
+    var statement = try db.prepare("DELETE FROM messages WHERE created >= ? AND created < ?");
+    defer statement.finalize();
+    try statement.bind(1, start);
+    try statement.bind(2, start + 86_400);
+    _ = try statement.step();
 }
 
 /// Writes a diary row and search chunk atomically.
@@ -434,30 +434,30 @@ fn expandQuery(db: *Db, gpa: std.mem.Allocator, query: []const u8, any: bool) ![
 fn lookupAlias(db: *Db, gpa: std.mem.Allocator, word: []const u8) !?[]u8 {
     var key_buf: [72]u8 = undefined;
     const key = aliasKey(&key_buf, word) orelse return null;
-    var q = try db.prepare("SELECT value FROM kv WHERE key = ?");
-    defer q.finalize();
-    try q.bind(1, key);
-    if (!try q.step()) return null;
-    return try gpa.dupe(u8, q.text(0));
+    var statement = try db.prepare("SELECT value FROM kv WHERE key = ?");
+    defer statement.finalize();
+    try statement.bind(1, key);
+    if (!try statement.step()) return null;
+    return try gpa.dupe(u8, statement.text(0));
 }
 
 fn aliasKey(buf: []u8, word: []const u8) ?[]u8 {
     const prefix = "alias:";
     if (prefix.len + word.len > buf.len) return null;
     @memcpy(buf[0..prefix.len], prefix);
-    for (word, 0..) |b, i| buf[prefix.len + i] = std.ascii.toLower(b);
+    for (word, 0..) |byte, index| buf[prefix.len + index] = std.ascii.toLower(byte);
     return buf[0 .. prefix.len + word.len];
 }
 
 fn nextToken(rest: *[]const u8, buf: []u8) ?[]u8 {
-    var s = rest.*;
-    while (s.len > 0 and !std.ascii.isAlphanumeric(s[0])) s = s[1..];
-    var n: usize = 0;
-    while (n < s.len and std.ascii.isAlphanumeric(s[n])) : (n += 1) {}
-    rest.* = s[n..];
-    if (n == 0) return null;
-    const take = @min(n, buf.len);
-    for (s[0..take], 0..) |b, i| buf[i] = std.ascii.toLower(b);
+    var text = rest.*;
+    while (text.len > 0 and !std.ascii.isAlphanumeric(text[0])) text = text[1..];
+    var size: usize = 0;
+    while (size < text.len and std.ascii.isAlphanumeric(text[size])) : (size += 1) {}
+    rest.* = text[size..];
+    if (size == 0) return null;
+    const take = @min(size, buf.len);
+    for (text[0..take], 0..) |byte, index| buf[index] = std.ascii.toLower(byte);
     return buf[0..take];
 }
 
@@ -469,19 +469,19 @@ fn isOperator(tok: []const u8) bool {
 }
 
 fn insertMsg(db: *Db, role: []const u8, content: []const u8, created: i64) !void {
-    var q = try db.prepare("INSERT INTO messages(role, content, created) VALUES (?, ?, ?)");
-    defer q.finalize();
-    try q.bind(1, role);
-    try q.bind(2, content);
-    try q.bind(3, created);
-    _ = try q.step();
+    var statement = try db.prepare("INSERT INTO messages(role, content, created) VALUES (?, ?, ?)");
+    defer statement.finalize();
+    try statement.bind(1, role);
+    try statement.bind(2, content);
+    try statement.bind(3, created);
+    _ = try statement.step();
 }
 
 fn countMsgs(db: *Db) !i64 {
-    var q = try db.prepare("SELECT COUNT(*) FROM messages");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    return q.int(0);
+    var statement = try db.prepare("SELECT COUNT(*) FROM messages");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    return statement.int(0);
 }
 
 test "a fact survives closing and reopening the database" {
@@ -849,8 +849,8 @@ test "a fact is found by its own key, not only by its value" {
 
     try put(&db, "landlord", "Priya", .owner, 100, null);
 
-    for ([_][]const u8{ "landlord", "Priya" }) |q| {
-        const hits = try search(&db, testing.allocator, q, 200, 8);
+    for ([_][]const u8{ "landlord", "Priya" }) |statement| {
+        const hits = try search(&db, testing.allocator, statement, 200, 8);
         defer freeHits(testing.allocator, hits);
         try testing.expectEqual(@as(usize, 1), hits.len);
         try testing.expectEqualStrings("landlord", hits[0].ref);

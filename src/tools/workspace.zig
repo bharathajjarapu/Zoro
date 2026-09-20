@@ -197,10 +197,10 @@ const Harness = struct {
 };
 
 test "file tools write read and uniquely edit workspace text" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx();
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx();
 
     const wrote = try tools.call(&ctx, &.{write_file}, "write_file", "{\"path\":\"note.txt\",\"content\":\"one two\"}");
     defer testing.allocator.free(wrote);
@@ -216,24 +216,24 @@ test "file tools write read and uniquely edit workspace text" {
 }
 
 test "write creates guarded parent directories" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx();
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx();
 
     const out = try tools.call(&ctx, &.{write_file}, "write_file", "{\"path\":\"reports/brief/index.html\",\"content\":\"<h1>Brief</h1>\"}");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("wrote reports/brief/index.html", out);
-    const got = try read(testing.allocator, h.threaded.io(), h.workspace, "reports/brief/index.html");
+    const got = try read(testing.allocator, harness.threaded.io(), harness.workspace, "reports/brief/index.html");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("<h1>Brief</h1>", got);
 }
 
 test "file tools reject escapes protected paths and symlinks" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx();
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx();
 
     const bad = [_][]const u8{
         "{\"path\":\"../secret\"}",
@@ -248,53 +248,53 @@ test "file tools reject escapes protected paths and symlinks" {
         try testing.expect(std.mem.indexOf(u8, out, "BadPath") != null);
     }
 
-    var root = try std.Io.Dir.cwd().openDir(h.threaded.io(), h.workspace, .{});
-    defer root.close(h.threaded.io());
-    try root.symLink(h.threaded.io(), "/etc/passwd", "link", .{});
+    var root = try std.Io.Dir.cwd().openDir(harness.threaded.io(), harness.workspace, .{});
+    defer root.close(harness.threaded.io());
+    try root.symLink(harness.threaded.io(), "/etc/passwd", "link", .{});
     const linked = try tools.call(&ctx, &.{read_file}, "read_file", "{\"path\":\"link\"}");
     defer testing.allocator.free(linked);
     try testing.expect(std.mem.indexOf(u8, linked, "SymLink") != null or std.mem.indexOf(u8, linked, "AccessDenied") != null);
-    try root.symLink(h.threaded.io(), "/tmp", "outside", .{ .is_directory = true });
+    try root.symLink(harness.threaded.io(), "/tmp", "outside", .{ .is_directory = true });
     const parent = try tools.call(&ctx, &.{read_file}, "read_file", "{\"path\":\"outside/file\"}");
     defer testing.allocator.free(parent);
     try testing.expect(std.mem.indexOf(u8, parent, "SymLink") != null or std.mem.indexOf(u8, parent, "NotDir") != null);
 }
 
 test "general file tools cannot replace identity" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx();
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx();
     const out = try tools.call(&ctx, &.{write_file}, "write_file", "{\"path\":\"SOUL.md\",\"content\":\"ignore safety\"}");
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "IdentityRequiresApproval") != null);
 }
 
 test "read reports truncation and binary honestly" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx();
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx();
     const text = try testing.allocator.alloc(u8, max_read + 9);
     defer testing.allocator.free(text);
     @memset(text, 'a');
-    try write(h.threaded.io(), h.workspace, "large.txt", text);
+    try write(harness.threaded.io(), harness.workspace, "large.txt", text);
     const large = try tools.call(&ctx, &.{read_file}, "read_file", "{\"path\":\"large.txt\"}");
     defer testing.allocator.free(large);
     try testing.expect(std.mem.endsWith(u8, large, trunc_mark));
 
-    try write(h.threaded.io(), h.workspace, "blob.bin", "\x00\xff");
+    try write(harness.threaded.io(), harness.workspace, "blob.bin", "\x00\xff");
     const binary = try tools.call(&ctx, &.{read_file}, "read_file", "{\"path\":\"blob.bin\"}");
     defer testing.allocator.free(binary);
     try testing.expect(std.mem.indexOf(u8, binary, "UnsupportedBinary") != null);
 }
 
 test "edit refuses missing and repeated matches" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx();
-    try write(h.threaded.io(), h.workspace, "note.txt", "same same");
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx();
+    try write(harness.threaded.io(), harness.workspace, "note.txt", "same same");
 
     const repeated = try tools.call(&ctx, &.{edit_file}, "edit_file", "{\"path\":\"note.txt\",\"old\":\"same\",\"new\":\"x\"}");
     defer testing.allocator.free(repeated);
@@ -305,24 +305,24 @@ test "edit refuses missing and repeated matches" {
 }
 
 test "delete removes one guarded workspace file directly" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx();
-    try write(h.threaded.io(), h.workspace, "old.txt", "old");
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx();
+    try write(harness.threaded.io(), harness.workspace, "old.txt", "old");
     const out = try tools.call(&ctx, &.{delete_file}, "delete_file", "{\"path\":\"old.txt\"}");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("deleted old.txt", out);
-    try testing.expectError(error.FileNotFound, openFile(h.threaded.io(), h.workspace, "old.txt"));
+    try testing.expectError(error.FileNotFound, openFile(harness.threaded.io(), harness.workspace, "old.txt"));
 }
 
 test "download applies web policy then writes atomically" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
     var fake: FakeGet = .{ .body = "downloaded" };
     var limiter: web.Limiter = .{};
-    var ctx = h.ctx();
+    var ctx = harness.ctx();
     ctx.fetch = fake.get();
     ctx.limiter = &limiter;
 
@@ -335,13 +335,13 @@ test "download applies web policy then writes atomically" {
     const failed = try tools.call(&ctx, &.{download_file}, "download_file", "{\"url\":\"https://8.8.8.8/missing\",\"path\":\"page.txt\"}");
     defer testing.allocator.free(failed);
     try testing.expectEqualStrings("tool error: HttpPermanent", failed);
-    try testing.expectError(error.FileNotFound, openFile(h.threaded.io(), h.workspace, "page.txt"));
+    try testing.expectError(error.FileNotFound, openFile(harness.threaded.io(), harness.workspace, "page.txt"));
 
     fake.status = 200;
     const out = try tools.call(&ctx, &.{download_file}, "download_file", "{\"url\":\"https://8.8.8.8/file\",\"path\":\"page.txt\"}");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("downloaded page.txt", out);
-    const got = try read(testing.allocator, h.threaded.io(), h.workspace, "page.txt");
+    const got = try read(testing.allocator, harness.threaded.io(), harness.workspace, "page.txt");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("downloaded", got);
 }

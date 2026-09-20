@@ -124,23 +124,23 @@ const CappedBody = struct {
         return bytes;
     }
 
-    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *CappedBody = @alignCast(@fieldParentPtr("writer", w));
-        if (w.end != 0) {
-            self.append(w.buffered()) catch {
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *CappedBody = @alignCast(@fieldParentPtr("writer", writer));
+        if (writer.end != 0) {
+            self.append(writer.buffered()) catch {
                 self.overflow = true;
                 return error.WriteFailed;
             };
-            w.end = 0;
+            writer.end = 0;
         }
         if (data.len == 0) return 0;
-        var n: usize = 0;
+        var count: usize = 0;
         for (data[0 .. data.len - 1]) |bytes| {
             self.append(bytes) catch {
                 self.overflow = true;
                 return error.WriteFailed;
             };
-            n += bytes.len;
+            count += bytes.len;
         }
         const last = data[data.len - 1];
         for (0..splat) |_| {
@@ -148,9 +148,9 @@ const CappedBody = struct {
                 self.overflow = true;
                 return error.WriteFailed;
             };
-            n += last.len;
+            count += last.len;
         }
-        return n;
+        return count;
     }
 
     fn append(self: *CappedBody, bytes: []const u8) error{Overflow}!void {

@@ -82,7 +82,7 @@ fn runRemember(ctx: *Ctx, args: []const u8) anyerror![]u8 {
 
 fn validKey(key: []const u8) bool {
     if (key.len == 0 or key.len > 64 or !std.ascii.isLower(key[0])) return false;
-    for (key[1..]) |c| if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and c != '_') return false;
+    for (key[1..]) |byte| if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and byte != '_') return false;
     return true;
 }
 
@@ -95,8 +95,8 @@ fn runRecall(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     if (hits.len == 0) return try ctx.gpa.dupe(u8, "no hits");
     var out: std.Io.Writer.Allocating = .init(ctx.gpa);
     errdefer out.deinit();
-    for (hits) |h| {
-        try out.writer.print("{s} ({s}): {s}\n", .{ h.ref, h.kind, h.text });
+    for (hits) |hit| {
+        try out.writer.print("{s} ({s}): {s}\n", .{ hit.ref, hit.kind, hit.text });
     }
     return try out.toOwnedSlice();
 }

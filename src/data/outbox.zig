@@ -23,7 +23,7 @@ pub const Item = struct {
     reply_id: ?i64,
 
     pub fn deinit(self: *Item, gpa: std.mem.Allocator) void {
-        if (self.path) |p| gpa.free(p);
+        if (self.path) |path| gpa.free(path);
         gpa.free(self.text);
         self.* = undefined;
     }
@@ -37,14 +37,14 @@ pub fn push(db: *Db, kind: Kind, path: ?[]const u8, body: []const u8, now: i64) 
 pub fn pushReply(db: *Db, kind: Kind, path: ?[]const u8, body: []const u8, reply_id: ?i64, now: i64) !void {
     if (kind != .text and (path == null or !safeRelative(path.?))) return error.BadPath;
     const text = clamp(body);
-    var q = try db.prepare("INSERT INTO outbox(kind, path, text, reply_id, created) VALUES (?, ?, ?, ?, ?)");
-    defer q.finalize();
-    try q.bind(1, @tagName(kind));
-    try q.bind(2, path);
-    try q.bind(3, text);
-    try q.bind(4, reply_id);
-    try q.bind(5, now);
-    _ = try q.step();
+    var statement = try db.prepare("INSERT INTO outbox(kind, path, text, reply_id, created) VALUES (?, ?, ?, ?, ?)");
+    defer statement.finalize();
+    try statement.bind(1, @tagName(kind));
+    try statement.bind(2, path);
+    try statement.bind(3, text);
+    try statement.bind(4, reply_id);
+    try statement.bind(5, now);
+    _ = try statement.step();
 }
 
 /// Claims up to `max_drain` rows. Caller must finalize every returned item.
@@ -54,23 +54,23 @@ pub fn claim(db: *Db, gpa: std.mem.Allocator, now: i64) ![]Item {
     try db.exec("BEGIN IMMEDIATE;");
     errdefer db.exec("ROLLBACK;") catch {};
     {
-        var q = try db.prepare("SELECT id, kind, path, text, reply_id FROM outbox WHERE status = 'queued' OR (status = 'retryable' AND next_attempt <= ?) ORDER BY id LIMIT ?");
-        defer q.finalize();
-        try q.bind(1, now);
-        try q.bind(2, @as(i64, @intCast(max_drain)));
-        while (try q.step()) {
+        var statement = try db.prepare("SELECT id, kind, path, text, reply_id FROM outbox WHERE status = 'queued' OR (status = 'retryable' AND next_attempt <= ?) ORDER BY id LIMIT ?");
+        defer statement.finalize();
+        try statement.bind(1, now);
+        try statement.bind(2, @as(i64, @intCast(max_drain)));
+        while (try statement.step()) {
             try out.ensureUnusedCapacity(gpa, 1);
-            const kind = std.meta.stringToEnum(Kind, q.text(1)) orelse .text;
-            const path = if (q.isNull(2)) null else try gpa.dupe(u8, q.text(2));
-            errdefer if (path) |p| gpa.free(p);
-            const text = try gpa.dupe(u8, q.text(3));
+            const kind = std.meta.stringToEnum(Kind, statement.text(1)) orelse .text;
+            const path = if (statement.isNull(2)) null else try gpa.dupe(u8, statement.text(2));
+            errdefer if (path) |value| gpa.free(value);
+            const text = try gpa.dupe(u8, statement.text(3));
             errdefer gpa.free(text);
             out.appendAssumeCapacity(.{
-                .id = q.int(0),
+                .id = statement.int(0),
                 .kind = kind,
                 .path = path,
                 .text = text,
-                .reply_id = if (q.isNull(4)) null else q.int(4),
+                .reply_id = if (statement.isNull(4)) null else statement.int(4),
             });
         }
     }
@@ -78,11 +78,11 @@ pub fn claim(db: *Db, gpa: std.mem.Allocator, now: i64) ![]Item {
     for (out.items[keep..]) |*item| item.deinit(gpa);
     out.items.len = keep;
     for (out.items) |item| {
-        var d = try db.prepare("UPDATE outbox SET status = 'claimed', attempts = attempts + 1, claimed = ?, error = NULL WHERE id = ?");
-        defer d.finalize();
-        try d.bind(1, now);
-        try d.bind(2, item.id);
-        _ = try d.step();
+        var statement = try db.prepare("UPDATE outbox SET status = 'claimed', attempts = attempts + 1, claimed = ?, error = NULL WHERE id = ?");
+        defer statement.finalize();
+        try statement.bind(1, now);
+        try statement.bind(2, item.id);
+        _ = try statement.step();
     }
     try db.exec("COMMIT;");
     return out.toOwnedSlice(gpa);
@@ -90,33 +90,33 @@ pub fn claim(db: *Db, gpa: std.mem.Allocator, now: i64) ![]Item {
 
 /// Removes an item only after the destination confirmed it.
 pub fn delivered(db: *Db, id: i64) !void {
-    var q = try db.prepare("DELETE FROM outbox WHERE id = ? AND status = 'claimed'");
-    defer q.finalize();
-    try q.bind(1, id);
-    _ = try q.step();
+    var statement = try db.prepare("DELETE FROM outbox WHERE id = ? AND status = 'claimed'");
+    defer statement.finalize();
+    try statement.bind(1, id);
+    _ = try statement.step();
 }
 
 /// Keeps a definite pre-send failure eligible for a later attempt.
 pub fn retry(db: *Db, id: i64, note: []const u8) !void {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\UPDATE outbox SET
         \\ status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'retryable' END,
         \\ next_attempt = unixepoch() + CASE attempts WHEN 1 THEN 1 WHEN 2 THEN 5 ELSE 30 END,
         \\ error = ? WHERE id = ? AND status = 'claimed'
     );
-    defer q.finalize();
-    try q.bind(1, max_attempts);
-    try q.bind(2, note);
-    try q.bind(3, id);
-    _ = try q.step();
+    defer statement.finalize();
+    try statement.bind(1, max_attempts);
+    try statement.bind(2, note);
+    try statement.bind(3, id);
+    _ = try statement.step();
 }
 
 /// Requeues one terminal delivery after an owner retry.
 pub fn retryDelivery(db: *Db, id: i64) !bool {
-    var q = try db.prepare("UPDATE outbox SET status = 'retryable', attempts = 0, next_attempt = 0, error = NULL WHERE id = ? AND status IN ('failed', 'uncertain')");
-    defer q.finalize();
-    try q.bind(1, id);
-    _ = try q.step();
+    var statement = try db.prepare("UPDATE outbox SET status = 'retryable', attempts = 0, next_attempt = 0, error = NULL WHERE id = ? AND status IN ('failed', 'uncertain')");
+    defer statement.finalize();
+    try statement.bind(1, id);
+    _ = try statement.step();
     return @import("c").sqlite3_changes(db.ptr) == 1;
 }
 
@@ -135,28 +135,28 @@ pub fn recover(db: *Db) !void {
 }
 
 pub fn recoverBefore(db: *Db, cutoff: i64) !void {
-    var q = try db.prepare("UPDATE outbox SET status = 'uncertain', error = 'interrupted during delivery' WHERE status = 'claimed' AND claimed <= ?");
-    defer q.finalize();
-    try q.bind(1, cutoff);
-    _ = try q.step();
+    var statement = try db.prepare("UPDATE outbox SET status = 'uncertain', error = 'interrupted during delivery' WHERE status = 'claimed' AND claimed <= ?");
+    defer statement.finalize();
+    try statement.bind(1, cutoff);
+    _ = try statement.step();
 }
 
 fn setStatus(db: *Db, id: i64, status: Status, note: []const u8) !void {
-    var q = try db.prepare("UPDATE outbox SET status = ?, error = ? WHERE id = ? AND status = 'claimed'");
-    defer q.finalize();
-    try q.bind(1, @tagName(status));
-    try q.bind(2, note);
-    try q.bind(3, id);
-    _ = try q.step();
+    var statement = try db.prepare("UPDATE outbox SET status = ?, error = ? WHERE id = ? AND status = 'claimed'");
+    defer statement.finalize();
+    try statement.bind(1, @tagName(status));
+    try statement.bind(2, note);
+    try statement.bind(3, id);
+    _ = try statement.step();
 }
 
 fn claimCount(items: []const Item) usize {
     if (items.len == 0) return 0;
     const class = albumClass(items[0].kind);
     if (class == 0) return 1;
-    var n: usize = 1;
-    while (n < items.len and n < 10 and albumClass(items[n].kind) == class) : (n += 1) {}
-    return n;
+    var count: usize = 1;
+    while (count < items.len and count < 10 and albumClass(items[count].kind) == class) : (count += 1) {}
+    return count;
 }
 
 fn albumClass(kind: Kind) u2 {
@@ -169,7 +169,7 @@ fn albumClass(kind: Kind) u2 {
 }
 
 pub fn free(gpa: std.mem.Allocator, items: []Item) void {
-    for (items) |*i| i.deinit(gpa);
+    for (items) |*item| item.deinit(gpa);
     gpa.free(items);
 }
 
@@ -243,15 +243,15 @@ fn runAttach(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     };
     const parsed = try std.json.parseFromSlice(Args, ctx.gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    const a = parsed.value;
-    const kind: Kind = if (a.as) |s| std.meta.stringToEnum(Kind, s) orelse return error.BadMediaKind else .document;
+    const input = parsed.value;
+    const kind: Kind = if (input.as) |name| std.meta.stringToEnum(Kind, name) orelse return error.BadMediaKind else .document;
     if (kind == .text or kind == .sticker) return error.BadMediaKind;
-    try workspace.checkFile(ctx.io, ctx.workspace, a.path, workspace.max_transfer);
+    try workspace.checkFile(ctx.io, ctx.workspace, input.path, workspace.max_transfer);
     const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
-    push(ctx.db, kind, a.path, a.caption orelse "", now) catch |err|
+    push(ctx.db, kind, input.path, input.caption orelse "", now) catch |err|
         return std.fmt.allocPrint(ctx.gpa, "not queued: {s}", .{@errorName(err)});
     if (ctx.delivery_out) |out| out.* = true;
-    return std.fmt.allocPrint(ctx.gpa, "queued {s}", .{a.path});
+    return std.fmt.allocPrint(ctx.gpa, "queued {s}", .{input.path});
 }
 
 fn runSticker(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
@@ -268,22 +268,22 @@ fn runSticker(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
 }
 
 pub fn stickerExists(db: *Db, alias: []const u8) !bool {
-    var q = try db.prepare("SELECT 1 FROM sticker_aliases WHERE alias = ?");
-    defer q.finalize();
-    try q.bind(1, alias);
-    return q.step();
+    var statement = try db.prepare("SELECT 1 FROM sticker_aliases WHERE alias = ?");
+    defer statement.finalize();
+    try statement.bind(1, alias);
+    return statement.step();
 }
 
 fn stickerQueued(db: *Db, alias: []const u8) !bool {
-    var q = try db.prepare("SELECT 1 FROM outbox WHERE kind = 'sticker' AND path = ? AND status = 'queued'");
-    defer q.finalize();
-    try q.bind(1, alias);
-    return q.step();
+    var statement = try db.prepare("SELECT 1 FROM outbox WHERE kind = 'sticker' AND path = ? AND status = 'queued'");
+    defer statement.finalize();
+    try statement.bind(1, alias);
+    return statement.step();
 }
 
 pub fn safeAlias(alias: []const u8) bool {
     if (alias.len == 0 or alias.len > 32) return false;
-    for (alias) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
+    for (alias) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return false;
     return true;
 }
 
@@ -349,10 +349,10 @@ test "unknown stickers never enter the outbox" {
     const result = try tools.call(&ctx, &.{send_sticker}, "send_sticker", "{\"alias\":\"missing\"}");
     defer testing.allocator.free(result);
     try testing.expectEqualStrings("unknown sticker alias", result);
-    var q = try db.prepare("SELECT count(*) FROM outbox");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqual(@as(i64, 0), q.int(0));
+    var statement = try db.prepare("SELECT count(*) FROM outbox");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqual(@as(i64, 0), statement.int(0));
 }
 
 test "the same pending sticker is queued once" {
@@ -370,10 +370,10 @@ test "the same pending sticker is queued once" {
         const result = try tools.call(&ctx, &.{send_sticker}, "send_sticker", "{\"alias\":\"pro\"}");
         testing.allocator.free(result);
     }
-    var q = try db.prepare("SELECT count(*) FROM outbox WHERE kind = 'sticker' AND status = 'queued'");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqual(@as(i64, 1), q.int(0));
+    var statement = try db.prepare("SELECT count(*) FROM outbox WHERE kind = 'sticker' AND status = 'queued'");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqual(@as(i64, 1), statement.int(0));
 }
 
 test "restart preserves an interrupted send as uncertain" {
@@ -388,11 +388,11 @@ test "restart preserves an interrupted send as uncertain" {
     defer free(testing.allocator, items);
     try recover(&db);
 
-    var q = try db.prepare("SELECT status FROM outbox WHERE id = ?");
-    defer q.finalize();
-    try q.bind(1, items[0].id);
-    try testing.expect(try q.step());
-    try testing.expectEqualStrings("uncertain", q.text(0));
+    var statement = try db.prepare("SELECT status FROM outbox WHERE id = ?");
+    defer statement.finalize();
+    try statement.bind(1, items[0].id);
+    try testing.expect(try statement.step());
+    try testing.expectEqualStrings("uncertain", statement.text(0));
 }
 
 test "delivery retries stop after three attempts" {
@@ -410,11 +410,11 @@ test "delivery retries stop after three attempts" {
         try testing.expectEqual(@as(usize, 1), items.len);
         try retry(&db, items[0].id, "offline");
     }
-    var q = try db.prepare("SELECT status, attempts FROM outbox");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqualStrings("failed", q.text(0));
-    try testing.expectEqual(max_attempts, q.int(1));
+    var statement = try db.prepare("SELECT status, attempts FROM outbox");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqualStrings("failed", statement.text(0));
+    try testing.expectEqual(max_attempts, statement.int(1));
 }
 
 test "an over-long message is trimmed on a codepoint boundary, not rejected" {
@@ -426,10 +426,10 @@ test "an over-long message is trimmed on a codepoint boundary, not rejected" {
 
     const long = try testing.allocator.alloc(u8, max_text + 64);
     defer testing.allocator.free(long);
-    var i: usize = 0;
-    while (i + 1 < long.len) : (i += 2) {
-        long[i] = 0xC3;
-        long[i + 1] = 0xA9;
+    var index: usize = 0;
+    while (index + 1 < long.len) : (index += 2) {
+        long[index] = 0xC3;
+        long[index + 1] = 0xA9;
     }
     long[long.len - 1] = 'x';
 

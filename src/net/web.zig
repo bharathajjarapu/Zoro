@@ -100,7 +100,7 @@ pub const Hop = struct {
 
     pub fn deinit(self: *Hop, gpa: std.mem.Allocator) void {
         gpa.free(self.body);
-        if (self.location) |l| gpa.free(l);
+        if (self.location) |location| gpa.free(location);
         self.* = undefined;
     }
 };
@@ -114,44 +114,44 @@ pub const Limiter = struct {
         host: [64]u8 = undefined,
         len: usize = 0,
         stamps: [per_host_per_min]i64 = @splat(0),
-        n: usize = 0,
+        count: usize = 0,
     };
 
     pub fn allow(self: *Limiter, host: []const u8, now: i64) bool {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         const window = now - 60;
-        const s = self.find(host) orelse return false;
+        const slot = self.find(host) orelse return false;
         var live: usize = 0;
-        for (s.stamps[0..s.n]) |t| {
-            if (t > window) live += 1;
+        for (slot.stamps[0..slot.count]) |stamp| {
+            if (stamp > window) live += 1;
         }
         if (live >= per_host_per_min) return false;
-        if (s.n < s.stamps.len) {
-            s.stamps[s.n] = now;
-            s.n += 1;
+        if (slot.count < slot.stamps.len) {
+            slot.stamps[slot.count] = now;
+            slot.count += 1;
         } else {
-            s.stamps[0] = now;
-            std.mem.rotate(i64, &s.stamps, 1);
+            slot.stamps[0] = now;
+            std.mem.rotate(i64, &slot.stamps, 1);
         }
         return true;
     }
 
     fn find(self: *Limiter, host: []const u8) ?*Slot {
         const take = @min(host.len, 64);
-        for (&self.slots) |*s| {
-            if (s.len == take and std.mem.eql(u8, s.host[0..take], host[0..take])) return s;
+        for (&self.slots) |*slot| {
+            if (slot.len == take and std.mem.eql(u8, slot.host[0..take], host[0..take])) return slot;
         }
-        for (&self.slots) |*s| {
-            if (s.len == 0) {
-                @memcpy(s.host[0..take], host[0..take]);
-                s.len = take;
-                return s;
+        for (&self.slots) |*slot| {
+            if (slot.len == 0) {
+                @memcpy(slot.host[0..take], host[0..take]);
+                slot.len = take;
+                return slot;
             }
         }
         var quiet: *Slot = &self.slots[0];
-        for (&self.slots) |*s| {
-            if (s.n < quiet.n) quiet = s;
+        for (&self.slots) |*slot| {
+            if (slot.count < quiet.count) quiet = slot;
         }
         quiet.* = .{};
         @memcpy(quiet.host[0..take], host[0..take]);
@@ -186,14 +186,14 @@ pub fn resolveAddress(io: std.Io, host: []const u8, port: u16) !std.Io.net.IpAdd
     if (blockedLiteral(host)) return error.Blocked;
     const name = std.Io.net.HostName.init(host) catch return error.Blocked;
     var buf: [16]std.Io.net.HostName.LookupResult = undefined;
-    var q: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buf);
-    name.lookup(io, &q, .{ .port = port }) catch return error.Blocked;
+    var statement: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buf);
+    name.lookup(io, &statement, .{ .port = port }) catch return error.Blocked;
     var first: ?std.Io.net.IpAddress = null;
-    while (q.getOne(io)) |r| {
-        switch (r) {
-            .address => |addr| {
-                if (blockedAddr(addr)) return error.Blocked;
-                if (first == null) first = addr;
+    while (statement.getOne(io)) |result| {
+        switch (result) {
+            .address => |address| {
+                if (blockedAddr(address)) return error.Blocked;
+                if (first == null) first = address;
             },
             .canonical_name => {},
         }
@@ -390,40 +390,40 @@ fn blockedLiteral(host: []const u8) bool {
         return blockedAddr(addr);
     } else |_| {}
     // 2130706433 → 127.0.0.1
-    if (decimalV4(bare)) |b| return blockedV4(b);
+    if (decimalV4(bare)) |address| return blockedV4(address);
     return false;
 }
 
 fn decimalV4(host: []const u8) ?[4]u8 {
     if (host.len == 0) return null;
-    for (host) |c| {
-        if (!std.ascii.isDigit(c)) return null;
+    for (host) |byte| {
+        if (!std.ascii.isDigit(byte)) return null;
     }
-    const n = std.fmt.parseInt(u32, host, 10) catch return null;
+    const number = std.fmt.parseInt(u32, host, 10) catch return null;
     return .{
-        @truncate(n >> 24),
-        @truncate(n >> 16),
-        @truncate(n >> 8),
-        @truncate(n),
+        @truncate(number >> 24),
+        @truncate(number >> 16),
+        @truncate(number >> 8),
+        @truncate(number),
     };
 }
 
 fn blockedAddr(addr: std.Io.net.IpAddress) bool {
     return switch (addr) {
-        .ip4 => |a| blockedV4(a.bytes),
-        .ip6 => |a| blockedV6(a.bytes),
+        .ip4 => |address| blockedV4(address.bytes),
+        .ip6 => |address| blockedV6(address.bytes),
     };
 }
 
-fn blockedV4(b: [4]u8) bool {
-    if (b[0] == 127) return true; // loopback
-    if (b[0] == 10) return true; // private
-    if (b[0] == 172 and b[1] >= 16 and b[1] <= 31) return true; // private
-    if (b[0] == 192 and b[1] == 168) return true; // private
-    if (b[0] == 169 and b[1] == 254) return true; // link-local
-    if (b[0] == 0) return true;
-    if (b[0] == 100 and b[1] >= 64 and b[1] <= 127) return true; // CGNAT
-    if (b[0] >= 224) return true; // multicast / reserved
+fn blockedV4(bytes: [4]u8) bool {
+    if (bytes[0] == 127) return true; // loopback
+    if (bytes[0] == 10) return true; // private
+    if (bytes[0] == 172 and bytes[1] >= 16 and bytes[1] <= 31) return true; // private
+    if (bytes[0] == 192 and bytes[1] == 168) return true; // private
+    if (bytes[0] == 169 and bytes[1] == 254) return true; // link-local
+    if (bytes[0] == 0) return true;
+    if (bytes[0] == 100 and bytes[1] >= 64 and bytes[1] <= 127) return true; // CGNAT
+    if (bytes[0] >= 224) return true; // multicast / reserved
     return false;
 }
 
@@ -491,28 +491,28 @@ test "a redirect into a private address is refused" {
 }
 
 test "per-host rate limit is 10 per minute" {
-    var lim: Limiter = .{};
-    var i: usize = 0;
-    while (i < 10) : (i += 1) {
-        try testing.expect(lim.allow("example.com", 1000));
+    var limiter: Limiter = .{};
+    var index: usize = 0;
+    while (index < 10) : (index += 1) {
+        try testing.expect(limiter.allow("example.com", 1000));
     }
-    try testing.expect(!lim.allow("example.com", 1000));
-    try testing.expect(lim.allow("other.com", 1000));
-    try testing.expect(lim.allow("example.com", 1000 + 61));
+    try testing.expect(!limiter.allow("example.com", 1000));
+    try testing.expect(limiter.allow("other.com", 1000));
+    try testing.expect(limiter.allow("example.com", 1000 + 61));
 }
 
 test "shared limiter stays exact under concurrent callers" {
     const Run = struct {
-        fn run(lim: *Limiter, allowed: *std.atomic.Value(usize)) void {
+        fn run(limiter: *Limiter, allowed: *std.atomic.Value(usize)) void {
             for (0..10) |_| {
-                if (lim.allow("example.com", 1000)) _ = allowed.fetchAdd(1, .monotonic);
+                if (limiter.allow("example.com", 1000)) _ = allowed.fetchAdd(1, .monotonic);
             }
         }
     };
-    var lim: Limiter = .{};
+    var limiter: Limiter = .{};
     var allowed: std.atomic.Value(usize) = .init(0);
     var threads: [4]std.Thread = undefined;
-    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Run.run, .{ &lim, &allowed });
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Run.run, .{ &limiter, &allowed });
     for (threads) |thread| thread.join();
     try testing.expectEqual(per_host_per_min, allowed.load(.acquire));
 }
@@ -682,7 +682,7 @@ const FakeGet = struct {
     pinned: bool = false,
 
     fn deinit(self: *FakeGet, gpa: std.mem.Allocator) void {
-        if (self.seen) |s| gpa.free(s);
+        if (self.seen) |seen| gpa.free(seen);
         self.* = undefined;
     }
 
@@ -697,13 +697,13 @@ const FakeGet = struct {
         if (auth != null) {
             if (self.hop == 1) self.auth_first = true else self.auth_later = true;
         }
-        if (self.seen) |s| gpa.free(s);
+        if (self.seen) |seen| gpa.free(seen);
         self.seen = try gpa.dupe(u8, url);
         if (self.hop == 1 and (self.status != 200 or self.location != null)) {
             return .{
                 .status = self.status,
                 .body = try gpa.dupe(u8, self.body),
-                .location = if (self.location) |l| try gpa.dupe(u8, l) else null,
+                .location = if (self.location) |location| try gpa.dupe(u8, location) else null,
             };
         }
         return .{
@@ -718,12 +718,12 @@ pub fn fromClient(client: *std.http.Client) Get {
     return .{ .ptr = client, .request_fn = stdRequest };
 }
 
-pub fn pinnedConnection(client: *std.http.Client, uri: std.Uri, addr: std.Io.net.IpAddress) !*std.http.Client.Connection {
+pub fn pinnedConnection(client: *std.http.Client, uri: std.Uri, address: std.Io.net.IpAddress) !*std.http.Client.Connection {
     var remote_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     const remote = uri.getHost(&remote_buf) catch return error.BadUrl;
     var endpoint_buf: [96]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&endpoint_buf);
-    try addr.format(&writer);
+    try address.format(&writer);
     const endpoint = writer.buffered();
     const host_text = if (endpoint[0] == '[')
         endpoint[1 .. std.mem.indexOfScalar(u8, endpoint, ']') orelse return error.BadUrl]
@@ -745,8 +745,8 @@ fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[
     const uri = std.Uri.parse(url) catch return error.BadUrl;
 
     var auth_buf: [256]u8 = undefined;
-    const auth_header: ?[]const u8 = if (auth) |a|
-        std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{a}) catch return error.AuthTooLong
+    const auth_header: ?[]const u8 = if (auth) |token|
+        std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return error.AuthTooLong
     else
         null;
 
@@ -766,7 +766,7 @@ fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[
         .headers = .{
             .accept_encoding = .{ .override = "identity" },
             .user_agent = .{ .override = "zoro/0.0" },
-            .authorization = if (auth_header) |h| .{ .override = h } else .omit,
+            .authorization = if (auth_header) |header| .{ .override = header } else .omit,
         },
     });
     handed_off = true;
@@ -776,8 +776,8 @@ fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[
     var response = try req.receiveHead(&.{});
 
     const status: u16 = @intFromEnum(response.head.status);
-    const location = if (response.head.location) |l| try gpa.dupe(u8, l) else null;
-    errdefer if (location) |l| gpa.free(l);
+    const location = if (response.head.location) |value| try gpa.dupe(u8, value) else null;
+    errdefer if (location) |value| gpa.free(value);
 
     const reader = response.reader(&.{});
     const body = reader.allocRemaining(gpa, .limited(limit)) catch |err| switch (err) {

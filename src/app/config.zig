@@ -19,9 +19,9 @@ pub const Secret = struct {
         return self.ptr[0..self.len];
     }
 
-    pub fn format(self: Secret, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn format(self: Secret, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         _ = self;
-        try w.writeAll("[redacted]");
+        try writer.writeAll("[redacted]");
     }
 };
 
@@ -105,8 +105,8 @@ pub const Config = struct {
 
     /// Environment values override file values.
     pub fn overlay(self: *Config, env: *const std.process.Environ.Map) void {
-        var it = env.iterator();
-        while (it.next()) |e| self.set(e.key_ptr.*, e.value_ptr.*);
+        var iterator = env.iterator();
+        while (iterator.next()) |entry| self.set(entry.key_ptr.*, entry.value_ptr.*);
     }
 
     pub fn inboxRelative(self: Config) ![]const u8 {

@@ -169,19 +169,19 @@ fn runLearningInspect(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     defer parsed.deinit();
     if (parsed.value.id) |raw| {
         const id = try parseId(raw);
-        var p = (try learning.get(ctx.db, ctx.gpa, id)) orelse return std.fmt.allocPrint(ctx.gpa, "proposal #{d} was not found", .{id});
-        defer p.deinit(ctx.gpa);
-        return proposalText(ctx.gpa, &p);
+        var proposal = (try learning.get(ctx.db, ctx.gpa, id)) orelse return std.fmt.allocPrint(ctx.gpa, "proposal #{d} was not found", .{id});
+        defer proposal.deinit(ctx.gpa);
+        return proposalText(ctx.gpa, &proposal);
     }
     const list = try learning.list(ctx.db, ctx.gpa, null);
     defer {
-        for (list) |*p| p.deinit(ctx.gpa);
+        for (list) |*proposal| proposal.deinit(ctx.gpa);
         ctx.gpa.free(list);
     }
     var out: std.Io.Writer.Allocating = .init(ctx.gpa);
     errdefer out.deinit();
     try out.writer.print("learning mode: {s}\n", .{@tagName(try learning.mode(ctx.db))});
-    for (list) |p| try out.writer.print("#{d} {s} {s}\n", .{ p.id, @tagName(p.status), p.target });
+    for (list) |proposal| try out.writer.print("#{d} {s} {s}\n", .{ proposal.id, @tagName(proposal.status), proposal.target });
     return out.toOwnedSlice();
 }
 
@@ -266,11 +266,11 @@ fn runIdentityReset(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
 }
 
 fn applySkill(ctx: *tools.Ctx, id: i64) !void {
-    var p = (try learning.get(ctx.db, ctx.gpa, id)) orelse return error.ProposalNotFound;
-    defer p.deinit(ctx.gpa);
-    if (p.status != .pending) return error.BadTransition;
-    const name = skillName(p.target) orelse return error.NotSkillProposal;
-    const skill = try skills.validateLearned(p.proposed);
+    var proposal = (try learning.get(ctx.db, ctx.gpa, id)) orelse return error.ProposalNotFound;
+    defer proposal.deinit(ctx.gpa);
+    if (proposal.status != .pending) return error.BadTransition;
+    const name = skillName(proposal.target) orelse return error.NotSkillProposal;
+    const skill = try skills.validateLearned(proposal.proposed);
     if (!std.mem.eql(u8, skill.name, name)) return error.TargetMismatch;
     const old = skills.readMarkdown(ctx.gpa, ctx.io, ctx.skills_dir, name) catch |err| switch (err) {
         error.FileNotFound => null,
@@ -278,19 +278,19 @@ fn applySkill(ctx: *tools.Ctx, id: i64) !void {
     };
     defer if (old) |text| ctx.gpa.free(text);
     const current = learning.hash(old orelse "");
-    if (!std.mem.eql(u8, &current, p.old_hash)) return error.StaleProposal;
+    if (!std.mem.eql(u8, &current, proposal.old_hash)) return error.StaleProposal;
     try learning.startApply(ctx.db, id, &current, now(ctx));
-    _ = try skills.save(ctx.gpa, ctx.io, ctx.skills_dir, p.proposed);
-    const applied = learning.hash(p.proposed);
+    _ = try skills.save(ctx.gpa, ctx.io, ctx.skills_dir, proposal.proposed);
+    const applied = learning.hash(proposal.proposed);
     try learning.finishApply(ctx.db, id, &applied, now(ctx));
 }
 
 fn rollbackSkill(ctx: *tools.Ctx, id: i64) !void {
-    var p = (try learning.get(ctx.db, ctx.gpa, id)) orelse return error.ProposalNotFound;
-    defer p.deinit(ctx.gpa);
-    if (p.status != .applied) return error.BadTransition;
-    const name = skillName(p.target) orelse return error.NotSkillProposal;
-    const applied = p.applied_hash orelse return error.NotApplied;
+    var proposal = (try learning.get(ctx.db, ctx.gpa, id)) orelse return error.ProposalNotFound;
+    defer proposal.deinit(ctx.gpa);
+    if (proposal.status != .applied) return error.BadTransition;
+    const name = skillName(proposal.target) orelse return error.NotSkillProposal;
+    const applied = proposal.applied_hash orelse return error.NotApplied;
     const current = skills.readMarkdown(ctx.gpa, ctx.io, ctx.skills_dir, name) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
@@ -299,7 +299,7 @@ fn rollbackSkill(ctx: *tools.Ctx, id: i64) !void {
     const current_hash = learning.hash(current orelse "");
     if (!std.mem.eql(u8, &current_hash, applied)) return error.StaleProposal;
     try learning.startRollback(ctx.db, id, now(ctx));
-    if (p.prior_content) |text| {
+    if (proposal.prior_content) |text| {
         _ = try skills.save(ctx.gpa, ctx.io, ctx.skills_dir, text);
     } else {
         try skills.remove(ctx.io, ctx.skills_dir, name);
@@ -308,29 +308,29 @@ fn rollbackSkill(ctx: *tools.Ctx, id: i64) !void {
 }
 
 fn applyIdentity(ctx: *tools.Ctx, id: i64) !void {
-    var p = (try learning.get(ctx.db, ctx.gpa, id)) orelse return error.ProposalNotFound;
-    defer p.deinit(ctx.gpa);
-    if (p.status != .pending) return error.BadTransition;
-    const file = targetFile(p.target) orelse return error.NotIdentityProposal;
+    var proposal = (try learning.get(ctx.db, ctx.gpa, id)) orelse return error.ProposalNotFound;
+    defer proposal.deinit(ctx.gpa);
+    if (proposal.status != .pending) return error.BadTransition;
+    const file = targetFile(proposal.target) orelse return error.NotIdentityProposal;
     const old = identity.read(ctx.gpa, ctx.io, ctx.workspace, file) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
     defer if (old) |text| ctx.gpa.free(text);
     const current = learning.hash(old orelse "");
-    if (!std.mem.eql(u8, &current, p.old_hash)) return error.StaleProposal;
+    if (!std.mem.eql(u8, &current, proposal.old_hash)) return error.StaleProposal;
     try learning.startApply(ctx.db, id, &current, now(ctx));
-    try identity.write(ctx.io, ctx.workspace, file, p.proposed);
-    const applied = learning.hash(p.proposed);
+    try identity.write(ctx.io, ctx.workspace, file, proposal.proposed);
+    const applied = learning.hash(proposal.proposed);
     try learning.finishApply(ctx.db, id, &applied, now(ctx));
 }
 
 fn rollbackIdentity(ctx: *tools.Ctx, id: i64) !void {
-    var p = (try learning.get(ctx.db, ctx.gpa, id)) orelse return error.ProposalNotFound;
-    defer p.deinit(ctx.gpa);
-    if (p.status != .applied) return error.BadTransition;
-    const file = targetFile(p.target) orelse return error.NotIdentityProposal;
-    const applied = p.applied_hash orelse return error.NotApplied;
+    var proposal = (try learning.get(ctx.db, ctx.gpa, id)) orelse return error.ProposalNotFound;
+    defer proposal.deinit(ctx.gpa);
+    if (proposal.status != .applied) return error.BadTransition;
+    const file = targetFile(proposal.target) orelse return error.NotIdentityProposal;
+    const applied = proposal.applied_hash orelse return error.NotApplied;
     const current = identity.read(ctx.gpa, ctx.io, ctx.workspace, file) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
@@ -339,7 +339,7 @@ fn rollbackIdentity(ctx: *tools.Ctx, id: i64) !void {
     const current_hash = learning.hash(current orelse "");
     if (!std.mem.eql(u8, &current_hash, applied)) return error.StaleProposal;
     try learning.startRollback(ctx.db, id, now(ctx));
-    if (p.prior_content) |text| {
+    if (proposal.prior_content) |text| {
         try identity.write(ctx.io, ctx.workspace, file, text);
     } else {
         try identity.reset(ctx.io, ctx.workspace, file);
@@ -356,35 +356,35 @@ pub fn reconcile(db: *Db, gpa: std.mem.Allocator, io: std.Io, workspace: []const
 fn reconcileStatus(db: *Db, gpa: std.mem.Allocator, io: std.Io, workspace: []const u8, skills_dir: []const u8, status: learning.Status, at: i64) !void {
     const list = try learning.list(db, gpa, status);
     defer {
-        for (list) |*p| p.deinit(gpa);
+        for (list) |*proposal| proposal.deinit(gpa);
         gpa.free(list);
     }
-    for (list) |*p| {
-        const current = try contentFor(gpa, io, workspace, skills_dir, p.target);
+    for (list) |*proposal| {
+        const current = try contentFor(gpa, io, workspace, skills_dir, proposal.target);
         defer if (current) |text| gpa.free(text);
         const current_hash = learning.hash(current orelse "");
         switch (status) {
             .applying => {
-                const proposed_hash = learning.hash(p.proposed);
+                const proposed_hash = learning.hash(proposal.proposed);
                 if (std.mem.eql(u8, &current_hash, &proposed_hash)) {
-                    try learning.recoverApply(db, p.id, .applied, &proposed_hash, at);
-                } else if (std.mem.eql(u8, &current_hash, p.old_hash)) {
-                    try learning.recoverApply(db, p.id, .pending, null, at);
+                    try learning.recoverApply(db, proposal.id, .applied, &proposed_hash, at);
+                } else if (std.mem.eql(u8, &current_hash, proposal.old_hash)) {
+                    try learning.recoverApply(db, proposal.id, .pending, null, at);
                 } else {
-                    try learning.recoverApply(db, p.id, .quarantined, null, at);
+                    try learning.recoverApply(db, proposal.id, .quarantined, null, at);
                 }
             },
             .rolling_back => {
-                const applied = p.applied_hash orelse {
-                    try learning.recoverRollback(db, p.id, .quarantined, at);
+                const applied = proposal.applied_hash orelse {
+                    try learning.recoverRollback(db, proposal.id, .quarantined, at);
                     continue;
                 };
-                if (std.mem.eql(u8, &current_hash, p.old_hash)) {
-                    try learning.recoverRollback(db, p.id, .rolled_back, at);
+                if (std.mem.eql(u8, &current_hash, proposal.old_hash)) {
+                    try learning.recoverRollback(db, proposal.id, .rolled_back, at);
                 } else if (std.mem.eql(u8, &current_hash, applied)) {
-                    try learning.recoverRollback(db, p.id, .applied, at);
+                    try learning.recoverRollback(db, proposal.id, .applied, at);
                 } else {
-                    try learning.recoverRollback(db, p.id, .quarantined, at);
+                    try learning.recoverRollback(db, proposal.id, .quarantined, at);
                 }
             },
             else => unreachable,
@@ -408,9 +408,9 @@ fn contentFor(gpa: std.mem.Allocator, io: std.Io, workspace: []const u8, skills_
     return error.UnknownTarget;
 }
 
-fn proposalText(gpa: std.mem.Allocator, p: *const learning.Proposal) ![]u8 {
+fn proposalText(gpa: std.mem.Allocator, proposal: *const learning.Proposal) ![]u8 {
     return std.fmt.allocPrint(gpa, "#{d} {s} {s}\nreason: {s}\nevidence: {s}\nold: {s}\nproposed:\n{s}", .{
-        p.id, @tagName(p.status), p.target, p.reason, p.evidence, p.old_hash, p.proposed,
+        proposal.id, @tagName(proposal.status), proposal.target, proposal.reason, proposal.evidence, proposal.old_hash, proposal.proposed,
     });
 }
 
@@ -503,17 +503,17 @@ test "reconcile commits an interrupted skill apply" {
     try reconcile(&db, std.testing.allocator, io, root, skills_dir, 3);
 
     {
-        var p = (try learning.get(&db, std.testing.allocator, id)).?;
-        defer p.deinit(std.testing.allocator);
-        try std.testing.expectEqual(learning.Status.applied, p.status);
+        var proposal = (try learning.get(&db, std.testing.allocator, id)).?;
+        defer proposal.deinit(std.testing.allocator);
+        try std.testing.expectEqual(learning.Status.applied, proposal.status);
     }
     try learning.startRollback(&db, id, 4);
     try skills.remove(io, skills_dir, "weather");
     try reconcile(&db, std.testing.allocator, io, root, skills_dir, 5);
 
     {
-        var p = (try learning.get(&db, std.testing.allocator, id)).?;
-        defer p.deinit(std.testing.allocator);
-        try std.testing.expectEqual(learning.Status.rolled_back, p.status);
+        var proposal = (try learning.get(&db, std.testing.allocator, id)).?;
+        defer proposal.deinit(std.testing.allocator);
+        try std.testing.expectEqual(learning.Status.rolled_back, proposal.status);
     }
 }

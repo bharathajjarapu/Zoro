@@ -67,11 +67,11 @@ fn parse(ctx: *tools.Ctx, args: []const u8) !Command {
 
     var out: Command = .{ .parsed = parsed, .argv = undefined, .len = parsed.value.argv.len, .kind = undefined, .auto = false };
     var total: usize = 0;
-    for (parsed.value.argv, 0..) |arg, i| {
+    for (parsed.value.argv, 0..) |arg, index| {
         if (arg.len == 0 or arg.len > max_arg or std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidArgs;
         total += arg.len;
         if (total > max_command or forbidden(arg)) return error.BlockedCommand;
-        out.argv[i] = arg;
+        out.argv[index] = arg;
     }
     const spec = resolve(out.argv[0]) orelse return error.BlockedCommand;
     out.argv[0] = spec.path;
@@ -111,9 +111,9 @@ fn forbidden(arg: []const u8) bool {
     return false;
 }
 
-fn envName(s: []const u8) bool {
-    if (s.len == 0 or !(std.ascii.isAlphabetic(s[0]) or s[0] == '_')) return false;
-    for (s[1..]) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+fn envName(name: []const u8) bool {
+    if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |byte| if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
     return true;
 }
 
@@ -147,13 +147,13 @@ fn validate(kind: Kind, argv: []const []const u8) !bool {
 
 fn validWorkerName(name: []const u8) bool {
     if (name.len == 0 or name.len > 63 or name[0] == '-' or name[name.len - 1] == '-') return false;
-    for (name) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '-')) return false;
+    for (name) |byte| if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '-')) return false;
     return true;
 }
 
 fn validDate(date: []const u8) bool {
     if (date.len != 10 or date[4] != '-' or date[7] != '-') return false;
-    for (date, 0..) |c, i| if (i != 4 and i != 7 and !std.ascii.isDigit(c)) return false;
+    for (date, 0..) |byte, index| if (index != 4 and index != 7 and !std.ascii.isDigit(byte)) return false;
     return true;
 }
 
@@ -245,7 +245,7 @@ fn execute(ctx: *tools.Ctx, argv: []const []const u8) ![]u8 {
         }
         const check = std.Io.Clock.Timestamp.fromNow(ctx.io, .{ .raw = .fromMilliseconds(100), .clock = .awake });
         const next = if (check.compare(.lt, deadline)) check else deadline;
-        readers.fill(256, .{ .deadline = next }) catch |err| switch (err) {
+        readers.fill(256, .{ .deadline = next }) catch |fault| switch (fault) {
             error.EndOfStream => break,
             error.Timeout => {
                 if (next.compare(.gte, deadline)) {
@@ -254,7 +254,7 @@ fn execute(ctx: *tools.Ctx, argv: []const []const u8) ![]u8 {
                 }
                 continue;
             },
-            else => |e| return e,
+            else => |err| return err,
         };
         if (stdout.buffered().len + stderr.buffered().len > max_output) {
             killGroup(&child);
@@ -322,10 +322,10 @@ const Harness = struct {
 };
 
 test "allowlisted commands run with a clean environment" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx(.allowlist);
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx(.allowlist);
     const pwd = try tools.call(&ctx, &.{run}, "shell", "{\"argv\":[\"pwd\"]}");
     defer testing.allocator.free(pwd);
     try testing.expect(std.mem.startsWith(u8, pwd, "exit 0\n"));
@@ -336,10 +336,10 @@ test "allowlisted commands run with a clean environment" {
     defer testing.allocator.free(pending);
     try testing.expect(std.mem.indexOf(u8, pending, "May I run") != null);
     try testing.expect(std.mem.indexOf(u8, pending, "[\"/usr/bin/env\"]") != null);
-    var q = try h.db.prepare("SELECT args FROM approvals ORDER BY id DESC LIMIT 1");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    const approved_args = try testing.allocator.dupe(u8, q.text(0));
+    var statement = try harness.db.prepare("SELECT args FROM approvals ORDER BY id DESC LIMIT 1");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    const approved_args = try testing.allocator.dupe(u8, statement.text(0));
     defer testing.allocator.free(approved_args);
     const approved = try tools.callApproved(&ctx, &.{run}, "shell", approved_args);
     defer testing.allocator.free(approved);
@@ -350,10 +350,10 @@ test "allowlisted commands run with a clean environment" {
 }
 
 test "shell approval is bound to its workspace" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx(.ask);
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx(.ask);
     try testing.expectError(
         error.UnboundApproval,
         tools.callApproved(&ctx, &.{run}, "shell", "{\"argv\":[\"env\"]}"),
@@ -361,10 +361,10 @@ test "shell approval is bound to its workspace" {
 }
 
 test "shell rejects wrappers operators assignments and host paths" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx(.ask);
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx(.ask);
     const cases = [_][]const u8{
         "{\"argv\":[\"bash\",\"-c\",\"pwd\"]}",
         "{\"argv\":[\"pwd\",\"&&\",\"id\"]}",
@@ -381,10 +381,10 @@ test "shell rejects wrappers operators assignments and host paths" {
 }
 
 test "deny mode and allowlist misses fail closed" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx(.deny);
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx(.deny);
     const denied = try tools.call(&ctx, &.{run}, "shell", "{\"argv\":[\"pwd\"]}");
     defer testing.allocator.free(denied);
     try testing.expectEqualStrings("shell denied by policy", denied);
@@ -396,12 +396,12 @@ test "deny mode and allowlist misses fail closed" {
 }
 
 test "temporary Wrangler deployment is exact and always asks" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx(.ask);
-    try workspace_app.makeDir(h.threaded.io(), h.workspace_path, "reports/brief");
-    try workspace_app.write(h.threaded.io(), h.workspace_path, "reports/brief/index.html", "<h1>Brief</h1>");
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx(.ask);
+    try workspace_app.makeDir(harness.threaded.io(), harness.workspace_path, "reports/brief");
+    try workspace_app.write(harness.threaded.io(), harness.workspace_path, "reports/brief/index.html", "<h1>Brief</h1>");
     const good = try tools.call(&ctx, &.{run}, "shell", "{\"argv\":[\"wrangler\",\"deploy\",\"reports/brief\",\"--name\",\"zoro-brief\",\"--temporary\",\"--compatibility-date\",\"2026-09-19\"]}");
     defer testing.allocator.free(good);
     try testing.expect(std.mem.indexOf(u8, good, "May I run") != null);
@@ -417,24 +417,24 @@ test "temporary Wrangler deployment is exact and always asks" {
         try testing.expect(std.mem.indexOf(u8, out, "InvalidArgs") != null);
     }
 
-    try workspace_app.write(h.threaded.io(), h.workspace_path, "reports/brief/private.txt", "no");
+    try workspace_app.write(harness.threaded.io(), harness.workspace_path, "reports/brief/private.txt", "no");
     const extra = try tools.call(&ctx, &.{run}, "shell", "{\"argv\":[\"wrangler\",\"deploy\",\"reports/brief\",\"--name\",\"zoro-brief\",\"--temporary\",\"--compatibility-date\",\"2026-09-19\"]}");
     defer testing.allocator.free(extra);
     try testing.expect(std.mem.indexOf(u8, extra, "StaticSiteMustBeSingleIndex") != null);
 }
 
 test "shell bounds output and runtime" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx(.ask);
-    const loud_args = try boundArgs(testing.allocator, h.workspace_path, &.{"yes"});
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx(.ask);
+    const loud_args = try boundArgs(testing.allocator, harness.workspace_path, &.{"yes"});
     defer testing.allocator.free(loud_args);
     const loud = try tools.callApproved(&ctx, &.{run}, "shell", loud_args);
     defer testing.allocator.free(loud);
     try testing.expectEqualStrings("shell output limit exceeded", loud);
 
-    const slow_args = try boundArgs(testing.allocator, h.workspace_path, &.{ "sleep", "2" });
+    const slow_args = try boundArgs(testing.allocator, harness.workspace_path, &.{ "sleep", "2" });
     defer testing.allocator.free(slow_args);
     const slow = try tools.callApproved(&ctx, &.{run}, "shell", slow_args);
     defer testing.allocator.free(slow);
@@ -442,13 +442,13 @@ test "shell bounds output and runtime" {
 }
 
 test "shell cancellation stops an approved process" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var ctx = h.ctx(.ask);
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var ctx = harness.ctx(.ask);
     var stop: std.atomic.Value(bool) = .init(true);
     ctx.cancel = &stop;
-    const args = try boundArgs(testing.allocator, h.workspace_path, &.{ "sleep", "1" });
+    const args = try boundArgs(testing.allocator, harness.workspace_path, &.{ "sleep", "1" });
     defer testing.allocator.free(args);
     try testing.expectError(error.Cancelled, tools.callApproved(&ctx, &.{run}, "shell", args));
 }

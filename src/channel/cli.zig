@@ -13,68 +13,68 @@ pub const max_prompt = 64 * 1024;
 
 /// Joins arguments into `buf`; returns null when empty.
 pub fn takePrompt(buf: []u8, args: anytype) error{StreamTooLong}!?[]u8 {
-    var n: usize = 0;
+    var size: usize = 0;
     while (args.next()) |part| {
-        if (n != 0) {
-            if (n >= buf.len) return error.StreamTooLong;
-            buf[n] = ' ';
-            n += 1;
+        if (size != 0) {
+            if (size >= buf.len) return error.StreamTooLong;
+            buf[size] = ' ';
+            size += 1;
         }
-        if (part.len > buf.len - n) return error.StreamTooLong;
-        @memcpy(buf[n..][0..part.len], part);
-        n += part.len;
+        if (part.len > buf.len - size) return error.StreamTooLong;
+        @memcpy(buf[size..][0..part.len], part);
+        size += part.len;
     }
-    return if (n == 0) null else buf[0..n];
+    return if (size == 0) null else buf[0..size];
 }
 
-pub fn oneShot(a: *Agent, prompt: []const u8, out: *std.Io.Writer) !void {
-    const reply = try a.turn(prompt);
-    defer a.gpa.free(reply);
-    try writeReply(out, reply);
-    try drain(a, out);
+pub fn oneShot(assistant: *Agent, prompt: []const u8, writer: *std.Io.Writer) !void {
+    const reply = try assistant.turn(prompt);
+    defer assistant.gpa.free(reply);
+    try writeReply(writer, reply);
+    try drain(assistant, writer);
 }
 
-pub fn chat(a: *Agent, in: *std.Io.Reader, out: *std.Io.Writer, err_out: *std.Io.Writer) !void {
-    try err_out.writeAll("zoro chat (:q to quit)\n");
-    try err_out.flush();
+pub fn chat(assistant: *Agent, reader: *std.Io.Reader, writer: *std.Io.Writer, errors: *std.Io.Writer) !void {
+    try errors.writeAll("zoro chat (:q to quit)\n");
+    try errors.flush();
     while (true) {
-        try err_out.writeAll("zoro> ");
-        try err_out.flush();
-        const line = (try in.takeDelimiter('\n')) orelse break;
+        try errors.writeAll("zoro> ");
+        try errors.flush();
+        const line = (try reader.takeDelimiter('\n')) orelse break;
         const text = std.mem.trim(u8, stripCr(line), &std.ascii.whitespace);
         if (text.len == 0) continue;
         if (isQuit(text)) break;
-        const reply = try a.turn(text);
-        defer a.gpa.free(reply);
-        try writeReply(out, reply);
-        try drain(a, out);
+        const reply = try assistant.turn(text);
+        defer assistant.gpa.free(reply);
+        try writeReply(writer, reply);
+        try drain(assistant, writer);
     }
 }
 
 /// Prints output queued outside the agent.
-fn drain(a: *Agent, out: *std.Io.Writer) !void {
-    const now = std.Io.Timestamp.now(a.io, .real).toSeconds();
-    try outbox.recoverBefore(a.db, now - 300);
+fn drain(assistant: *Agent, writer: *std.Io.Writer) !void {
+    const now = std.Io.Timestamp.now(assistant.io, .real).toSeconds();
+    try outbox.recoverBefore(assistant.db, now - 300);
     var sent: usize = 0;
     while (sent < outbox.max_drain) {
-        const items = try outbox.claim(a.db, a.gpa, now);
-        defer outbox.free(a.gpa, items);
+        const items = try outbox.claim(assistant.db, assistant.gpa, now);
+        defer outbox.free(assistant.gpa, items);
         if (items.len == 0) break;
         sent += items.len;
-        for (items, 0..) |item, i| {
-            writeItem(out, item) catch |err| {
-                try outbox.uncertain(a.db, item.id, @errorName(err));
-                for (items[i + 1 ..]) |rest| try outbox.retry(a.db, rest.id, @errorName(err));
+        for (items, 0..) |item, index| {
+            writeItem(writer, item) catch |err| {
+                try outbox.uncertain(assistant.db, item.id, @errorName(err));
+                for (items[index + 1 ..]) |rest| try outbox.retry(assistant.db, rest.id, @errorName(err));
                 return err;
             };
-            try outbox.delivered(a.db, item.id);
+            try outbox.delivered(assistant.db, item.id);
         }
     }
-    try out.flush();
+    try writer.flush();
 }
 
 fn writeItem(out: *std.Io.Writer, item: outbox.Item) !void {
-    if (item.path) |p| try out.print("[{s}] {s}\n", .{ @tagName(item.kind), p });
+    if (item.path) |path| try out.print("[{s}] {s}\n", .{ @tagName(item.kind), path });
     if (item.text.len != 0) return writeReply(out, item.text);
     try out.flush();
 }
@@ -89,8 +89,8 @@ fn stripCr(line: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, line, "\r")) line[0 .. line.len - 1] else line;
 }
 
-fn isQuit(s: []const u8) bool {
-    return std.mem.eql(u8, s, ":q") or std.mem.eql(u8, s, ":quit");
+fn isQuit(text: []const u8) bool {
+    return std.mem.eql(u8, text, ":q") or std.mem.eql(u8, text, ":quit");
 }
 
 pub fn printDiary(
@@ -124,8 +124,8 @@ pub fn printMemory(db: *Db, gpa: std.mem.Allocator, query: []const u8, now: i64,
         try out.flush();
         return;
     }
-    for (hits) |h| {
-        try out.print("{s}\t{s}\t{d:.4}\n", .{ h.ref, h.kind, h.score });
+    for (hits) |hit| {
+        try out.print("{s}\t{s}\t{d:.4}\n", .{ hit.ref, hit.kind, hit.score });
     }
     try out.flush();
 }
@@ -139,40 +139,40 @@ pub fn printTasks(db: *Db, gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
 }
 
 pub fn printRoutines(db: *Db, out: *std.Io.Writer) !void {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\SELECT name, enabled, COALESCE(status, '-'), fails, skips,
         \\       COALESCE(next, 0), COALESCE(last, 0)
         \\FROM routines ORDER BY name
     );
-    defer q.finalize();
-    var n: usize = 0;
-    while (try q.step()) : (n += 1) {
+    defer statement.finalize();
+    var count: usize = 0;
+    while (try statement.step()) : (count += 1) {
         try out.print("{s} {s} status={s} fails={d} skips={d} next={d} last={d}\n", .{
-            q.text(0),
-            if (q.int(1) == 1) "on" else "off",
-            q.text(2),
-            q.int(3),
-            q.int(4),
-            q.int(5),
-            q.int(6),
+            statement.text(0),
+            if (statement.int(1) == 1) "on" else "off",
+            statement.text(2),
+            statement.int(3),
+            statement.int(4),
+            statement.int(5),
+            statement.int(6),
         });
     }
-    if (n == 0) try out.writeAll("no routines\n");
+    if (count == 0) try out.writeAll("no routines\n");
     try out.flush();
 }
 
 pub fn printStatus(db: *Db, out: *std.Io.Writer) !void {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\SELECT
         \\ (SELECT count(*) FROM tasks WHERE status IN ('queued','running','blocked')) + (SELECT count(*) FROM outbox WHERE status IN ('queued','claimed','retryable')) + (SELECT count(*) FROM telegram_updates WHERE status IN ('pending','processing','retryable')) + (SELECT count(*) FROM approvals WHERE status IN ('pending','executing')),
         \\ (SELECT count(*) FROM tasks WHERE status = 'failed') + (SELECT count(*) FROM outbox WHERE status = 'failed') + (SELECT count(*) FROM telegram_updates WHERE status = 'failed'),
         \\ (SELECT count(*) FROM outbox WHERE status = 'uncertain') + (SELECT count(*) FROM telegram_updates WHERE status = 'uncertain') + (SELECT count(*) FROM approvals WHERE status = 'uncertain')
     );
-    defer q.finalize();
-    if (!try q.step()) return error.NoRow;
-    const pending = q.int(0);
-    const failed = q.int(1);
-    const uncertain = q.int(2);
+    defer statement.finalize();
+    if (!try statement.step()) return error.NoRow;
+    const pending = statement.int(0);
+    const failed = statement.int(1);
+    const uncertain = statement.int(2);
     const state: []const u8 = if (uncertain != 0 or failed != 0) "blocked" else if (pending != 0) "recovering" else "usable";
     try out.print("{s} pending={d} failed={d} uncertain={d}\n", .{ state, pending, failed, uncertain });
     try out.flush();
@@ -188,54 +188,54 @@ fn resolveDay(buf: *[10]u8, date: ?[]const u8, now: i64) ![]const u8 {
 }
 
 test "run prints the stubbed reply and exits" {
-    var h: Harness = undefined;
-    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"hello back\"}}]}"});
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init(&.{"{\"choices\":[{\"message\":{\"content\":\"hello back\"}}]}"});
+    defer harness.deinit();
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
 
-    try oneShot(&h.agent, "hello", &out.writer);
+    try oneShot(&harness.agent, "hello", &out.writer);
     try testing.expectEqualStrings("hello back\n", out.written());
 }
 
 test "chat holds a multi-turn conversation over stdin" {
-    var h: Harness = undefined;
-    try h.init(&.{
+    var harness: Harness = undefined;
+    try harness.init(&.{
         "{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}",
         "{\"choices\":[{\"message\":{\"content\":\"later\"}}]}",
     });
-    defer h.deinit();
+    defer harness.deinit();
 
-    var in: std.Io.Reader = .fixed("hello\nagain\n");
+    var reader: std.Io.Reader = .fixed("hello\nagain\n");
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     var err_out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer err_out.deinit();
 
-    try chat(&h.agent, &in, &out.writer, &err_out.writer);
+    try chat(&harness.agent, &reader, &out.writer, &err_out.writer);
     try testing.expectEqualStrings("hi\nlater\n", out.written());
 }
 
 test "chat skips blanks and quits on :q" {
-    var h: Harness = undefined;
-    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"});
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init(&.{"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"});
+    defer harness.deinit();
 
-    var in: std.Io.Reader = .fixed("hello\n  \n:q\nignored\n");
+    var reader: std.Io.Reader = .fixed("hello\n  \n:q\nignored\n");
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     var err_out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer err_out.deinit();
 
-    try chat(&h.agent, &in, &out.writer, &err_out.writer);
+    try chat(&harness.agent, &reader, &out.writer, &err_out.writer);
     try testing.expectEqualStrings("ok\n", out.written());
 }
 
 test "takePrompt joins args and rejects overflow" {
     var buf: [16]u8 = undefined;
-    var it: SliceIter = .{ .items = &.{ "hello", "zig" } };
-    try testing.expectEqualStrings("hello zig", (try takePrompt(&buf, &it)).?);
+    var iterator: SliceIter = .{ .items = &.{ "hello", "zig" } };
+    try testing.expectEqualStrings("hello zig", (try takePrompt(&buf, &iterator)).?);
 
     var empty: SliceIter = .{ .items = &.{} };
     try testing.expect(try takePrompt(&buf, &empty) == null);
@@ -246,87 +246,87 @@ test "takePrompt joins args and rejects overflow" {
 
 const SliceIter = struct {
     items: []const []const u8,
-    i: usize = 0,
+    index: usize = 0,
     fn next(self: *SliceIter) ?[]const u8 {
-        if (self.i >= self.items.len) return null;
-        const s = self.items[self.i];
-        self.i += 1;
-        return s;
+        if (self.index >= self.items.len) return null;
+        const item = self.items[self.index];
+        self.index += 1;
+        return item;
     }
 };
 
 test "diary prints a day's file and reports a missing day clearly" {
-    var h: Harness = undefined;
-    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
+    defer harness.deinit();
 
-    const diary_dir = try std.fmt.bufPrint(&h.path_buf, ".zig-cache/tmp/{s}/diary", .{h.tmp.sub_path});
-    try std.Io.Dir.cwd().createDirPath(h.agent.io, diary_dir);
-    var d = try std.Io.Dir.cwd().openDir(h.agent.io, diary_dir, .{});
-    defer d.close(h.agent.io);
-    try d.writeFile(h.agent.io, .{ .sub_path = "2026-08-20.md", .data = "# 2026-08-20\n\nwalked the dog\n" });
+    const diary_dir = try std.fmt.bufPrint(&harness.path_buf, ".zig-cache/tmp/{s}/diary", .{harness.tmp.sub_path});
+    try std.Io.Dir.cwd().createDirPath(harness.agent.io, diary_dir);
+    var folder = try std.Io.Dir.cwd().openDir(harness.agent.io, diary_dir, .{});
+    defer folder.close(harness.agent.io);
+    try folder.writeFile(harness.agent.io, .{ .sub_path = "2026-08-20.md", .data = "# 2026-08-20\n\nwalked the dog\n" });
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try printDiary(testing.allocator, h.agent.io, diary_dir, "2026-08-20", 0, &out.writer);
+    try printDiary(testing.allocator, harness.agent.io, diary_dir, "2026-08-20", 0, &out.writer);
     try testing.expect(std.mem.indexOf(u8, out.written(), "walked the dog") != null);
 
     var missing: std.Io.Writer.Allocating = .init(testing.allocator);
     defer missing.deinit();
-    try printDiary(testing.allocator, h.agent.io, diary_dir, "2026-08-21", 0, &missing.writer);
+    try printDiary(testing.allocator, harness.agent.io, diary_dir, "2026-08-21", 0, &missing.writer);
     try testing.expectEqualStrings("no diary for 2026-08-21\n", missing.written());
 }
 
 test "diary with no date argument defaults to today" {
-    var h: Harness = undefined;
-    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
+    defer harness.deinit();
 
     const now: i64 = 1_755_648_000; // 2026-08-20 00:00 UTC
     var day: [10]u8 = undefined;
     const today = memory.formatDay(&day, now);
-    const diary_dir = try std.fmt.bufPrint(&h.path_buf, ".zig-cache/tmp/{s}/diary", .{h.tmp.sub_path});
-    try std.Io.Dir.cwd().createDirPath(h.agent.io, diary_dir);
-    var d = try std.Io.Dir.cwd().openDir(h.agent.io, diary_dir, .{});
-    defer d.close(h.agent.io);
+    const diary_dir = try std.fmt.bufPrint(&harness.path_buf, ".zig-cache/tmp/{s}/diary", .{harness.tmp.sub_path});
+    try std.Io.Dir.cwd().createDirPath(harness.agent.io, diary_dir);
+    var folder = try std.Io.Dir.cwd().openDir(harness.agent.io, diary_dir, .{});
+    defer folder.close(harness.agent.io);
     var name: [16]u8 = undefined;
-    try d.writeFile(h.agent.io, .{
+    try folder.writeFile(harness.agent.io, .{
         .sub_path = try std.fmt.bufPrint(&name, "{s}.md", .{today}),
         .data = "today's log\n",
     });
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try printDiary(testing.allocator, h.agent.io, diary_dir, null, now, &out.writer);
+    try printDiary(testing.allocator, harness.agent.io, diary_dir, null, now, &out.writer);
     try testing.expectEqualStrings("today's log\n", out.written());
 }
 
 test "memory prints ref, kind, and score per hit" {
-    var h: Harness = undefined;
-    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
+    defer harness.deinit();
 
-    try memory.put(h.agent.db, "pet", "a black cat named mittens", .owner, 1000, null);
+    try memory.put(harness.agent.db, "pet", "a black cat named mittens", .owner, 1000, null);
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try printMemory(h.agent.db, testing.allocator, "mittens", 1000, &out.writer);
+    try printMemory(harness.agent.db, testing.allocator, "mittens", 1000, &out.writer);
     try testing.expect(std.mem.indexOf(u8, out.written(), "pet") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "fact") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), ".") != null);
 }
 
 test "tasks lists parent and child with status, priority, and goal" {
-    var h: Harness = undefined;
-    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
+    defer harness.deinit();
 
-    const parent = try tasks.create(h.agent.db, "research", "notes written", 0, null, 2);
-    _ = try tasks.create(h.agent.db, "fetch sources", "three urls saved", 0, parent, 0);
+    const parent = try tasks.create(harness.agent.db, "research", "notes written", 0, null, 2);
+    _ = try tasks.create(harness.agent.db, "fetch sources", "three urls saved", 0, parent, 0);
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try printTasks(h.agent.db, testing.allocator, &out.writer);
+    try printTasks(harness.agent.db, testing.allocator, &out.writer);
     try testing.expect(std.mem.indexOf(u8, out.written(), "research") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "queued") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "prio=2") != null);
@@ -335,14 +335,14 @@ test "tasks lists parent and child with status, priority, and goal" {
 }
 
 test "status reports recovery without transcript or secrets" {
-    var h: Harness = undefined;
-    try h.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
-    defer h.deinit();
-    _ = try tasks.create(h.agent.db, "work", "done", 0, null, 0);
+    var harness: Harness = undefined;
+    try harness.init(&.{"{\"choices\":[{\"message\":{\"content\":\"x\"}}]}"});
+    defer harness.deinit();
+    _ = try tasks.create(harness.agent.db, "work", "done", 0, null, 0);
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try printStatus(h.agent.db, &out.writer);
+    try printStatus(harness.agent.db, &out.writer);
     try testing.expectEqualStrings("recovering pending=1 failed=0 uncertain=0\n", out.written());
 }
 

@@ -45,21 +45,21 @@ pub const Ctx = struct {
 
 pub fn requireOwnerEvidence(ctx: *Ctx, evidence: []const u8) !void {
     const id = ctx.source_message orelse return error.UntrustedEvidence;
-    var q = try ctx.db.prepare("SELECT owner_text FROM messages WHERE id = ? AND role = 'user'");
-    defer q.finalize();
-    try q.bind(1, id);
-    if (!try q.step() or q.isNull(0) or evidence.len == 0 or std.mem.indexOf(u8, q.text(0), evidence) == null)
+    var statement = try ctx.db.prepare("SELECT owner_text FROM messages WHERE id = ? AND role = 'user'");
+    defer statement.finalize();
+    try statement.bind(1, id);
+    if (!try statement.step() or statement.isNull(0) or evidence.len == 0 or std.mem.indexOf(u8, statement.text(0), evidence) == null)
         return error.UntrustedEvidence;
 }
 
 fn requireOwnerReply(ctx: *Ctx, evidence: []const u8) !void {
     const id = ctx.source_message orelse return error.UntrustedEvidence;
-    var q = try ctx.db.prepare("SELECT owner_text FROM messages WHERE id = ? AND role = 'user'");
-    defer q.finalize();
-    try q.bind(1, id);
-    if (!try q.step() or q.isNull(0) or !std.mem.eql(
+    var statement = try ctx.db.prepare("SELECT owner_text FROM messages WHERE id = ? AND role = 'user'");
+    defer statement.finalize();
+    try statement.bind(1, id);
+    if (!try statement.step() or statement.isNull(0) or !std.mem.eql(
         u8,
-        std.mem.trim(u8, q.text(0), &std.ascii.whitespace),
+        std.mem.trim(u8, statement.text(0), &std.ascii.whitespace),
         std.mem.trim(u8, evidence, &std.ascii.whitespace),
     )) return error.UntrustedEvidence;
 }
@@ -74,11 +74,11 @@ pub fn sensitiveMemory(text: []const u8) bool {
 
 fn containsWord(text: []const u8, word: []const u8) bool {
     var at: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(text, at, word)) |i| {
-        const end = i + word.len;
-        if ((i == 0 or !std.ascii.isAlphanumeric(text[i - 1])) and
+    while (std.ascii.indexOfIgnoreCasePos(text, at, word)) |index| {
+        const end = index + word.len;
+        if ((index == 0 or !std.ascii.isAlphanumeric(text[index - 1])) and
             (end == text.len or !std.ascii.isAlphanumeric(text[end]))) return true;
-        at = i + 1;
+        at = index + 1;
     }
     return false;
 }
@@ -98,11 +98,11 @@ pub const Def = struct {
 pub fn subset(gpa: std.mem.Allocator, all: []const Def, read_only: bool, names: ?[]const u8) ![]Def {
     var out: std.ArrayList(Def) = .empty;
     errdefer out.deinit(gpa);
-    for (all) |t| {
-        if (t.primary_only) continue;
-        if (read_only and t.mutates) continue;
-        if (names) |list| if (!listed(list, t.name)) continue;
-        try out.append(gpa, t);
+    for (all) |tool| {
+        if (tool.primary_only) continue;
+        if (read_only and tool.mutates) continue;
+        if (names) |list| if (!listed(list, tool.name)) continue;
+        try out.append(gpa, tool);
     }
     return out.toOwnedSlice(gpa);
 }
@@ -294,32 +294,32 @@ pub fn call(ctx: *Ctx, tools: []const Def, name: []const u8, args: []const u8) !
     return bound(ctx.gpa, raw);
 }
 
-pub fn writeSchema(w: *std.Io.Writer, def: Def) !void {
-    try w.writeAll("{\"type\":\"object\",\"properties\":{");
-    for (def.params, 0..) |p, i| {
-        if (i != 0) try w.writeByte(',');
-        try std.json.Stringify.encodeJsonString(p.name, .{}, w);
-        try w.writeAll(":{\"type\":\"");
-        try w.writeAll(@tagName(p.kind));
-        try w.writeAll("\",\"description\":");
-        try std.json.Stringify.encodeJsonString(p.description, .{}, w);
-        if (p.kind == .array) try w.writeAll(",\"items\":{\"type\":\"string\"}");
-        try w.writeByte('}');
+pub fn writeSchema(writer: *std.Io.Writer, def: Def) !void {
+    try writer.writeAll("{\"type\":\"object\",\"properties\":{");
+    for (def.params, 0..) |param, index| {
+        if (index != 0) try writer.writeByte(',');
+        try std.json.Stringify.encodeJsonString(param.name, .{}, writer);
+        try writer.writeAll(":{\"type\":\"");
+        try writer.writeAll(@tagName(param.kind));
+        try writer.writeAll("\",\"description\":");
+        try std.json.Stringify.encodeJsonString(param.description, .{}, writer);
+        if (param.kind == .array) try writer.writeAll(",\"items\":{\"type\":\"string\"}");
+        try writer.writeByte('}');
     }
-    try w.writeAll("},\"required\":[");
+    try writer.writeAll("},\"required\":[");
     var first = true;
-    for (def.params) |p| {
-        if (!p.required) continue;
-        if (!first) try w.writeByte(',');
+    for (def.params) |param| {
+        if (!param.required) continue;
+        if (!first) try writer.writeByte(',');
         first = false;
-        try std.json.Stringify.encodeJsonString(p.name, .{}, w);
+        try std.json.Stringify.encodeJsonString(param.name, .{}, writer);
     }
-    try w.writeAll("]}");
+    try writer.writeAll("]}");
 }
 
 fn find(tools: []const Def, name: []const u8) ?Def {
-    for (tools) |t| {
-        if (std.mem.eql(u8, t.name, name)) return t;
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return tool;
     }
     return null;
 }
@@ -331,11 +331,11 @@ fn validate(gpa: std.mem.Allocator, def: Def, args: []const u8) !void {
     };
     defer parsed.deinit();
     const obj = switch (parsed.value) {
-        .object => |o| o,
+        .object => |object| object,
         else => return error.InvalidArgs,
     };
-    for (def.params) |p| {
-        if (p.required and obj.get(p.name) == null) return error.MissingParam;
+    for (def.params) |param| {
+        if (param.required and obj.get(param.name) == null) return error.MissingParam;
     }
 }
 
@@ -358,8 +358,8 @@ fn boomRun(_: *Ctx, _: []const u8) anyerror![]u8 {
 }
 
 fn bigRun(ctx: *Ctx, _: []const u8) anyerror![]u8 {
-    const n = max_result + 100;
-    const out = try ctx.gpa.alloc(u8, n);
+    const size = max_result + 100;
+    const out = try ctx.gpa.alloc(u8, size);
     @memset(out, 'x');
     return out;
 }
@@ -472,19 +472,19 @@ test "permission resolution requires the whole current owner reply" {
     const out = try call(&ctx, &.{resolve_permission}, "resolve_permission", "{\"id\":\"1\",\"decision\":\"approve\",\"evidence\":\"yes\"}");
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "UntrustedEvidence") != null);
-    var q = try db.prepare("SELECT status FROM approvals WHERE id = 1");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqualStrings("pending", q.text(0));
+    var statement = try db.prepare("SELECT status FROM approvals WHERE id = 1");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqualStrings("pending", statement.text(0));
 }
 
 test "schema lists required parameter names" {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try writeSchema(&out.writer, echo_def);
-    const s = out.written();
-    try testing.expect(std.mem.indexOf(u8, s, "\"text\"") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "\"required\"") != null);
+    const schema = out.written();
+    try testing.expect(std.mem.indexOf(u8, schema, "\"text\"") != null);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"required\"") != null);
 }
 
 test "store_secret scrubs the value and keeps the name" {
@@ -507,10 +507,10 @@ test "store_secret scrubs the value and keeps the name" {
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "weather_api_key") != null);
 
-    var q = try db.prepare("SELECT content FROM messages");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expect(std.mem.indexOf(u8, q.text(0), "sk-secret-value") == null);
+    var statement = try db.prepare("SELECT content FROM messages");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expect(std.mem.indexOf(u8, statement.text(0), "sk-secret-value") == null);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -522,7 +522,7 @@ test "store_secret scrubs the value and keeps the name" {
 test "a read-only caller gets no mutating tool, and delegation is never handed out" {
     const list = try subset(testing.allocator, &builtins, true, null);
     defer testing.allocator.free(list);
-    for (list) |t| try testing.expect(!t.mutates and !t.primary_only);
+    for (list) |tool| try testing.expect(!tool.mutates and !tool.primary_only);
     try testing.expect(find(list, "recall") != null);
     try testing.expect(find(list, "remember") == null);
     try testing.expect(find(list, "save_skill") == null);
@@ -559,8 +559,8 @@ test "a gated tool is invisible to the model and reachable only once approved" {
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "active") != null);
 
-    var q = try db.prepare("SELECT enabled FROM routines WHERE name = 'nightly'");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqual(@as(i64, 1), q.int(0));
+    var statement = try db.prepare("SELECT enabled FROM routines WHERE name = 'nightly'");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqual(@as(i64, 1), statement.int(0));
 }

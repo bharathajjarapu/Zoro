@@ -18,7 +18,7 @@ const Parent = struct {
 
 pub fn validPath(path: []const u8) bool {
     if (path.len == 0 or path.len > max_path or std.fs.path.isAbsolute(path)) return false;
-    for (path) |c| if (c < 0x20 or c == 0x7f or c == '"' or c == '\\') return false;
+    for (path) |byte| if (byte < 0x20 or byte == 0x7f or byte == '"' or byte == '\\') return false;
     var it = std.mem.splitScalar(u8, path, '/');
     while (it.next()) |part| {
         if (part.len == 0 or part.len > 255) return false;
@@ -126,10 +126,10 @@ pub fn readBytes(gpa: std.mem.Allocator, io: std.Io, root: []const u8, path: []c
     const stat = try file.stat(io);
     if (stat.kind != .file) return error.NotFile;
     if (stat.size > limit) return error.FileTooLarge;
-    const n: usize = @intCast(stat.size);
-    const out = try gpa.alloc(u8, n);
+    const size: usize = @intCast(stat.size);
+    const out = try gpa.alloc(u8, size);
     errdefer gpa.free(out);
-    if (try file.readPositionalAll(io, out, 0) != n) return error.ShortRead;
+    if (try file.readPositionalAll(io, out, 0) != size) return error.ShortRead;
     return out;
 }
 
@@ -139,15 +139,15 @@ pub fn readLimited(gpa: std.mem.Allocator, io: std.Io, root: []const u8, path: [
     const stat = try file.stat(io);
     if (stat.kind != .file) return error.NotFile;
     if (!truncate and stat.size > limit) return error.FileTooLarge;
-    const n: usize = @intCast(@min(stat.size, limit));
+    const size: usize = @intCast(@min(stat.size, limit));
     const extra = if (truncate and stat.size > limit) trunc_mark.len else 0;
-    const out = try gpa.alloc(u8, n + extra);
+    const out = try gpa.alloc(u8, size + extra);
     errdefer gpa.free(out);
-    const got = try file.readPositionalAll(io, out[0..n], 0);
-    if (got != n) return error.ShortRead;
-    if (!std.unicode.utf8ValidateSlice(out[0..n]) or std.mem.indexOfScalar(u8, out[0..n], 0) != null)
+    const got = try file.readPositionalAll(io, out[0..size], 0);
+    if (got != size) return error.ShortRead;
+    if (!std.unicode.utf8ValidateSlice(out[0..size]) or std.mem.indexOfScalar(u8, out[0..size], 0) != null)
         return error.UnsupportedBinary;
-    if (extra != 0) @memcpy(out[n..], trunc_mark);
+    if (extra != 0) @memcpy(out[size..], trunc_mark);
     return out;
 }
 

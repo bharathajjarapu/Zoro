@@ -1,24 +1,24 @@
 const std = @import("std");
-const c = @import("c");
+const sqlite = @import("c");
 const testing = std.testing;
 
 const log = std.log.scoped(.db);
 
 /// A SQLite connection. One per thread; WAL lets several coexist on one file.
 pub const Db = struct {
-    ptr: *c.sqlite3,
+    ptr: *sqlite.sqlite3,
 
     /// Opens a configured database. Caller must close it.
     pub fn open(path: [:0]const u8) !Db {
-        _ = c.sqlite3_initialize(); // SQLITE_OMIT_AUTOINIT: nobody else does it
+        _ = sqlite.sqlite3_initialize(); // SQLITE_OMIT_AUTOINIT: nobody else does it
 
-        var ptr: ?*c.sqlite3 = null;
-        const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_NOMUTEX;
-        if (c.sqlite3_open_v2(path.ptr, &ptr, flags, null) != c.SQLITE_OK) {
+        var ptr: ?*sqlite.sqlite3 = null;
+        const flags = sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE | sqlite.SQLITE_OPEN_NOMUTEX;
+        if (sqlite.sqlite3_open_v2(path.ptr, &ptr, flags, null) != sqlite.SQLITE_OK) {
             // A failed open still allocates a handle carrying the error.
-            if (ptr) |p| {
-                log.err("open {s}: {s}", .{ path, c.sqlite3_errmsg(p) });
-                _ = c.sqlite3_close(p);
+            if (ptr) |handle| {
+                log.err("open {s}: {s}", .{ path, sqlite.sqlite3_errmsg(handle) });
+                _ = sqlite.sqlite3_close(handle);
             }
             return error.Sqlite;
         }
@@ -44,15 +44,15 @@ pub const Db = struct {
 
     /// Logs leaked statements reported during close.
     pub fn close(self: *Db) void {
-        if (c.sqlite3_close(self.ptr) != c.SQLITE_OK) {
-            log.err("close: {s}", .{c.sqlite3_errmsg(self.ptr)});
+        if (sqlite.sqlite3_close(self.ptr) != sqlite.SQLITE_OK) {
+            log.err("close: {s}", .{sqlite.sqlite3_errmsg(self.ptr)});
         }
         self.* = undefined;
     }
 
     pub fn exec(self: *Db, sql: [:0]const u8) !void {
-        if (c.sqlite3_exec(self.ptr, sql.ptr, null, null, null) != c.SQLITE_OK) {
-            log.err("exec: {s}", .{c.sqlite3_errmsg(self.ptr)});
+        if (sqlite.sqlite3_exec(self.ptr, sql.ptr, null, null, null) != sqlite.SQLITE_OK) {
+            log.err("exec: {s}", .{sqlite.sqlite3_errmsg(self.ptr)});
             return error.Sqlite;
         }
     }
@@ -65,14 +65,14 @@ pub const Db = struct {
     }
 
     pub fn lastId(self: *Db) i64 {
-        return c.sqlite3_last_insert_rowid(self.ptr);
+        return sqlite.sqlite3_last_insert_rowid(self.ptr);
     }
 
     /// Compiles `sql`. Caller must `finalize()` the result.
     pub fn prepare(self: *Db, sql: [:0]const u8) !Stmt {
-        var ptr: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.ptr, sql.ptr, -1, &ptr, null) != c.SQLITE_OK) {
-            log.err("prepare {s}: {s}", .{ sql, c.sqlite3_errmsg(self.ptr) });
+        var ptr: ?*sqlite.sqlite3_stmt = null;
+        if (sqlite.sqlite3_prepare_v2(self.ptr, sql.ptr, -1, &ptr, null) != sqlite.SQLITE_OK) {
+            log.err("prepare {s}: {s}", .{ sql, sqlite.sqlite3_errmsg(self.ptr) });
             return error.Sqlite;
         }
         return .{ .ptr = ptr.?, .db = self.ptr };
@@ -81,72 +81,72 @@ pub const Db = struct {
 
 /// Column slices expire on step, reset, or finalize.
 pub const Stmt = struct {
-    ptr: *c.sqlite3_stmt,
-    db: *c.sqlite3,
+    ptr: *sqlite.sqlite3_stmt,
+    db: *sqlite.sqlite3,
 
     pub fn finalize(self: *Stmt) void {
-        _ = c.sqlite3_finalize(self.ptr);
+        _ = sqlite.sqlite3_finalize(self.ptr);
         self.* = undefined;
     }
 
     /// Binds a 1-based parameter; SQLite copies text.
-    pub fn bind(self: *Stmt, i: c_int, val: anytype) !void {
-        const rc = switch (@typeInfo(@TypeOf(val))) {
-            .null => c.sqlite3_bind_null(self.ptr, i),
-            .optional => return if (val) |v| self.bind(i, v) else self.bind(i, null),
-            .int, .comptime_int => c.sqlite3_bind_int64(self.ptr, i, @intCast(val)),
-            .float, .comptime_float => c.sqlite3_bind_double(self.ptr, i, val),
-            else => c.sqlite3_bind_text64(
+    pub fn bind(self: *Stmt, index: c_int, val: anytype) !void {
+        const result = switch (@typeInfo(@TypeOf(val))) {
+            .null => sqlite.sqlite3_bind_null(self.ptr, index),
+            .optional => return if (val) |value| self.bind(index, value) else self.bind(index, null),
+            .int, .comptime_int => sqlite.sqlite3_bind_int64(self.ptr, index, @intCast(val)),
+            .float, .comptime_float => sqlite.sqlite3_bind_double(self.ptr, index, val),
+            else => sqlite.sqlite3_bind_text64(
                 self.ptr,
-                i,
+                index,
                 val.ptr,
                 val.len,
-                c.SQLITE_TRANSIENT,
-                c.SQLITE_UTF8,
+                sqlite.SQLITE_TRANSIENT,
+                sqlite.SQLITE_UTF8,
             ),
         };
-        if (rc != c.SQLITE_OK) {
-            log.err("bind {d}: {s}", .{ i, c.sqlite3_errmsg(self.db) });
+        if (result != sqlite.SQLITE_OK) {
+            log.err("bind {d}: {s}", .{ index, sqlite.sqlite3_errmsg(self.db) });
             return error.Sqlite;
         }
     }
 
     /// Rewinds for reuse. Bindings survive; call `clear` too if that matters.
     pub fn reset(self: *Stmt) !void {
-        if (c.sqlite3_reset(self.ptr) != c.SQLITE_OK) {
-            log.err("reset: {s}", .{c.sqlite3_errmsg(self.db)});
+        if (sqlite.sqlite3_reset(self.ptr) != sqlite.SQLITE_OK) {
+            log.err("reset: {s}", .{sqlite.sqlite3_errmsg(self.db)});
             return error.Sqlite;
         }
     }
 
     /// Advances one row. Returns false when the statement is done.
     pub fn step(self: *Stmt) !bool {
-        return switch (c.sqlite3_step(self.ptr)) {
-            c.SQLITE_ROW => true,
-            c.SQLITE_DONE => false,
+        return switch (sqlite.sqlite3_step(self.ptr)) {
+            sqlite.SQLITE_ROW => true,
+            sqlite.SQLITE_DONE => false,
             else => {
-                log.err("step: {s}", .{c.sqlite3_errmsg(self.db)});
+                log.err("step: {s}", .{sqlite.sqlite3_errmsg(self.db)});
                 return error.Sqlite;
             },
         };
     }
 
-    pub fn int(self: *Stmt, col: c_int) i64 {
-        return c.sqlite3_column_int64(self.ptr, col);
+    pub fn int(self: *Stmt, column: c_int) i64 {
+        return sqlite.sqlite3_column_int64(self.ptr, column);
     }
 
-    pub fn float(self: *Stmt, col: c_int) f64 {
-        return c.sqlite3_column_double(self.ptr, col);
+    pub fn float(self: *Stmt, column: c_int) f64 {
+        return sqlite.sqlite3_column_double(self.ptr, column);
     }
 
-    pub fn isNull(self: *Stmt, col: c_int) bool {
-        return c.sqlite3_column_type(self.ptr, col) == c.SQLITE_NULL;
+    pub fn isNull(self: *Stmt, column: c_int) bool {
+        return sqlite.sqlite3_column_type(self.ptr, column) == sqlite.SQLITE_NULL;
     }
 
     /// Returns "" for NULL; use `isNull` to distinguish it.
-    pub fn text(self: *Stmt, col: c_int) []const u8 {
-        const ptr = c.sqlite3_column_text(self.ptr, col) orelse return "";
-        const len: usize = @intCast(c.sqlite3_column_bytes(self.ptr, col));
+    pub fn text(self: *Stmt, column: c_int) []const u8 {
+        const ptr = sqlite.sqlite3_column_text(self.ptr, column) orelse return "";
+        const len: usize = @intCast(sqlite.sqlite3_column_bytes(self.ptr, column));
         return ptr[0..len];
     }
 };
@@ -187,8 +187,8 @@ test "schema creates every table and is idempotent" {
     try db.initSchema();
     try testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM kv"));
 
-    var q = try db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'chunks_%' ORDER BY name");
-    defer q.finalize();
+    var statement = try db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'chunks_%' ORDER BY name");
+    defer statement.finalize();
     const want = [_][]const u8{
         "approvals",    "approvals_status",      "chunks",             "diary",
         "facts",        "kv",                    "learning_proposals", "learning_proposals_status",
@@ -199,20 +199,19 @@ test "schema creates every table and is idempotent" {
     };
 
     // Compare inside the loop: a column slice dies at the next step().
-    var n: usize = 0;
-    while (try q.step()) : (n += 1) {
-        try testing.expect(n < want.len);
-        try testing.expectEqualStrings(want[n], q.text(0));
+    var index: usize = 0;
+    while (try statement.step()) : (index += 1) {
+        try testing.expect(index < want.len);
+        try testing.expectEqualStrings(want[index], statement.text(0));
     }
-    try testing.expectEqual(want.len, n);
+    try testing.expectEqual(want.len, index);
 }
 
-/// One-column, one-row integer query. Test-only sugar.
 fn scalar(db: *Db, sql: [:0]const u8) !i64 {
-    var q = try db.prepare(sql);
-    defer q.finalize();
-    if (!try q.step()) return error.NoRow;
-    return q.int(0);
+    var statement = try db.prepare(sql);
+    defer statement.finalize();
+    if (!try statement.step()) return error.NoRow;
+    return statement.int(0);
 }
 
 test "deleting a task cascades to its children and approvals" {
@@ -267,8 +266,8 @@ test "bind copies text, so a caller's buffer need not outlive the step" {
     @memset(&scratch, '!'); // SQLITE_STATIC would now store "!!!!!!!!!"
     try testing.expect(!try ins.step());
 
-    var q = try db.prepare("SELECT key FROM kv");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqualStrings("tg_offset", q.text(0));
+    var statement = try db.prepare("SELECT key FROM kv");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqualStrings("tg_offset", statement.text(0));
 }

@@ -31,59 +31,59 @@ pub const parseUpdates = updates.parseUpdates;
 const utf8ChunkEnd = updates.utf8ChunkEnd;
 
 fn loadPending(db: *Db, gpa: std.mem.Allocator, owner_id: i64, chat_id: i64) ![]Update {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\SELECT id, text, message_id, reply_id, reply_text, kind, file_id, preview_id, file_name, mime,
         \\       file_size, file_unique_id, emoji, sticker_type, callback_id,
         \\       callback_data, latitude, longitude, owner_text
         \\FROM telegram_updates WHERE status = 'pending' ORDER BY id
     );
-    defer q.finalize();
+    defer statement.finalize();
     var items: std.ArrayList(Update) = .empty;
     errdefer freeUpdates(gpa, items.items);
-    while (try q.step()) {
-        const kind = std.meta.stringToEnum(Kind, q.text(5)) orelse .text;
-        var u: Update = undefined;
+    while (try statement.step()) {
+        const kind = std.meta.stringToEnum(Kind, statement.text(5)) orelse .text;
+        var update: Update = undefined;
         {
             const chat_type = try gpa.dupe(u8, "private");
             errdefer gpa.free(chat_type);
-            const reply_text = if (q.isNull(4)) null else try gpa.dupe(u8, q.text(4));
+            const reply_text = if (statement.isNull(4)) null else try gpa.dupe(u8, statement.text(4));
             errdefer if (reply_text) |text| gpa.free(text);
-            const text = try gpa.dupe(u8, q.text(1));
+            const text = try gpa.dupe(u8, statement.text(1));
             errdefer gpa.free(text);
-            u = .{
-                .update_id = q.int(0),
+            update = .{
+                .update_id = statement.int(0),
                 .from_id = owner_id,
                 .chat_id = chat_id,
                 .chat_type = chat_type,
-                .message_id = if (q.isNull(2)) 0 else q.int(2),
-                .reply_id = if (q.isNull(3)) null else q.int(3),
+                .message_id = if (statement.isNull(2)) 0 else statement.int(2),
+                .reply_id = if (statement.isNull(3)) null else statement.int(3),
                 .reply_text = reply_text,
                 .kind = kind,
                 .text = text,
             };
         }
-        errdefer u.deinit(gpa);
-        const file_id = if (q.isNull(6)) null else try gpa.dupe(u8, q.text(6));
-        if (kind == .photo) u.photo = file_id else u.file_id = file_id;
-        u.preview_id = if (q.isNull(7)) null else try gpa.dupe(u8, q.text(7));
-        u.file_name = if (q.isNull(8)) null else try gpa.dupe(u8, q.text(8));
-        u.mime = if (q.isNull(9)) null else try gpa.dupe(u8, q.text(9));
-        u.file_size = if (q.isNull(10)) null else q.int(10);
-        u.unique_id = if (q.isNull(11)) null else try gpa.dupe(u8, q.text(11));
-        u.emoji = if (q.isNull(12)) null else try gpa.dupe(u8, q.text(12));
-        u.sticker_type = if (q.isNull(13)) null else try gpa.dupe(u8, q.text(13));
-        u.callback_id = if (q.isNull(14)) null else try gpa.dupe(u8, q.text(14));
-        u.callback_data = if (q.isNull(15)) null else try gpa.dupe(u8, q.text(15));
-        u.latitude = if (q.isNull(16)) null else q.float(16);
-        u.longitude = if (q.isNull(17)) null else q.float(17);
-        u.owner_text = if (q.isNull(18)) null else try gpa.dupe(u8, q.text(18));
-        try items.append(gpa, u);
+        errdefer update.deinit(gpa);
+        const file_id = if (statement.isNull(6)) null else try gpa.dupe(u8, statement.text(6));
+        if (kind == .photo) update.photo = file_id else update.file_id = file_id;
+        update.preview_id = if (statement.isNull(7)) null else try gpa.dupe(u8, statement.text(7));
+        update.file_name = if (statement.isNull(8)) null else try gpa.dupe(u8, statement.text(8));
+        update.mime = if (statement.isNull(9)) null else try gpa.dupe(u8, statement.text(9));
+        update.file_size = if (statement.isNull(10)) null else statement.int(10);
+        update.unique_id = if (statement.isNull(11)) null else try gpa.dupe(u8, statement.text(11));
+        update.emoji = if (statement.isNull(12)) null else try gpa.dupe(u8, statement.text(12));
+        update.sticker_type = if (statement.isNull(13)) null else try gpa.dupe(u8, statement.text(13));
+        update.callback_id = if (statement.isNull(14)) null else try gpa.dupe(u8, statement.text(14));
+        update.callback_data = if (statement.isNull(15)) null else try gpa.dupe(u8, statement.text(15));
+        update.latitude = if (statement.isNull(16)) null else statement.float(16);
+        update.longitude = if (statement.isNull(17)) null else statement.float(17);
+        update.owner_text = if (statement.isNull(18)) null else try gpa.dupe(u8, statement.text(18));
+        try items.append(gpa, update);
     }
     return items.toOwnedSlice(gpa);
 }
 
 fn freeUpdates(gpa: std.mem.Allocator, items: []Update) void {
-    for (items) |*u| u.deinit(gpa);
+    for (items) |*update| update.deinit(gpa);
     gpa.free(items);
 }
 
@@ -101,26 +101,26 @@ fn commandPrompt(text: []const u8) []const u8 {
 }
 
 fn beginStickerLearning(db: *Db, alias: []const u8, now: i64) !void {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\INSERT INTO sticker_learning(id, alias, created, expires) VALUES (1, ?, ?, ?)
         \\ON CONFLICT(id) DO UPDATE SET alias = excluded.alias, created = excluded.created, expires = excluded.expires
     );
-    defer q.finalize();
-    try q.bind(1, alias);
-    try q.bind(2, now);
-    try q.bind(3, now + sticker_ttl);
-    _ = try q.step();
+    defer statement.finalize();
+    try statement.bind(1, alias);
+    try statement.bind(2, now);
+    try statement.bind(3, now + sticker_ttl);
+    _ = try statement.step();
 }
 
-fn takeStickerLearning(db: *Db, gpa: std.mem.Allocator, u: Update, now: i64) !?[]u8 {
-    var q = try db.prepare("SELECT alias, expires FROM sticker_learning WHERE id = 1");
-    defer q.finalize();
-    if (!try q.step()) return null;
-    if (q.int(1) <= now) {
+fn takeStickerLearning(db: *Db, gpa: std.mem.Allocator, update: Update, now: i64) !?[]u8 {
+    var statement = try db.prepare("SELECT alias, expires FROM sticker_learning WHERE id = 1");
+    defer statement.finalize();
+    if (!try statement.step()) return null;
+    if (statement.int(1) <= now) {
         try db.exec("DELETE FROM sticker_learning;");
         return null;
     }
-    const alias = try gpa.dupe(u8, q.text(0));
+    const alias = try gpa.dupe(u8, statement.text(0));
     errdefer gpa.free(alias);
     var put = try db.prepare(
         \\INSERT INTO sticker_aliases(alias, file_id, unique_id, emoji, updated) VALUES (?, ?, ?, ?, ?)
@@ -129,9 +129,9 @@ fn takeStickerLearning(db: *Db, gpa: std.mem.Allocator, u: Update, now: i64) !?[
     );
     defer put.finalize();
     try put.bind(1, alias);
-    try put.bind(2, u.file_id.?);
-    try put.bind(3, u.unique_id orelse "");
-    try put.bind(4, u.emoji);
+    try put.bind(2, update.file_id.?);
+    try put.bind(3, update.unique_id orelse "");
+    try put.bind(4, update.emoji);
     try put.bind(5, now);
     _ = try put.step();
     try db.exec("DELETE FROM sticker_learning;");
@@ -139,31 +139,31 @@ fn takeStickerLearning(db: *Db, gpa: std.mem.Allocator, u: Update, now: i64) !?[
 }
 
 fn listStickers(db: *Db, gpa: std.mem.Allocator) ![]u8 {
-    var q = try db.prepare("SELECT alias, emoji FROM sticker_aliases ORDER BY alias");
-    defer q.finalize();
+    var statement = try db.prepare("SELECT alias, emoji FROM sticker_aliases ORDER BY alias");
+    defer statement.finalize();
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    while (try q.step()) try out.writer.print("{s}{s}{s}\n", .{ q.text(0), if (q.isNull(1)) "" else " ", q.text(1) });
+    while (try statement.step()) try out.writer.print("{s}{s}{s}\n", .{ statement.text(0), if (statement.isNull(1)) "" else " ", statement.text(1) });
     if (out.written().len == 0) try out.writer.writeAll("No learned stickers.");
     return out.toOwnedSlice();
 }
 
 fn safeName(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
     const base = baseName(raw);
-    const n = @min(base.len, 96);
-    const out = try gpa.alloc(u8, if (n == 0) 4 else n);
-    if (n == 0) {
+    const size = @min(base.len, 96);
+    const out = try gpa.alloc(u8, if (size == 0) 4 else size);
+    if (size == 0) {
         @memcpy(out, "file");
         return out;
     }
-    for (base[0..n], 0..) |c, i| out[i] = if (std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_') c else '_';
+    for (base[0..size], 0..) |byte, index| out[index] = if (std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or byte == '_') byte else '_';
     return out;
 }
 
-pub fn admit(u: Update, owner_id: i64, chat_id: i64) bool {
-    return u.from_id == owner_id and
-        u.chat_id == chat_id and
-        std.mem.eql(u8, u.chat_type, "private");
+pub fn admit(update: Update, owner_id: i64, chat_id: i64) bool {
+    return update.from_id == owner_id and
+        update.chat_id == chat_id and
+        std.mem.eql(u8, update.chat_type, "private");
 }
 
 test "admit serves only the owner in the configured private chat" {
@@ -194,75 +194,75 @@ test "admit serves only the owner in the configured private chat" {
 }
 
 pub fn loadOffset(db: *Db) !?i64 {
-    var q = try db.prepare("SELECT value FROM kv WHERE key = 'tg_offset'");
-    defer q.finalize();
-    if (!try q.step()) return null;
-    return std.fmt.parseInt(i64, q.text(0), 10) catch error.InvalidOffset;
+    var statement = try db.prepare("SELECT value FROM kv WHERE key = 'tg_offset'");
+    defer statement.finalize();
+    if (!try statement.step()) return null;
+    return std.fmt.parseInt(i64, statement.text(0), 10) catch error.InvalidOffset;
 }
 
-pub fn saveOffset(db: *Db, n: i64) !void {
-    var q = try db.prepare(
+pub fn saveOffset(db: *Db, offset: i64) !void {
+    var statement = try db.prepare(
         \\INSERT INTO kv(key, value) VALUES ('tg_offset', ?)
         \\ON CONFLICT(key) DO UPDATE SET value = excluded.value
     );
-    defer q.finalize();
+    defer statement.finalize();
     var buf: [32]u8 = undefined;
-    try q.bind(1, std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable);
-    _ = try q.step();
+    try statement.bind(1, std.fmt.bufPrint(&buf, "{d}", .{offset}) catch unreachable);
+    _ = try statement.step();
 }
 
 /// Records owner work before Telegram's offset acknowledges it. False is a replay.
-fn accept(db: *Db, u: Update, now: i64) !bool {
+fn accept(db: *Db, update: Update, now: i64) !bool {
     try db.exec("BEGIN IMMEDIATE;");
     errdefer db.exec("ROLLBACK;") catch {};
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\INSERT OR IGNORE INTO telegram_updates(
         \\ id, status, text, created, updated, message_id, reply_id, reply_text, kind,
         \\ file_id, preview_id, file_name, mime, file_size, file_unique_id, emoji,
         \\ sticker_type, callback_id, callback_data, latitude, longitude, owner_text)
         \\VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     );
-    defer q.finalize();
-    try q.bind(1, u.update_id);
-    try q.bind(2, u.text);
-    try q.bind(3, now);
-    try q.bind(4, now);
-    try q.bind(5, u.message_id);
-    try q.bind(6, u.reply_id);
-    try q.bind(7, u.reply_text);
-    try q.bind(8, @tagName(u.kind));
-    try q.bind(9, u.photo orelse u.file_id);
-    try q.bind(10, u.preview_id);
-    try q.bind(11, u.file_name);
-    try q.bind(12, u.mime);
-    try q.bind(13, u.file_size);
-    try q.bind(14, u.unique_id);
-    try q.bind(15, u.emoji);
-    try q.bind(16, u.sticker_type);
-    try q.bind(17, u.callback_id);
-    try q.bind(18, u.callback_data);
-    try q.bind(19, u.latitude);
-    try q.bind(20, u.longitude);
-    try q.bind(21, u.owner_text);
-    _ = try q.step();
+    defer statement.finalize();
+    try statement.bind(1, update.update_id);
+    try statement.bind(2, update.text);
+    try statement.bind(3, now);
+    try statement.bind(4, now);
+    try statement.bind(5, update.message_id);
+    try statement.bind(6, update.reply_id);
+    try statement.bind(7, update.reply_text);
+    try statement.bind(8, @tagName(update.kind));
+    try statement.bind(9, update.photo orelse update.file_id);
+    try statement.bind(10, update.preview_id);
+    try statement.bind(11, update.file_name);
+    try statement.bind(12, update.mime);
+    try statement.bind(13, update.file_size);
+    try statement.bind(14, update.unique_id);
+    try statement.bind(15, update.emoji);
+    try statement.bind(16, update.sticker_type);
+    try statement.bind(17, update.callback_id);
+    try statement.bind(18, update.callback_data);
+    try statement.bind(19, update.latitude);
+    try statement.bind(20, update.longitude);
+    try statement.bind(21, update.owner_text);
+    _ = try statement.step();
     const fresh = cChanges(db) == 1;
-    try saveOffset(db, u.update_id + 1);
+    try saveOffset(db, update.update_id + 1);
     try db.exec("COMMIT;");
     return fresh;
 }
 
 fn updateStatus(db: *Db, id: i64, status: []const u8, now: i64) !void {
-    var q = try db.prepare("UPDATE telegram_updates SET status = ?, updated = ? WHERE id = ?");
-    defer q.finalize();
-    try q.bind(1, status);
-    try q.bind(2, now);
-    try q.bind(3, id);
-    _ = try q.step();
+    var statement = try db.prepare("UPDATE telegram_updates SET status = ?, updated = ? WHERE id = ?");
+    defer statement.finalize();
+    try statement.bind(1, status);
+    try statement.bind(2, now);
+    try statement.bind(3, id);
+    _ = try statement.step();
 }
 
 fn cChanges(db: *Db) i64 {
-    const c = @import("c");
-    return c.sqlite3_changes(db.ptr);
+    const sqlite = @import("c");
+    return sqlite.sqlite3_changes(db.ptr);
 }
 
 const api_base = "https://api.telegram.org/bot";
@@ -318,29 +318,29 @@ pub const Bot = struct {
         var batch = try parseUpdates(self.gpa, body);
         defer batch.deinit(self.gpa);
 
-        for (batch.items) |u| {
-            if (u.kind == .callback) self.answerCallback(u.callback_id.?, if (admit(u, self.owner_id, self.chat_id)) "" else "Not allowed") catch |err|
+        for (batch.items) |update| {
+            if (update.kind == .callback) self.answerCallback(update.callback_id.?, if (admit(update, self.owner_id, self.chat_id)) "" else "Not allowed") catch |err|
                 log.warn("callback answer: {t}", .{err});
-            if (!admit(u, self.owner_id, self.chat_id)) {
-                try saveOffset(self.db, u.update_id + 1);
+            if (!admit(update, self.owner_id, self.chat_id)) {
+                try saveOffset(self.db, update.update_id + 1);
                 continue;
             }
             const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
-            if (!try accept(self.db, u, now)) continue;
-            try updateStatus(self.db, u.update_id, "processing", now);
-            self.process(u) catch |err| {
+            if (!try accept(self.db, update, now)) continue;
+            try updateStatus(self.db, update.update_id, "processing", now);
+            self.process(update) catch |err| {
                 if (err == error.TurnCancelled) {
-                    try updateStatus(self.db, u.update_id, "cancelled", now);
+                    try updateStatus(self.db, update.update_id, "cancelled", now);
                     try self.flush();
                     continue;
                 }
-                try updateStatus(self.db, u.update_id, "failed", now);
+                try updateStatus(self.db, update.update_id, "failed", now);
                 return err;
             };
-            try updateStatus(self.db, u.update_id, "completed", now);
+            try updateStatus(self.db, update.update_id, "completed", now);
             try self.flush();
         }
-        if (batch.next_offset) |n| try saveOffset(self.db, n);
+        if (batch.next_offset) |next_offset| try saveOffset(self.db, next_offset);
     }
 
     pub fn run(self: *Bot, stop: *const fn () bool) !void {
@@ -359,12 +359,12 @@ pub const Bot = struct {
         }
     }
 
-    fn process(self: *Bot, u: Update) !void {
-        if (u.kind == .callback) return self.handleCallback(u);
-        if (u.kind == .reaction) return;
-        if (try self.handleCommand(u)) return;
+    fn process(self: *Bot, update: Update) !void {
+        if (update.kind == .callback) return self.handleCallback(update);
+        if (update.kind == .reaction) return;
+        if (try self.handleCommand(update)) return;
         if (self.live_http == null) self.sendActivity(self.http, "typing") catch |err| log.warn("typing: {t}", .{err});
-        try self.answer(u);
+        try self.answer(update);
     }
 
     fn recoverUpdates(self: *Bot) !void {
@@ -372,20 +372,20 @@ pub const Bot = struct {
 
         const pending = try loadPending(self.db, self.gpa, self.owner_id, self.chat_id);
         defer freeUpdates(self.gpa, pending);
-        for (pending) |u| {
+        for (pending) |update| {
             const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
-            try updateStatus(self.db, u.update_id, "processing", now);
-            self.process(u) catch {
-                try updateStatus(self.db, u.update_id, "failed", now);
+            try updateStatus(self.db, update.update_id, "processing", now);
+            self.process(update) catch {
+                try updateStatus(self.db, update.update_id, "failed", now);
                 continue;
             };
-            try updateStatus(self.db, u.update_id, "completed", now);
+            try updateStatus(self.db, update.update_id, "completed", now);
         }
         try self.flush();
     }
 
-    fn handleCallback(self: *Bot, u: Update) !void {
-        const data = u.callback_data orelse return;
+    fn handleCallback(self: *Bot, update: Update) !void {
+        const data = update.callback_data orelse return;
         if (data.len < 3 or data[1] != ':') return;
         const id = std.fmt.parseInt(i64, data[2..], 10) catch return;
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
@@ -393,51 +393,51 @@ pub const Bot = struct {
             's' => {
                 const stopped = if (self.agent.pool) |pool| pool.cancel(id) else false;
                 if (stopped) tasks.setStatus(self.db, id, .cancelled) catch {};
-                try outbox.pushReply(self.db, .text, null, if (stopped) "Stopping that task." else "That task is no longer running.", u.message_id, now);
+                try outbox.pushReply(self.db, .text, null, if (stopped) "Stopping that task." else "That task is no longer running.", update.message_id, now);
             },
             'r' => {
                 const queued = try outbox.retryDelivery(self.db, id);
-                try outbox.pushReply(self.db, .text, null, if (queued) "Queued one retry." else "That delivery cannot be retried.", u.message_id, now);
+                try outbox.pushReply(self.db, .text, null, if (queued) "Queued one retry." else "That delivery cannot be retried.", update.message_id, now);
             },
             else => {},
         }
     }
 
-    fn handleCommand(self: *Bot, u: Update) !bool {
-        const text = std.mem.trim(u8, u.text, &std.ascii.whitespace);
+    fn handleCommand(self: *Bot, update: Update) !bool {
+        const text = std.mem.trim(u8, update.text, &std.ascii.whitespace);
         if (std.mem.eql(u8, text, "/help")) {
-            try self.queueReply(u.message_id, "Use /status, /tasks, /routines, /memory, /diary, /skills, /character, /learn, /model, /cache, /compact, /clear, /stickers, /stop, or /new.");
+            try self.queueReply(update.message_id, "Use /status, /tasks, /routines, /memory, /diary, /skills, /character, /learn, /model, /cache, /compact, /clear, /stickers, /stop, or /new.");
             return true;
         }
         if (std.mem.eql(u8, text, "/stop")) {
-            try self.queueReply(u.message_id, "Nothing is running right now.");
+            try self.queueReply(update.message_id, "Nothing is running right now.");
             return true;
         }
         const learn = "/learn sticker ";
         if (std.mem.startsWith(u8, text, learn)) {
             const alias = std.mem.trim(u8, text[learn.len..], &std.ascii.whitespace);
             if (!outbox.safeAlias(alias)) {
-                try self.queueReply(u.message_id, "Use /learn sticker followed by one short alias.");
+                try self.queueReply(update.message_id, "Use /learn sticker followed by one short alias.");
                 return true;
             }
             const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
             try beginStickerLearning(self.db, alias, now);
-            try self.queueReply(u.message_id, "Send the sticker within five minutes.");
+            try self.queueReply(update.message_id, "Send the sticker within five minutes.");
             return true;
         }
         if (std.mem.eql(u8, text, "/stickers")) {
             const list = try listStickers(self.db, self.gpa);
             defer self.gpa.free(list);
-            try self.queueReply(u.message_id, list);
+            try self.queueReply(update.message_id, list);
             return true;
         }
         const send_prefix = "/sticker ";
         if (std.mem.startsWith(u8, text, send_prefix)) {
             const alias = std.mem.trim(u8, text[send_prefix.len..], &std.ascii.whitespace);
             if (!outbox.safeAlias(alias) or !try outbox.stickerExists(self.db, alias))
-                try self.queueReply(u.message_id, "Unknown sticker alias.")
+                try self.queueReply(update.message_id, "Unknown sticker alias.")
             else
-                try outbox.pushReply(self.db, .sticker, alias, "", u.message_id, std.Io.Timestamp.now(self.io, .real).toSeconds());
+                try outbox.pushReply(self.db, .sticker, alias, "", update.message_id, std.Io.Timestamp.now(self.io, .real).toSeconds());
             return true;
         }
         return false;
@@ -447,17 +447,17 @@ pub const Bot = struct {
         try outbox.pushReply(self.db, .text, null, text, reply_id, std.Io.Timestamp.now(self.io, .real).toSeconds());
     }
 
-    fn context(self: *Bot, u: Update, picture: *?[]u8, mime: *[]const u8) ![]u8 {
-        if (u.kind == .location) return std.fmt.allocPrint(self.gpa, "{s}{s}[location: {d:.6}, {d:.6}]", .{
-            u.text,
-            if (u.text.len == 0) "" else "\n",
-            u.latitude.?,
-            u.longitude.?,
+    fn context(self: *Bot, update: Update, picture: *?[]u8, mime: *[]const u8) ![]u8 {
+        if (update.kind == .location) return std.fmt.allocPrint(self.gpa, "{s}{s}[location: {d:.6}, {d:.6}]", .{
+            update.text,
+            if (update.text.len == 0) "" else "\n",
+            update.latitude.?,
+            update.longitude.?,
         });
-        if (u.kind == .sticker) {
-            const learned = try takeStickerLearning(self.db, self.gpa, u, std.Io.Timestamp.now(self.io, .real).toSeconds());
+        if (update.kind == .sticker) {
+            const learned = try takeStickerLearning(self.db, self.gpa, update, std.Io.Timestamp.now(self.io, .real).toSeconds());
             defer if (learned) |alias| self.gpa.free(alias);
-            const image_id = if (std.mem.eql(u8, u.sticker_type orelse "", "static")) u.file_id else u.preview_id;
+            const image_id = if (std.mem.eql(u8, update.sticker_type orelse "", "static")) update.file_id else update.preview_id;
             if (image_id) |id| {
                 if (self.download(id)) |bytes| {
                     if (bytes.len <= max_model_image) {
@@ -467,36 +467,36 @@ pub const Bot = struct {
                 } else |_| {}
             }
             return std.fmt.allocPrint(self.gpa, "[sticker: {s}, {s}{s}{s}]", .{
-                u.emoji orelse "no emoji",
-                u.sticker_type orelse "unknown",
+                update.emoji orelse "no emoji",
+                update.sticker_type orelse "unknown",
                 if (learned != null) ", learned as " else "",
                 learned orelse "",
             });
         }
 
-        if ((u.file_size orelse 0) > max_file) return std.fmt.allocPrint(self.gpa, "{s}{s}[{s}: too large to download, {d} bytes]", .{
-            u.text, if (u.text.len == 0) "" else "\n", @tagName(u.kind), u.file_size.?,
+        if ((update.file_size orelse 0) > max_file) return std.fmt.allocPrint(self.gpa, "{s}{s}[{s}: too large to download, {d} bytes]", .{
+            update.text, if (update.text.len == 0) "" else "\n", @tagName(update.kind), update.file_size.?,
         });
 
-        const bytes = self.download(u.file_id.?) catch |err| return std.fmt.allocPrint(
+        const bytes = self.download(update.file_id.?) catch |err| return std.fmt.allocPrint(
             self.gpa,
             "{s}{s}[{s}: download failed ({s})]",
-            .{ u.text, if (u.text.len == 0) "" else "\n", @tagName(u.kind), @errorName(err) },
+            .{ update.text, if (update.text.len == 0) "" else "\n", @tagName(update.kind), @errorName(err) },
         );
         var keep_bytes = false;
         defer if (!keep_bytes) self.gpa.free(bytes);
-        const name = try safeName(self.gpa, u.file_name orelse @tagName(u.kind));
+        const name = try safeName(self.gpa, update.file_name orelse @tagName(update.kind));
         defer self.gpa.free(name);
         var rel_buf: [workspace.max_path]u8 = undefined;
-        const rel = try std.fmt.bufPrint(&rel_buf, "{s}/{d}-{s}", .{ self.inbox, u.update_id, name });
+        const rel = try std.fmt.bufPrint(&rel_buf, "{s}/{d}-{s}", .{ self.inbox, update.update_id, name });
         try self.ensureInbox();
         try workspace.writeBounded(self.io, self.workspace, rel, bytes, max_file);
         const detected = imageMime(bytes);
-        if (bytes.len <= max_model_image and (detected != null or std.mem.startsWith(u8, u.mime orelse "", "image/"))) {
+        if (bytes.len <= max_model_image and (detected != null or std.mem.startsWith(u8, update.mime orelse "", "image/"))) {
             picture.* = bytes;
-            mime.* = detected orelse u.mime.?;
+            mime.* = detected orelse update.mime.?;
             keep_bytes = true;
-        } else if (u.preview_id) |preview_id| {
+        } else if (update.preview_id) |preview_id| {
             if (self.download(preview_id)) |preview| {
                 if (preview.len <= max_model_image) {
                     picture.* = preview;
@@ -504,20 +504,20 @@ pub const Bot = struct {
                 } else self.gpa.free(preview);
             } else |_| {}
         }
-        const note = switch (u.kind) {
+        const note = switch (update.kind) {
             .voice => "Voice transcription is unavailable; the original file is saved.",
             .audio, .video, .animation => "This media is saved, but its contents were not interpreted.",
             else => "The file is saved.",
         };
-        if (std.mem.startsWith(u8, u.mime orelse "", "text/") and bytes.len <= max_text and std.unicode.utf8ValidateSlice(bytes)) {
+        if (std.mem.startsWith(u8, update.mime orelse "", "text/") and bytes.len <= max_text and std.unicode.utf8ValidateSlice(bytes)) {
             return std.fmt.allocPrint(self.gpa, "{s}{s}[{s} in inbox: {s}, {s}, {d} bytes]\n{s}", .{
-                u.text,                  if (u.text.len == 0) "" else "\n", @tagName(u.kind), rel,
-                u.mime orelse "unknown", bytes.len,                         bytes,
+                update.text,                  if (update.text.len == 0) "" else "\n", @tagName(update.kind), rel,
+                update.mime orelse "unknown", bytes.len,                              bytes,
             });
         }
         return std.fmt.allocPrint(self.gpa, "{s}{s}[{s} in inbox: {s}, {s}, {d} bytes] {s}", .{
-            u.text,                  if (u.text.len == 0) "" else "\n", @tagName(u.kind), rel,
-            u.mime orelse "unknown", bytes.len,                         note,
+            update.text,                  if (update.text.len == 0) "" else "\n", @tagName(update.kind), rel,
+            update.mime orelse "unknown", bytes.len,                              note,
         });
     }
 
@@ -526,12 +526,12 @@ pub const Bot = struct {
     }
 
     fn sendStickerAlias(self: *Bot, alias: []const u8, reply_id: ?i64) !void {
-        var q = try self.db.prepare("SELECT file_id FROM sticker_aliases WHERE alias = ?");
-        defer q.finalize();
-        try q.bind(1, alias);
-        if (!try q.step()) return error.UnknownSticker;
+        var statement = try self.db.prepare("SELECT file_id FROM sticker_aliases WHERE alias = ?");
+        defer statement.finalize();
+        try statement.bind(1, alias);
+        if (!try statement.step()) return error.UnknownSticker;
         self.sendActivity(self.live_http, "choose_sticker") catch |err| log.warn("sticker action: {t}", .{err});
-        const req = try buildFileId(self.gpa, self.chat_id, "sticker", q.text(0), reply_id);
+        const req = try buildFileId(self.gpa, self.chat_id, "sticker", statement.text(0), reply_id);
         defer self.gpa.free(req);
         const body = try self.call("sendSticker", req);
         defer self.gpa.free(body);
@@ -553,23 +553,23 @@ pub const Bot = struct {
     }
 
     /// Failed image downloads still produce a text turn.
-    fn answer(self: *Bot, u: Update) !void {
+    fn answer(self: *Bot, update: Update) !void {
         var picture: ?[]u8 = null;
-        defer if (picture) |p| self.gpa.free(p);
+        defer if (picture) |image| self.gpa.free(image);
         var mime: []const u8 = "image/jpeg";
         var prompt: ?[]u8 = null;
-        defer if (prompt) |s| self.gpa.free(s);
+        defer if (prompt) |text| self.gpa.free(text);
 
-        if (u.photo) |file_id| {
+        if (update.photo) |file_id| {
             if (self.download(file_id)) |bytes| {
                 var keep_bytes = false;
                 defer if (!keep_bytes) self.gpa.free(bytes);
-                const rel = try std.fmt.allocPrint(self.gpa, "{s}/{d}-photo.jpg", .{ self.inbox, u.update_id });
+                const rel = try std.fmt.allocPrint(self.gpa, "{s}/{d}-photo.jpg", .{ self.inbox, update.update_id });
                 defer self.gpa.free(rel);
                 try self.ensureInbox();
                 try workspace.writeBounded(self.io, self.workspace, rel, bytes, max_file);
                 prompt = try std.fmt.allocPrint(self.gpa, "{s}{s}[photo in inbox: {s}, {d} bytes]", .{
-                    u.text, if (u.text.len == 0) "" else "\n", rel, bytes.len,
+                    update.text, if (update.text.len == 0) "" else "\n", rel, bytes.len,
                 });
                 if (bytes.len <= max_model_image) {
                     picture = bytes;
@@ -579,14 +579,14 @@ pub const Bot = struct {
             } else |err| {
                 log.warn("photo {s}: {t}", .{ file_id, err });
                 prompt = try std.fmt.allocPrint(self.gpa, "{s}{s}[photo download failed: {s}]", .{
-                    u.text, if (u.text.len == 0) "" else "\n", @errorName(err),
+                    update.text, if (update.text.len == 0) "" else "\n", @errorName(err),
                 });
             }
         }
 
-        if (u.kind != .photo and u.kind != .text) prompt = try self.context(u, &picture, &mime);
-        const input = commandPrompt(u.text);
-        if (u.reply_text) |quoted| {
+        if (update.kind != .photo and update.kind != .text) prompt = try self.context(update, &picture, &mime);
+        const input = commandPrompt(update.text);
+        if (update.reply_text) |quoted| {
             const combined = try std.fmt.allocPrint(self.gpa, "[replying to: {s}]\n{s}", .{ quoted, prompt orelse input });
             if (prompt) |old| self.gpa.free(old);
             prompt = combined;
@@ -599,13 +599,13 @@ pub const Bot = struct {
         var stop_update: std.atomic.Value(i64) = .init(0);
         var activity_thread: ?std.Thread = null;
         if (self.live_http != null) {
-            activity_thread = try std.Thread.spawn(.{}, activity, .{ self, &cancel, &done, &stop_update, u.update_id + 1 });
+            activity_thread = try std.Thread.spawn(.{}, activity, .{ self, &cancel, &done, &stop_update, update.update_id + 1 });
         }
 
         const result = self.agent.turnWithCancel(.{
             .text = prompt orelse if (input.len != 0) input else "(a picture, no caption)",
-            .owner_text = u.owner_text,
-            .image = if (picture) |p| .{ .mime = mime, .data = p } else null,
+            .owner_text = update.owner_text,
+            .image = if (picture) |image| .{ .mime = mime, .data = image } else null,
         }, &cancel);
         cancel.stop.store(true, .release);
         done.store(true, .release);
@@ -613,26 +613,25 @@ pub const Bot = struct {
         if (stop_update.load(.acquire) != 0) try recordStop(self.db, stop_update.load(.acquire), std.Io.Timestamp.now(self.io, .real).toSeconds());
         const reply = result catch |err| {
             if (err != error.Cancelled) return err;
-            try self.queueReply(u.message_id, "Okay, I stopped.");
+            try self.queueReply(update.message_id, "Okay, I stopped.");
             return error.TurnCancelled;
         };
         defer self.gpa.free(reply);
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
         if (reply.len != 0) {
             if (self.agent.last_approval != null)
-                try outbox.pushReply(self.db, .text, null, reply, u.message_id, now)
+                try outbox.pushReply(self.db, .text, null, reply, update.message_id, now)
             else
                 try outbox.push(self.db, .text, null, reply, now);
         }
     }
 
-    /// Sends queued owner output.
     fn flush(self: *Bot) !void {
         var drained: usize = 0;
         while (drained < outbox.max_drain) {
-            const n = try self.flushBatch();
-            if (n == 0) return;
-            drained += n;
+            const count = try self.flushBatch();
+            if (count == 0) return;
+            drained += count;
         }
     }
 
@@ -673,19 +672,19 @@ pub const Bot = struct {
     fn sendAlbum(self: *Bot, items: []const outbox.Item) !void {
         if (items.len < 2 or items.len > 10) return error.BadAlbum;
         var files: [10][]u8 = undefined;
-        var n: usize = 0;
+        var count: usize = 0;
         var total: usize = 0;
-        defer for (files[0..n]) |bytes| self.gpa.free(bytes);
+        defer for (files[0..count]) |bytes| self.gpa.free(bytes);
         for (items) |item| {
             const bytes = try workspace.readBytes(self.gpa, self.io, self.workspace, item.path.?, max_file);
             total = addAlbumSize(total, bytes.len) catch |err| {
                 self.gpa.free(bytes);
                 return err;
             };
-            files[n] = bytes;
-            n += 1;
+            files[count] = bytes;
+            count += 1;
         }
-        const body = try albumBody(self.gpa, self.chat_id, items, files[0..n]);
+        const body = try albumBody(self.gpa, self.chat_id, items, files[0..count]);
         defer self.gpa.free(body);
         self.sendActivity(self.live_http, actionFor(items[0].kind)) catch |err| log.warn("upload action: {t}", .{err});
         const reply = try self.post("sendMediaGroup", body, "multipart/form-data; boundary=" ++ boundary);
@@ -852,9 +851,9 @@ fn activity(
         defer self.gpa.free(body);
         var batch = parseUpdates(self.gpa, body) catch return;
         defer batch.deinit(self.gpa);
-        for (batch.items) |u| {
-            if (!admit(u, self.owner_id, self.chat_id) or u.kind != .text or !stopText(u.text)) continue;
-            stop_update.store(u.update_id, .release);
+        for (batch.items) |update| {
+            if (!admit(update, self.owner_id, self.chat_id) or update.kind != .text or !stopText(update.text)) continue;
+            stop_update.store(update.update_id, .release);
             cancel.stop.store(true, .release);
             return;
         }
@@ -961,15 +960,15 @@ fn timedPost(
 }
 
 fn recordStop(db: *Db, id: i64, now: i64) !void {
-    var q = try db.prepare(
+    var statement = try db.prepare(
         \\INSERT OR IGNORE INTO telegram_updates(id, status, text, created, updated, kind, callback_data)
         \\VALUES (?, 'completed', '/stop', ?, ?, 'text', NULL)
     );
-    defer q.finalize();
-    try q.bind(1, id);
-    try q.bind(2, now);
-    try q.bind(3, now);
-    _ = try q.step();
+    defer statement.finalize();
+    try statement.bind(1, id);
+    try statement.bind(2, now);
+    try statement.bind(3, now);
+    _ = try statement.step();
 }
 
 fn endpoint(gpa: std.mem.Allocator, token: []const u8, method: []const u8) ![]u8 {
@@ -980,9 +979,9 @@ fn endpoint(gpa: std.mem.Allocator, token: []const u8, method: []const u8) ![]u8
 fn validToken(token: []const u8) bool {
     const colon = std.mem.indexOfScalar(u8, token, ':') orelse return false;
     if (colon == 0 or colon + 1 == token.len) return false;
-    for (token[0..colon]) |b| if (!std.ascii.isDigit(b)) return false;
-    for (token[colon + 1 ..]) |b| {
-        if (std.ascii.isAlphanumeric(b) or b == '-' or b == '_') continue;
+    for (token[0..colon]) |byte| if (!std.ascii.isDigit(byte)) return false;
+    for (token[colon + 1 ..]) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_') continue;
         return false;
     }
     return true;
@@ -990,7 +989,7 @@ fn validToken(token: []const u8) bool {
 
 fn validMethod(method: []const u8) bool {
     if (method.len == 0) return false;
-    for (method) |b| if (!std.ascii.isAlphanumeric(b)) return false;
+    for (method) |byte| if (!std.ascii.isAlphanumeric(byte)) return false;
     return true;
 }
 
@@ -1013,8 +1012,8 @@ fn retryAfter(gpa: std.mem.Allocator, body: []const u8) ?u32 {
         .ignore_unknown_fields = true,
     }) catch return null;
     defer parsed.deinit();
-    const n = (parsed.value.parameters orelse return null).retry_after orelse return null;
-    return if (n >= 0) std.math.cast(u32, n) else null;
+    const seconds = (parsed.value.parameters orelse return null).retry_after orelse return null;
+    return if (seconds >= 0) std.math.cast(u32, seconds) else null;
 }
 
 test "retryAfter reads parameters.retry_after" {
@@ -1081,11 +1080,11 @@ const commands_json =
 fn escapeHtml(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    for (text) |c| switch (c) {
+    for (text) |byte| switch (byte) {
         '&' => try out.writer.writeAll("&amp;"),
         '<' => try out.writer.writeAll("&lt;"),
         '>' => try out.writer.writeAll("&gt;"),
-        else => try out.writer.writeByte(c),
+        else => try out.writer.writeByte(byte),
     };
     return out.toOwnedSlice();
 }
@@ -1110,35 +1109,35 @@ const boundary = "zoroFormBoundary7Nn2Kq";
 fn albumBody(gpa: std.mem.Allocator, chat_id: i64, items: []const outbox.Item, files: []const []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    const w = &out.writer;
-    try w.print("--{s}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{ boundary, chat_id });
-    if (items[0].reply_id) |id| try w.print("--{s}\r\nContent-Disposition: form-data; name=\"reply_parameters\"\r\nContent-Type: application/json\r\n\r\n{{\"message_id\":{d}}}\r\n", .{ boundary, id });
-    try w.print("--{s}\r\nContent-Disposition: form-data; name=\"media\"\r\nContent-Type: application/json\r\n\r\n[", .{boundary});
-    for (items, 0..) |item, i| {
-        if (i != 0) try w.writeByte(',');
-        try w.print("{{\"type\":\"{s}\",\"media\":\"attach://f{d}\"", .{ @tagName(item.kind), i });
-        if (i == 0 and item.text.len != 0) {
-            try w.writeAll(",\"caption\":");
-            try std.json.Stringify.encodeJsonString(item.text[0..@min(item.text.len, 1024)], .{}, w);
+    const writer = &out.writer;
+    try writer.print("--{s}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{ boundary, chat_id });
+    if (items[0].reply_id) |id| try writer.print("--{s}\r\nContent-Disposition: form-data; name=\"reply_parameters\"\r\nContent-Type: application/json\r\n\r\n{{\"message_id\":{d}}}\r\n", .{ boundary, id });
+    try writer.print("--{s}\r\nContent-Disposition: form-data; name=\"media\"\r\nContent-Type: application/json\r\n\r\n[", .{boundary});
+    for (items, 0..) |item, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{{\"type\":\"{s}\",\"media\":\"attach://f{d}\"", .{ @tagName(item.kind), index });
+        if (index == 0 and item.text.len != 0) {
+            try writer.writeAll(",\"caption\":");
+            try std.json.Stringify.encodeJsonString(item.text[0..@min(item.text.len, 1024)], .{}, writer);
         }
-        try w.writeByte('}');
+        try writer.writeByte('}');
     }
-    try w.writeAll("]\r\n");
-    for (items, files, 0..) |item, bytes, i| {
-        try w.print(
+    try writer.writeAll("]\r\n");
+    for (items, files, 0..) |item, bytes, index| {
+        try writer.print(
             "--{s}\r\nContent-Disposition: form-data; name=\"f{d}\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
-            .{ boundary, i, baseName(item.path.?) },
+            .{ boundary, index, baseName(item.path.?) },
         );
-        try w.writeAll(bytes);
-        try w.writeAll("\r\n");
+        try writer.writeAll(bytes);
+        try writer.writeAll("\r\n");
     }
-    try w.print("--{s}--\r\n", .{boundary});
+    try writer.print("--{s}--\r\n", .{boundary});
     return out.toOwnedSlice();
 }
 
-fn addAlbumSize(total: usize, n: usize) !usize {
-    if (n > max_album - total) return error.FileTooLarge;
-    return total + n;
+fn addAlbumSize(total: usize, size: usize) !usize {
+    if (size > max_album - total) return error.FileTooLarge;
+    return total + size;
 }
 
 test "album size is bounded before assembly" {
@@ -1147,13 +1146,12 @@ test "album size is bounded before assembly" {
 }
 
 /// Removes control bytes that could forge multipart boundaries.
-fn field(w: *std.Io.Writer, text: []const u8) !void {
-    for (text) |c| {
-        if (c >= 0x20 or c == '\t') try w.writeByte(c) else try w.writeByte(' ');
+fn field(writer: *std.Io.Writer, text: []const u8) !void {
+    for (text) |byte| {
+        if (byte >= 0x20 or byte == '\t') try writer.writeByte(byte) else try writer.writeByte(' ');
     }
 }
 
-/// Builds Telegram's multipart upload form.
 fn multipart(
     gpa: std.mem.Allocator,
     chat_id: i64,
@@ -1165,21 +1163,21 @@ fn multipart(
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    const w = &out.writer;
+    const writer = &out.writer;
 
-    try w.print("--{s}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{ boundary, chat_id });
-    if (reply_id) |id| try w.print("--{s}\r\nContent-Disposition: form-data; name=\"reply_parameters\"\r\nContent-Type: application/json\r\n\r\n{{\"message_id\":{d}}}\r\n", .{ boundary, id });
+    try writer.print("--{s}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{ boundary, chat_id });
+    if (reply_id) |id| try writer.print("--{s}\r\nContent-Disposition: form-data; name=\"reply_parameters\"\r\nContent-Type: application/json\r\n\r\n{{\"message_id\":{d}}}\r\n", .{ boundary, id });
     if (caption.len != 0) {
-        try w.print("--{s}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n", .{boundary});
-        try field(w, caption[0..@min(caption.len, 1024)]);
-        try w.writeAll("\r\n");
+        try writer.print("--{s}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n", .{boundary});
+        try field(writer, caption[0..@min(caption.len, 1024)]);
+        try writer.writeAll("\r\n");
     }
-    try w.print(
+    try writer.print(
         "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
         .{ boundary, part, name },
     );
-    try w.writeAll(bytes);
-    try w.print("\r\n--{s}--\r\n", .{boundary});
+    try writer.writeAll(bytes);
+    try writer.print("\r\n--{s}--\r\n", .{boundary});
     return out.toOwnedSlice();
 }
 
@@ -1188,7 +1186,6 @@ fn baseName(path: []const u8) []const u8 {
     return path[cut + 1 ..];
 }
 
-/// Sniffs common image types for the model.
 fn sniff(bytes: []const u8) []const u8 {
     return imageMime(bytes) orelse "image/jpeg";
 }
@@ -1220,10 +1217,10 @@ fn buildCancelUpdates(gpa: std.mem.Allocator, offset: i64) ![]u8 {
 }
 
 fn scalar(db: *Db, sql: [:0]const u8) !i64 {
-    var q = try db.prepare(sql);
-    defer q.finalize();
-    if (!try q.step()) return error.NoRow;
-    return q.int(0);
+    var statement = try db.prepare(sql);
+    defer statement.finalize();
+    if (!try statement.step()) return error.NoRow;
+    return statement.int(0);
 }
 
 test "offset persists in kv and a second open sees it" {
@@ -1288,7 +1285,6 @@ const Harness = struct {
         };
     }
 
-    /// A workspace directory beside the temp database.
     fn workspace(self: *Harness, buf: []u8) ![]const u8 {
         const dir = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/workspace", .{self.tmp.sub_path});
         try std.Io.Dir.cwd().createDirPath(self.threaded.io(), dir);
@@ -1304,17 +1300,17 @@ const Harness = struct {
 };
 
 test "getMe rejects a fixture with ok false" {
-    var h: Harness = undefined;
-    try h.init(&.{"{\"ok\":false,\"description\":\"Unauthorized\"}"}, &.{});
-    defer h.deinit();
-    try testing.expectError(error.TelegramApiError, h.bot.getMe());
+    var harness: Harness = undefined;
+    try harness.init(&.{"{\"ok\":false,\"description\":\"Unauthorized\"}"}, &.{});
+    defer harness.deinit();
+    try testing.expectError(error.TelegramApiError, harness.bot.getMe());
 }
 
 test "getMe accepts a fixture with ok true" {
-    var h: Harness = undefined;
-    try h.init(&.{"{\"ok\":true,\"result\":{\"id\":1,\"is_bot\":true}}"}, &.{});
-    defer h.deinit();
-    try h.bot.getMe();
+    var harness: Harness = undefined;
+    try harness.init(&.{"{\"ok\":true,\"result\":{\"id\":1,\"is_bot\":true}}"}, &.{});
+    defer harness.deinit();
+    try harness.bot.getMe();
 }
 
 test "Telegram requests have a deadline" {
@@ -1332,25 +1328,25 @@ test "Telegram requests have a deadline" {
         }
     };
 
-    var h: Harness = undefined;
-    try h.init(&.{}, &.{});
-    defer h.deinit();
-    var slow: Slow = .{ .io = h.threaded.io() };
-    h.bot.http = slow.http();
-    try testing.expectError(error.TelegramTimeout, h.bot.getMe());
+    var harness: Harness = undefined;
+    try harness.init(&.{}, &.{});
+    defer harness.deinit();
+    var slow: Slow = .{ .io = harness.threaded.io() };
+    harness.bot.http = slow.http();
+    try testing.expectError(error.TelegramTimeout, harness.bot.getMe());
 }
 
 test "getMe rejects HTTP non-200" {
-    var h: Harness = undefined;
-    try h.init(&.{"unauthorized"}, &.{});
-    defer h.deinit();
-    h.tg.status = 401;
-    try testing.expectError(error.TelegramRejected, h.bot.getMe());
+    var harness: Harness = undefined;
+    try harness.init(&.{"unauthorized"}, &.{});
+    defer harness.deinit();
+    harness.tg.status = 401;
+    try testing.expectError(error.TelegramRejected, harness.bot.getMe());
 }
 
 test "pollOnce sends the reply via sendMessage" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{
             "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
             "{\"ok\":true}",
@@ -1358,19 +1354,19 @@ test "pollOnce sends the reply via sendMessage" {
         },
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     );
-    defer h.deinit();
+    defer harness.deinit();
 
-    try h.bot.pollOnce();
-    try testing.expect(std.mem.indexOf(u8, h.tg.sentUrl(), "sendMessage") != null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"chat_id\":42") != null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"text\":\"hi\"") != null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "reply_parameters") == null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "inline_keyboard") == null);
+    try harness.bot.pollOnce();
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sentUrl(), "sendMessage") != null);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "\"chat_id\":42") != null);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "\"text\":\"hi\"") != null);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "reply_parameters") == null);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "inline_keyboard") == null);
 }
 
 test "pollOnce sends a typing indicator before the turn" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{
             "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
             "{\"ok\":true}",
@@ -1378,17 +1374,17 @@ test "pollOnce sends a typing indicator before the turn" {
         },
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     );
-    defer h.deinit();
+    defer harness.deinit();
 
-    try h.bot.pollOnce();
-    try testing.expectEqual(@as(usize, 3), h.tg.n);
-    try testing.expect(std.mem.endsWith(u8, h.tg.url(1), "sendChatAction"));
-    try testing.expect(std.mem.endsWith(u8, h.tg.url(2), "sendMessage"));
+    try harness.bot.pollOnce();
+    try testing.expectEqual(@as(usize, 3), harness.tg.count);
+    try testing.expect(std.mem.endsWith(u8, harness.tg.url(1), "sendChatAction"));
+    try testing.expect(std.mem.endsWith(u8, harness.tg.url(2), "sendMessage"));
 }
 
 test "a 429 is retried after retry-after rather than failing immediately" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{
             "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
             "{\"ok\":true}",
@@ -1397,19 +1393,19 @@ test "a 429 is retried after retry-after rather than failing immediately" {
         },
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     );
-    defer h.deinit();
-    h.tg.statuses = &.{ 200, 200, 429, 200 };
+    defer harness.deinit();
+    harness.tg.statuses = &.{ 200, 200, 429, 200 };
 
-    try h.bot.pollOnce();
-    try testing.expectEqual(@as(usize, 4), h.tg.i);
-    try testing.expect(std.mem.endsWith(u8, h.tg.url(2), "sendMessage"));
-    try testing.expect(std.mem.endsWith(u8, h.tg.url(3), "sendMessage"));
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"text\":\"hi\"") != null);
+    try harness.bot.pollOnce();
+    try testing.expectEqual(@as(usize, 4), harness.tg.index);
+    try testing.expect(std.mem.endsWith(u8, harness.tg.url(2), "sendMessage"));
+    try testing.expect(std.mem.endsWith(u8, harness.tg.url(3), "sendMessage"));
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "\"text\":\"hi\"") != null);
 }
 
 test "a rejected send remains inspectable without repeating the turn" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{
             "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
             "{\"ok\":true}",
@@ -1417,10 +1413,10 @@ test "a rejected send remains inspectable without repeating the turn" {
         },
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     );
-    defer h.deinit();
-    try h.bot.pollOnce();
-    try testing.expectEqual(@as(i64, 1), try scalar(&h.db, "SELECT count(*) FROM outbox WHERE status = 'failed'"));
-    try testing.expectEqual(@as(i64, 1), try scalar(&h.db, "SELECT count(*) FROM telegram_updates WHERE status = 'completed'"));
+    defer harness.deinit();
+    try harness.bot.pollOnce();
+    try testing.expectEqual(@as(i64, 1), try scalar(&harness.db, "SELECT count(*) FROM outbox WHERE status = 'failed'"));
+    try testing.expectEqual(@as(i64, 1), try scalar(&harness.db, "SELECT count(*) FROM telegram_updates WHERE status = 'completed'"));
 }
 
 test "pollOnce splits a long reply into UTF-8-safe chunks" {
@@ -1435,8 +1431,8 @@ test "pollOnce splits a long reply into UTF-8-safe chunks" {
     );
     defer testing.allocator.free(llm);
 
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{
             "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
             "{\"ok\":true}",
@@ -1445,76 +1441,76 @@ test "pollOnce splits a long reply into UTF-8-safe chunks" {
         },
         &.{llm},
     );
-    defer h.deinit();
+    defer harness.deinit();
 
-    try h.bot.pollOnce();
-    try testing.expectEqual(@as(usize, 4), h.tg.i);
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "sendMessage") == null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.sentUrl(), "sendMessage") != null);
+    try harness.bot.pollOnce();
+    try testing.expectEqual(@as(usize, 4), harness.tg.index);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "sendMessage") == null);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sentUrl(), "sendMessage") != null);
     const want = "a" ** extra;
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), want) != null);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), want) != null);
 }
 
 test "pollOnce serves the owner and persists the offset" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{ "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}", "{\"ok\":true}", "{\"ok\":true}" },
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     );
-    defer h.deinit();
+    defer harness.deinit();
 
-    try h.bot.pollOnce();
-    try testing.expectEqual(@as(?i64, 11), try loadOffset(&h.db));
+    try harness.bot.pollOnce();
+    try testing.expectEqual(@as(?i64, 11), try loadOffset(&harness.db));
 
-    var q = try h.db.prepare("SELECT role, content FROM messages ORDER BY id");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqualStrings("user", q.text(0));
-    try testing.expectEqualStrings("hello", q.text(1));
-    try testing.expect(try q.step());
-    try testing.expectEqualStrings("assistant", q.text(0));
-    try testing.expectEqualStrings("hi", q.text(1));
+    var statement = try harness.db.prepare("SELECT role, content FROM messages ORDER BY id");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqualStrings("user", statement.text(0));
+    try testing.expectEqualStrings("hello", statement.text(1));
+    try testing.expect(try statement.step());
+    try testing.expectEqualStrings("assistant", statement.text(0));
+    try testing.expectEqualStrings("hi", statement.text(1));
 }
 
 test "pollOnce skips a stranger and still advances the offset" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{"{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":99,\"is_bot\":false},\"chat\":{\"id\":99,\"type\":\"private\"},\"text\":\"hi\"}}]}"},
         &.{},
     );
-    defer h.deinit();
+    defer harness.deinit();
 
-    try h.bot.pollOnce();
-    try testing.expectEqual(@as(?i64, 11), try loadOffset(&h.db));
-    try testing.expectEqual(@as(i64, 0), try scalar(&h.db, "SELECT count(*) FROM messages"));
+    try harness.bot.pollOnce();
+    try testing.expectEqual(@as(?i64, 11), try loadOffset(&harness.db));
+    try testing.expectEqual(@as(i64, 0), try scalar(&harness.db, "SELECT count(*) FROM messages"));
 }
 
 test "pollOnce advances offset past a batch with nothing to serve" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{"{\"ok\":true,\"result\":[{\"update_id\":5,\"callback_query\":{\"id\":\"x\"}}]}"},
         &.{},
     );
-    defer h.deinit();
-    try h.bot.pollOnce();
-    try testing.expectEqual(@as(?i64, 6), try loadOffset(&h.db));
-    try testing.expectEqual(@as(i64, 0), try scalar(&h.db, "SELECT count(*) FROM messages"));
+    defer harness.deinit();
+    try harness.bot.pollOnce();
+    try testing.expectEqual(@as(?i64, 6), try loadOffset(&harness.db));
+    try testing.expectEqual(@as(i64, 0), try scalar(&harness.db, "SELECT count(*) FROM messages"));
 }
 
 test "pollOnce advances offset past skipped updates after a served message" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{ "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}},{\"update_id\":11,\"callback_query\":{\"id\":\"x\"}}]}", "{\"ok\":true}", "{\"ok\":true}" },
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     );
-    defer h.deinit();
-    try h.bot.pollOnce();
-    try testing.expectEqual(@as(?i64, 12), try loadOffset(&h.db));
+    defer harness.deinit();
+    try harness.bot.pollOnce();
+    try testing.expectEqual(@as(?i64, 12), try loadOffset(&harness.db));
 }
 
 test "a later pollOnce sends the persisted offset" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{
             "{\"ok\":true,\"result\":[{\"update_id\":10,\"message\":{\"from\":{\"id\":42,\"is_bot\":false},\"chat\":{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}]}",
             "{\"ok\":true}",
@@ -1523,10 +1519,10 @@ test "a later pollOnce sends the persisted offset" {
         },
         &.{"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"},
     );
-    defer h.deinit();
-    try h.bot.pollOnce();
-    try h.bot.pollOnce();
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"offset\":11") != null);
+    defer harness.deinit();
+    try harness.bot.pollOnce();
+    try harness.bot.pollOnce();
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "\"offset\":11") != null);
 }
 
 test "poller lock is exclusive and does not cover the database" {
@@ -1552,18 +1548,17 @@ test "poller lock is exclusive and does not cover the database" {
 }
 
 test "run returns without polling when stop is already set" {
-    var h: Harness = undefined;
-    try h.init(&.{}, &.{});
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init(&.{}, &.{});
+    defer harness.deinit();
     const halt = struct {
         fn yes() bool {
             return true;
         }
     };
-    try h.bot.run(&halt.yes);
+    try harness.bot.run(&halt.yes);
 }
 
-/// Fakes Telegram's file download endpoint.
 const FakeGet = struct {
     body: []const u8,
     status: u16 = 200,
@@ -1591,53 +1586,53 @@ const FakeGet = struct {
 const ok_json = "{\"ok\":true,\"result\":{}}";
 
 test "a photo is downloaded and reaches the base model with its caption" {
-    var h: Harness = undefined;
-    try h.init(&.{
+    var harness: Harness = undefined;
+    try harness.init(&.{
         \\{"ok":true,"result":[{"update_id":5,"message":{"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"caption":"what plant is this","photo":[{"file_id":"small","file_size":100},{"file_id":"big","file_size":900}]}}]}
         ,
         ok_json, // sendChatAction
         "{\"ok\":true,\"result\":{\"file_path\":\"photos/x.png\",\"file_size\":8}}",
         ok_json, // sendMessage
     }, &.{"{\"choices\":[{\"message\":{\"content\":\"a fern\"}}]}"});
-    defer h.deinit();
+    defer harness.deinit();
 
     var files: FakeGet = .{ .body = "\x89PNG\r\n\x1a\n" };
-    h.bot.fetch = files.get();
+    harness.bot.fetch = files.get();
     var workspace_buf: [128]u8 = undefined;
-    h.bot.workspace = try h.workspace(&workspace_buf);
-    try h.bot.pollOnce();
+    harness.bot.workspace = try harness.workspace(&workspace_buf);
+    try harness.bot.pollOnce();
 
     try testing.expectEqual(@as(usize, 1), files.calls);
     try testing.expect(std.mem.endsWith(u8, files.url(), "/photos/x.png"));
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"big\"") != null or
-        std.mem.indexOf(u8, h.tg.url(2), "getFile") != null);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "\"big\"") != null or
+        std.mem.indexOf(u8, harness.tg.url(2), "getFile") != null);
 
-    const asked = h.llm.sent();
+    const asked = harness.llm.sent();
     try testing.expect(std.mem.indexOf(u8, asked, "\"m\"") != null);
     try testing.expect(std.mem.indexOf(u8, asked, "data:image/png;base64,") != null);
     try testing.expect(std.mem.indexOf(u8, asked, "what plant is this") != null);
-    const saved = try workspace.readBytes(testing.allocator, h.threaded.io(), h.bot.workspace, "inbox/5-photo.jpg", 8);
+    const saved = try workspace.readBytes(testing.allocator, harness.threaded.io(), harness.bot.workspace, "inbox/5-photo.jpg", 8);
     defer testing.allocator.free(saved);
     try testing.expectEqualStrings("\x89PNG\r\n\x1a\n", saved);
 }
 
 test "a photo that will not download still gets an answer" {
-    var h: Harness = undefined;
-    try h.init(&.{
+    var harness: Harness = undefined;
+    try harness.init(&.{
         \\{"ok":true,"result":[{"update_id":5,"message":{"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"photo":[{"file_id":"big","file_size":900}]}}]}
         ,
         ok_json,
         "{\"ok\":true,\"result\":{\"file_path\":\"photos/x.jpg\",\"file_size\":8}}",
         ok_json,
     }, &.{"{\"choices\":[{\"message\":{\"content\":\"I could not open it\"}}]}"});
-    defer h.deinit();
+    defer harness.deinit();
 
     var files: FakeGet = .{ .body = "", .status = 404 };
-    h.bot.fetch = files.get();
+    harness.bot.fetch = files.get();
 
-    try h.bot.pollOnce(); // the download fails; the turn happens anyway
-    try testing.expect(std.mem.indexOf(u8, h.llm.sent(), "photo download failed") != null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "I could not open it") != null);
+    try harness.bot.pollOnce(); // the download fails; the turn happens anyway
+    try testing.expect(std.mem.indexOf(u8, harness.llm.sent(), "photo download failed") != null);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "I could not open it") != null);
 }
 
 test "a non-image attachment becomes metadata, never a failed turn" {
@@ -1648,9 +1643,9 @@ test "a non-image attachment becomes metadata, never a failed turn" {
     defer batch.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 1), batch.items.len);
-    const u = batch.items[0];
-    try testing.expectEqual(@as(?[]u8, null), u.photo);
-    try testing.expect(std.mem.startsWith(u8, u.text, "the lease\n[attachment: lease.pdf, application/pdf, 24576 bytes"));
+    const update = batch.items[0];
+    try testing.expectEqual(@as(?[]u8, null), update.photo);
+    try testing.expect(std.mem.startsWith(u8, update.text, "the lease\n[attachment: lease.pdf, application/pdf, 24576 bytes"));
 }
 
 test "reply text and identifier survive parsing" {
@@ -1664,109 +1659,109 @@ test "reply text and identifier survive parsing" {
 }
 
 test "document bytes land in the configured inbox" {
-    var h: Harness = undefined;
-    try h.init(&.{
+    var harness: Harness = undefined;
+    try harness.init(&.{
         \\{"ok":true,"result":[{"update_id":1,"message":{"message_id":8,"from":{"id":42},"chat":{"id":42,"type":"private"},"caption":"read this","document":{"file_id":"d1","file_name":"note.txt","mime_type":"text/plain","file_size":5}}}]}
         ,
         ok_json,
         "{\"ok\":true,\"result\":{\"file_path\":\"documents/note.txt\",\"file_size\":5}}",
         ok_json,
     }, &.{"{\"choices\":[{\"message\":{\"content\":\"read\"}}]}"});
-    defer h.deinit();
+    defer harness.deinit();
     var root_buf: [128]u8 = undefined;
-    h.bot.workspace = try h.workspace(&root_buf);
-    h.bot.inbox = "incoming";
+    harness.bot.workspace = try harness.workspace(&root_buf);
+    harness.bot.inbox = "incoming";
     var files: FakeGet = .{ .body = "hello" };
-    h.bot.fetch = files.get();
+    harness.bot.fetch = files.get();
 
-    try h.bot.pollOnce();
-    const saved = try workspace.readBytes(testing.allocator, h.threaded.io(), h.bot.workspace, "incoming/1-note.txt", 5);
+    try harness.bot.pollOnce();
+    const saved = try workspace.readBytes(testing.allocator, harness.threaded.io(), harness.bot.workspace, "incoming/1-note.txt", 5);
     defer testing.allocator.free(saved);
     try testing.expectEqualStrings("hello", saved);
-    try testing.expect(std.mem.indexOf(u8, h.llm.sent(), "in inbox: incoming/1-note.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, harness.llm.sent(), "in inbox: incoming/1-note.txt") != null);
 }
 
 test "an image document is saved and shown to the model" {
-    var h: Harness = undefined;
-    try h.init(&.{
+    var harness: Harness = undefined;
+    try harness.init(&.{
         \\{"ok":true,"result":[{"update_id":2,"message":{"message_id":9,"from":{"id":42},"chat":{"id":42,"type":"private"},"document":{"file_id":"image","file_name":"scan.png","mime_type":"application/octet-stream","file_size":8}}}]}
         ,
         ok_json,
         "{\"ok\":true,\"result\":{\"file_path\":\"documents/scan.png\",\"file_size\":8}}",
         ok_json,
     }, &.{"{\"choices\":[{\"message\":{\"content\":\"a scan\"}}]}"});
-    defer h.deinit();
+    defer harness.deinit();
     var root_buf: [128]u8 = undefined;
-    h.bot.workspace = try h.workspace(&root_buf);
+    harness.bot.workspace = try harness.workspace(&root_buf);
     var files: FakeGet = .{ .body = "\x89PNG\r\n\x1a\n" };
-    h.bot.fetch = files.get();
+    harness.bot.fetch = files.get();
 
-    try h.bot.pollOnce();
-    try testing.expect(std.mem.indexOf(u8, h.llm.sent(), "data:image/png;base64,") != null);
-    const saved = try workspace.readBytes(testing.allocator, h.threaded.io(), h.bot.workspace, "inbox/2-scan.png", 8);
+    try harness.bot.pollOnce();
+    try testing.expect(std.mem.indexOf(u8, harness.llm.sent(), "data:image/png;base64,") != null);
+    const saved = try workspace.readBytes(testing.allocator, harness.threaded.io(), harness.bot.workspace, "inbox/2-scan.png", 8);
     defer testing.allocator.free(saved);
     try testing.expectEqualStrings("\x89PNG\r\n\x1a\n", saved);
 }
 
 test "a workspace file goes out as a photo with its caption" {
-    var h: Harness = undefined;
-    try h.init(&.{ok_json}, &.{});
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init(&.{ok_json}, &.{});
+    defer harness.deinit();
 
     var dir_buf: [128]u8 = undefined;
-    const dir = try h.workspace(&dir_buf);
-    h.bot.workspace = dir;
-    var d = try std.Io.Dir.cwd().openDir(h.threaded.io(), dir, .{});
-    defer d.close(h.threaded.io());
-    try d.writeFile(h.threaded.io(), .{ .sub_path = "chart.png", .data = "\x89PNG-bytes" });
+    const dir = try harness.workspace(&dir_buf);
+    harness.bot.workspace = dir;
+    var folder = try std.Io.Dir.cwd().openDir(harness.threaded.io(), dir, .{});
+    defer folder.close(harness.threaded.io());
+    try folder.writeFile(harness.threaded.io(), .{ .sub_path = "chart.png", .data = "\x89PNG-bytes" });
 
-    try outbox.push(&h.db, .photo, "chart.png", "yesterday's spend", 100);
-    try h.bot.flush();
+    try outbox.push(&harness.db, .photo, "chart.png", "yesterday's spend", 100);
+    try harness.bot.flush();
 
-    const sent = h.tg.sent();
-    try testing.expect(std.mem.endsWith(u8, h.tg.sentUrl(), "/sendPhoto"));
+    const sent = harness.tg.sent();
+    try testing.expect(std.mem.endsWith(u8, harness.tg.sentUrl(), "/sendPhoto"));
     try testing.expect(std.mem.indexOf(u8, sent, "name=\"photo\"; filename=\"chart.png\"") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "yesterday's spend") != null);
     try testing.expect(std.mem.indexOf(u8, sent, "\x89PNG-bytes") != null);
 
-    try h.bot.flush();
-    try testing.expectEqual(@as(usize, 1), h.tg.i);
+    try harness.bot.flush();
+    try testing.expectEqual(@as(usize, 1), harness.tg.index);
 }
 
 test "compatible media are sent as one bounded album" {
-    var h: Harness = undefined;
-    try h.init(&.{ok_json}, &.{});
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init(&.{ok_json}, &.{});
+    defer harness.deinit();
 
     var dir_buf: [128]u8 = undefined;
-    const dir = try h.workspace(&dir_buf);
-    h.bot.workspace = dir;
-    var d = try std.Io.Dir.cwd().openDir(h.threaded.io(), dir, .{});
-    defer d.close(h.threaded.io());
-    try d.writeFile(h.threaded.io(), .{ .sub_path = "a.png", .data = "a" });
-    try d.writeFile(h.threaded.io(), .{ .sub_path = "b.mp4", .data = "b" });
-    try outbox.pushReply(&h.db, .photo, "a.png", "album", 12, 1);
-    try outbox.push(&h.db, .video, "b.mp4", "ignored", 2);
+    const dir = try harness.workspace(&dir_buf);
+    harness.bot.workspace = dir;
+    var folder = try std.Io.Dir.cwd().openDir(harness.threaded.io(), dir, .{});
+    defer folder.close(harness.threaded.io());
+    try folder.writeFile(harness.threaded.io(), .{ .sub_path = "a.png", .data = "a" });
+    try folder.writeFile(harness.threaded.io(), .{ .sub_path = "b.mp4", .data = "b" });
+    try outbox.pushReply(&harness.db, .photo, "a.png", "album", 12, 1);
+    try outbox.push(&harness.db, .video, "b.mp4", "ignored", 2);
 
-    try h.bot.flush();
-    try testing.expect(std.mem.endsWith(u8, h.tg.sentUrl(), "/sendMediaGroup"));
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"media\":\"attach://f0\"") != null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"media\":\"attach://f1\"") != null);
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"message_id\":12") != null);
-    try testing.expectEqual(@as(i64, 0), try scalar(&h.db, "SELECT count(*) FROM outbox"));
+    try harness.bot.flush();
+    try testing.expect(std.mem.endsWith(u8, harness.tg.sentUrl(), "/sendMediaGroup"));
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "\"media\":\"attach://f0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "\"media\":\"attach://f1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "\"message_id\":12") != null);
+    try testing.expectEqual(@as(i64, 0), try scalar(&harness.db, "SELECT count(*) FROM outbox"));
 }
 
 test "a later text chunk failure is uncertain" {
-    var h: Harness = undefined;
-    try h.init(&.{ok_json}, &.{});
-    defer h.deinit();
+    var harness: Harness = undefined;
+    try harness.init(&.{ok_json}, &.{});
+    defer harness.deinit();
     var body: [max_message + 1]u8 = @splat('a');
-    try outbox.push(&h.db, .text, null, &body, 1);
+    try outbox.push(&harness.db, .text, null, &body, 1);
 
-    try h.bot.flush();
+    try harness.bot.flush();
 
-    try testing.expectEqual(@as(i64, 1), try scalar(&h.db, "SELECT count(*) FROM outbox WHERE status = 'uncertain'"));
-    try testing.expectEqual(@as(usize, 1), h.tg.i);
+    try testing.expectEqual(@as(i64, 1), try scalar(&harness.db, "SELECT count(*) FROM outbox WHERE status = 'uncertain'"));
+    try testing.expectEqual(@as(usize, 1), harness.tg.index);
 }
 
 test "a stop message cancels the active model turn" {
@@ -1784,39 +1779,39 @@ test "a stop message cancels the active model turn" {
         }
     };
 
-    var h: Harness = undefined;
-    try h.init(&.{
+    var harness: Harness = undefined;
+    try harness.init(&.{
         \\{"ok":true,"result":[{"update_id":4,"message":{"message_id":9,"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"text":"work"}}]}
         ,
         ok_json,
     }, &.{});
-    defer h.deinit();
+    defer harness.deinit();
     var live: FakeHttp = .{ .bodies = &.{
         ok_json,
         \\{"ok":true,"result":[{"update_id":5,"message":{"message_id":10,"from":{"id":42,"is_bot":false},"chat":{"id":42,"type":"private"},"text":"/stop"}}]}
         ,
     } };
-    var slow: Slow = .{ .io = h.threaded.io() };
-    h.agent.http = slow.http();
-    h.bot.live_http = live.http();
+    var slow: Slow = .{ .io = harness.threaded.io() };
+    harness.agent.http = slow.http();
+    harness.bot.live_http = live.http();
 
-    try h.bot.pollOnce();
-    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "Okay, I stopped.") != null);
+    try harness.bot.pollOnce();
+    try testing.expect(std.mem.indexOf(u8, harness.tg.sent(), "Okay, I stopped.") != null);
     try testing.expect(std.mem.endsWith(u8, live.url(0), "/sendChatAction"));
     try testing.expect(std.mem.endsWith(u8, live.url(1), "/getUpdates"));
-    try testing.expectEqual(@as(i64, 1), try scalar(&h.db, "SELECT count(*) FROM telegram_updates WHERE id = 5 AND status = 'completed'"));
+    try testing.expectEqual(@as(i64, 1), try scalar(&harness.db, "SELECT count(*) FROM telegram_updates WHERE id = 5 AND status = 'completed'"));
 }
 
 test "an attachment pointing outside the workspace is refused" {
-    var h: Harness = undefined;
-    try h.init(&.{}, &.{});
-    defer h.deinit();
-    try testing.expectError(error.BadPath, h.bot.sendFile(.document, "../../etc/passwd", "", null));
+    var harness: Harness = undefined;
+    try harness.init(&.{}, &.{});
+    defer harness.deinit();
+    try testing.expectError(error.BadPath, harness.bot.sendFile(.document, "../../etc/passwd", "", null));
 }
 
 test "an old approval callback cannot grant authority" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{
             \\{"ok":true,"result":[{"update_id":7,"callback_query":{"id":"cb1","from":{"id":42,"is_bot":false},"message":{"message_id":90,"chat":{"id":42,"type":"private"}},"data":"a:1"}}]}
             ,
@@ -1825,21 +1820,21 @@ test "an old approval callback cannot grant authority" {
         },
         &.{},
     );
-    defer h.deinit();
-    _ = try tasks.ask(&h.db, "missing_tool", "{}", null, "test action", null, std.Io.Timestamp.now(h.threaded.io(), .real).toSeconds());
+    defer harness.deinit();
+    _ = try tasks.ask(&harness.db, "missing_tool", "{}", null, "test action", null, std.Io.Timestamp.now(harness.threaded.io(), .real).toSeconds());
 
-    try h.bot.pollOnce();
-    try testing.expect(std.mem.endsWith(u8, h.tg.url(1), "/answerCallbackQuery"));
-    try testing.expectEqual(@as(usize, 2), h.tg.i);
-    var q = try h.db.prepare("SELECT status FROM approvals WHERE id = 1");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqualStrings("pending", q.text(0));
+    try harness.bot.pollOnce();
+    try testing.expect(std.mem.endsWith(u8, harness.tg.url(1), "/answerCallbackQuery"));
+    try testing.expectEqual(@as(usize, 2), harness.tg.index);
+    var statement = try harness.db.prepare("SELECT status FROM approvals WHERE id = 1");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqualStrings("pending", statement.text(0));
 }
 
 test "foreign callback is answered without granting authority" {
-    var h: Harness = undefined;
-    try h.init(
+    var harness: Harness = undefined;
+    try harness.init(
         &.{
             \\{"ok":true,"result":[{"update_id":7,"callback_query":{"id":"cb1","from":{"id":99,"is_bot":false},"message":{"message_id":90,"chat":{"id":42,"type":"private"}},"data":"a:1"}}]}
             ,
@@ -1847,15 +1842,15 @@ test "foreign callback is answered without granting authority" {
         },
         &.{},
     );
-    defer h.deinit();
-    _ = try tasks.ask(&h.db, "missing_tool", "{}", null, "test action", null, 1);
+    defer harness.deinit();
+    _ = try tasks.ask(&harness.db, "missing_tool", "{}", null, "test action", null, 1);
 
-    try h.bot.pollOnce();
-    try testing.expect(std.mem.endsWith(u8, h.tg.sentUrl(), "/answerCallbackQuery"));
-    var q = try h.db.prepare("SELECT status FROM approvals WHERE id = 1");
-    defer q.finalize();
-    try testing.expect(try q.step());
-    try testing.expectEqualStrings("pending", q.text(0));
+    try harness.bot.pollOnce();
+    try testing.expect(std.mem.endsWith(u8, harness.tg.sentUrl(), "/answerCallbackQuery"));
+    var statement = try harness.db.prepare("SELECT status FROM approvals WHERE id = 1");
+    defer statement.finalize();
+    try testing.expect(try statement.step());
+    try testing.expectEqualStrings("pending", statement.text(0));
 }
 
 test "HTML output is escaped and chunks keep entities whole" {
@@ -1874,7 +1869,7 @@ test "sticker aliases are durable and listed" {
     defer db.close();
 
     try beginStickerLearning(&db, "wave", 10);
-    var u: Update = .{
+    var update: Update = .{
         .update_id = 1,
         .from_id = 42,
         .chat_id = 42,
@@ -1885,8 +1880,8 @@ test "sticker aliases are durable and listed" {
         .unique_id = try testing.allocator.dupe(u8, "stable"),
         .emoji = try testing.allocator.dupe(u8, "👋"),
     };
-    defer u.deinit(testing.allocator);
-    const alias = (try takeStickerLearning(&db, testing.allocator, u, 11)).?;
+    defer update.deinit(testing.allocator);
+    const alias = (try takeStickerLearning(&db, testing.allocator, update, 11)).?;
     defer testing.allocator.free(alias);
     try testing.expectEqualStrings("wave", alias);
 
@@ -1896,8 +1891,8 @@ test "sticker aliases are durable and listed" {
 }
 
 test "sending a sticker does not add an emoji reply" {
-    var h: Harness = undefined;
-    try h.init(&.{
+    var harness: Harness = undefined;
+    try harness.init(&.{
         \\{"ok":true,"result":[{"update_id":1,"message":{"message_id":2,"from":{"id":42},"chat":{"id":42,"type":"private"},"text":"Send pro"}}]}
         ,
         ok_json,
@@ -1908,11 +1903,11 @@ test "sending a sticker does not add an emoji reply" {
         ,
         "{\"choices\":[{\"message\":{\"content\":\"😎\"}}]}",
     });
-    defer h.deinit();
-    h.agent.tools = &tools.builtins;
-    try h.db.exec("INSERT INTO sticker_aliases(alias, file_id, unique_id, updated) VALUES ('pro', 'file', 'stable', 1)");
+    defer harness.deinit();
+    harness.agent.tools = &tools.builtins;
+    try harness.db.exec("INSERT INTO sticker_aliases(alias, file_id, unique_id, updated) VALUES ('pro', 'file', 'stable', 1)");
 
-    try h.bot.pollOnce();
-    try testing.expectEqual(@as(usize, 3), h.tg.i);
-    try testing.expect(std.mem.endsWith(u8, h.tg.sentUrl(), "/sendSticker"));
+    try harness.bot.pollOnce();
+    try testing.expectEqual(@as(usize, 3), harness.tg.index);
+    try testing.expect(std.mem.endsWith(u8, harness.tg.sentUrl(), "/sendSticker"));
 }
