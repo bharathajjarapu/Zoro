@@ -152,7 +152,7 @@ fn runCharacterInspect(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
 fn runCharacterPropose(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     const parsed = try std.json.parseFromSlice(ProposalArgs, ctx.gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    try requireOwnerEvidence(ctx, parsed.value.evidence);
+    try tools.requireOwnerEvidence(ctx, parsed.value.evidence);
     const file = try parseFile(parsed.value.file);
     try identity.validate(parsed.value.content);
     const old = identity.read(ctx.gpa, ctx.io, ctx.workspace, file) catch |err| switch (err) {
@@ -188,7 +188,7 @@ fn runLearningInspect(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
 fn runLearningPropose(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     const parsed = try std.json.parseFromSlice(SkillArgs, ctx.gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    try requireOwnerEvidence(ctx, parsed.value.evidence);
+    try tools.requireOwnerEvidence(ctx, parsed.value.evidence);
     const skill = try skills.validateLearned(parsed.value.content);
     const old = skills.readMarkdown(ctx.gpa, ctx.io, ctx.skills_dir, skill.name) catch |err| switch (err) {
         error.FileNotFound => null,
@@ -446,15 +446,6 @@ fn now(ctx: *tools.Ctx) i64 {
     return std.Io.Timestamp.now(ctx.io, .real).toSeconds();
 }
 
-fn requireOwnerEvidence(ctx: *tools.Ctx, evidence: []const u8) !void {
-    const id = ctx.source_message orelse return error.UntrustedEvidence;
-    var q = try ctx.db.prepare("SELECT owner_text FROM messages WHERE id = ? AND role = 'user'");
-    defer q.finalize();
-    try q.bind(1, id);
-    if (!try q.step() or q.isNull(0) or evidence.len == 0 or std.mem.indexOf(u8, q.text(0), evidence) == null)
-        return error.UntrustedEvidence;
-}
-
 fn parseId(raw: []const u8) !i64 {
     const id = try std.fmt.parseInt(i64, raw, 10);
     if (id <= 0) return error.BadProposalId;
@@ -483,8 +474,8 @@ test "learning evidence must quote the current owner message" {
         .source_message = db.lastId(),
     };
 
-    try requireOwnerEvidence(&ctx, "concise replies");
-    try std.testing.expectError(error.UntrustedEvidence, requireOwnerEvidence(&ctx, "from a web page"));
+    try tools.requireOwnerEvidence(&ctx, "concise replies");
+    try std.testing.expectError(error.UntrustedEvidence, tools.requireOwnerEvidence(&ctx, "from a web page"));
 }
 
 test "reconcile commits an interrupted skill apply" {

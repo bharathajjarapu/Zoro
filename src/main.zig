@@ -9,6 +9,7 @@ const telegram = @import("channel/telegram.zig");
 const tools = @import("tools/root.zig");
 const learning_tools = @import("tools/learning.zig");
 const scheduler = @import("automation/scheduler.zig");
+const default_skills = @import("automation/defaults.zig");
 const worker = @import("agent/worker.zig");
 const http = @import("net/http.zig");
 
@@ -65,7 +66,7 @@ const usage =
 fn daemon(init: std.process.Init) !void {
     var cfg = try config.loadRuntime(init.gpa, init.io, init.environ_map);
     defer cfg.deinit(init.gpa);
-    try createRuntimeDirs(init.io, cfg);
+    try createRuntimeDirs(init.gpa, init.io, cfg);
 
     const token = cfg.telegram_token orelse return config.missing("TELEGRAM_TOKEN");
     const owner_id = cfg.owner_id orelse return config.missing("OWNER_ID");
@@ -305,7 +306,7 @@ const Store = struct {
         self.gpa = p.gpa;
         self.cfg = try config.loadRuntime(p.gpa, p.io, p.environ_map);
         errdefer self.cfg.deinit(self.gpa);
-        try createRuntimeDirs(p.io, self.cfg);
+        try createRuntimeDirs(p.gpa, p.io, self.cfg);
         self.db = try openDb(p.io, self.cfg.data_dir);
         errdefer self.db.close();
         try self.db.initSchema();
@@ -351,10 +352,11 @@ fn makeAgent(p: std.process.Init, cfg: config.Config, db: *Db, client: *http.Std
     };
 }
 
-fn createRuntimeDirs(io: std.Io, cfg: config.Config) !void {
+fn createRuntimeDirs(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !void {
     for ([_][]const u8{ cfg.data_dir, cfg.workspace, cfg.skills_dir, cfg.tmp_dir }) |path| {
         try std.Io.Dir.cwd().createDirPath(io, path);
     }
+    try default_skills.install(gpa, io, cfg.skills_dir);
 }
 
 fn openDb(io: std.Io, dir: []const u8) !Db {

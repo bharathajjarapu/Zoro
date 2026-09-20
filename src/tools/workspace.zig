@@ -15,6 +15,7 @@ const write = workspace.write;
 const delete = workspace.delete;
 const checkExisting = workspace.checkExisting;
 const openFile = workspace.openFile;
+const makeDir = workspace.makeDir;
 
 const path_param = [_]tools.Param{.{ .name = "path", .description = "workspace path" }};
 const write_params = [_]tools.Param{
@@ -99,6 +100,7 @@ fn runWrite(ctx: *tools.Ctx, args: []const u8) ![]u8 {
     try allowMutation(parsed.value.path);
     if (!std.unicode.utf8ValidateSlice(parsed.value.content) or std.mem.indexOfScalar(u8, parsed.value.content, 0) != null)
         return error.UnsupportedBinary;
+    if (std.fs.path.dirname(parsed.value.path)) |parent| try makeDir(ctx.io, ctx.workspace, parent);
     try write(ctx.io, ctx.workspace, parsed.value.path, parsed.value.content);
     return std.fmt.allocPrint(ctx.gpa, "wrote {s}", .{parsed.value.path});
 }
@@ -235,6 +237,20 @@ test "file tools write read and uniquely edit workspace text" {
     const got = try tools.call(&ctx, &.{read_file}, "read_file", "{\"path\":\"note.txt\"}");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("one three", got);
+}
+
+test "write creates guarded parent directories" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var ctx = h.ctx();
+
+    const out = try tools.call(&ctx, &.{write_file}, "write_file", "{\"path\":\"reports/brief/index.html\",\"content\":\"<h1>Brief</h1>\"}");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("wrote reports/brief/index.html", out);
+    const got = try read(testing.allocator, h.threaded.io(), h.workspace, "reports/brief/index.html");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("<h1>Brief</h1>", got);
 }
 
 test "file tools reject escapes protected paths and symlinks" {

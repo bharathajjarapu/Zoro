@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const tasks = @import("../data/tasks.zig");
 const tools = @import("root.zig");
+const workspace_app = @import("../app/workspace.zig");
 
 const max_args: usize = 32;
 const max_arg: usize = 4096;
@@ -11,6 +12,7 @@ const max_runtime = std.Io.Clock.Duration{
     .clock = .awake,
     .raw = .fromSeconds(if (builtin.is_test) 1 else 10),
 };
+const publish_runtime = std.Io.Clock.Duration{ .clock = .awake, .raw = .fromSeconds(if (builtin.is_test) 1 else 60) };
 
 const argv_param = [_]tools.Param{.{
     .name = "argv",
@@ -45,6 +47,7 @@ const Command = struct {
     parsed: std.json.Parsed(Args),
     argv: [max_args][]const u8,
     len: usize,
+    kind: Kind,
     auto: bool,
 
     fn deinit(self: *Command) void {
@@ -62,7 +65,7 @@ fn parse(ctx: *tools.Ctx, args: []const u8) !Command {
     errdefer parsed.deinit();
     if (parsed.value.argv.len == 0 or parsed.value.argv.len > max_args) return error.InvalidArgs;
 
-    var out: Command = .{ .parsed = parsed, .argv = undefined, .len = parsed.value.argv.len, .auto = false };
+    var out: Command = .{ .parsed = parsed, .argv = undefined, .len = parsed.value.argv.len, .kind = undefined, .auto = false };
     var total: usize = 0;
     for (parsed.value.argv, 0..) |arg, i| {
         if (arg.len == 0 or arg.len > max_arg or std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidArgs;
@@ -72,11 +75,12 @@ fn parse(ctx: *tools.Ctx, args: []const u8) !Command {
     }
     const spec = resolve(out.argv[0]) orelse return error.BlockedCommand;
     out.argv[0] = spec.path;
+    out.kind = spec.kind;
     out.auto = try validate(spec.kind, out.slice());
     return out;
 }
 
-const Kind = enum { pwd, ls, env, yes, sleep };
+const Kind = enum { pwd, ls, env, yes, sleep, wrangler };
 const Spec = struct { path: []const u8, kind: Kind };
 
 fn resolve(name: []const u8) ?Spec {
@@ -86,6 +90,7 @@ fn resolve(name: []const u8) ?Spec {
         .{ .path = "/usr/bin/env", .kind = .env },
         .{ .path = "/usr/bin/yes", .kind = .yes },
         .{ .path = "/bin/sleep", .kind = .sleep },
+        .{ .path = "/usr/local/bin/wrangler", .kind = .wrangler },
     };
     for (specs) |spec| {
         if (std.mem.eql(u8, name, spec.path) or std.mem.eql(u8, name, std.fs.path.basename(spec.path))) return spec;
@@ -126,7 +131,30 @@ fn validate(kind: Kind, argv: []const []const u8) !bool {
             for (argv[1..]) |arg| if (!listed(&.{ "-a", "-l", "-la", "-al" }, arg)) return error.InvalidArgs;
             break :blk true;
         },
+        .wrangler => blk: {
+            if (argv.len != 8 or
+                !std.mem.eql(u8, argv[1], "deploy") or
+                !workspace_app.validPath(argv[2]) or
+                !std.mem.eql(u8, argv[3], "--name") or
+                !validWorkerName(argv[4]) or
+                !std.mem.eql(u8, argv[5], "--temporary") or
+                !std.mem.eql(u8, argv[6], "--compatibility-date") or
+                !validDate(argv[7])) return error.InvalidArgs;
+            break :blk false;
+        },
     };
+}
+
+fn validWorkerName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 63 or name[0] == '-' or name[name.len - 1] == '-') return false;
+    for (name) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '-')) return false;
+    return true;
+}
+
+fn validDate(date: []const u8) bool {
+    if (date.len != 10 or date[4] != '-' or date[7] != '-') return false;
+    for (date, 0..) |c, i| if (i != 4 and i != 7 and !std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 fn listed(list: []const []const u8, value: []const u8) bool {
@@ -138,6 +166,7 @@ fn runChecked(ctx: *tools.Ctx, args: []const u8) ![]u8 {
     var command = try parse(ctx, args);
     defer command.deinit();
     if (ctx.shell_mode == .deny) return ctx.gpa.dupe(u8, "shell denied by policy");
+    if (command.kind == .wrangler) try checkStatic(ctx, command.argv[2]);
     if (command.auto) return execute(ctx, command.slice());
     if (ctx.shell_mode == .allowlist) return ctx.gpa.dupe(u8, "shell command is not allowlisted");
     var bound: std.Io.Writer.Allocating = .init(ctx.gpa);
@@ -158,7 +187,27 @@ fn runApproved(ctx: *tools.Ctx, args: []const u8) ![]u8 {
     defer command.deinit();
     const bound = command.parsed.value.workspace orelse return error.UnboundApproval;
     if (!std.mem.eql(u8, bound, ctx.workspace)) return error.WrongWorkspace;
+    if (command.kind == .wrangler) try checkStatic(ctx, command.argv[2]);
     return execute(ctx, command.slice());
+}
+
+fn checkStatic(ctx: *tools.Ctx, path: []const u8) !void {
+    var full_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const full = try std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ ctx.workspace, path });
+    var dir = try std.Io.Dir.cwd().openDir(ctx.io, full, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(ctx.io);
+    var found = false;
+    var it = dir.iterate();
+    while (try it.next(ctx.io)) |entry| {
+        if (found or entry.kind != .file or !std.mem.eql(u8, entry.name, "index.html"))
+            return error.StaticSiteMustBeSingleIndex;
+        var file = try dir.openFile(ctx.io, entry.name, .{ .allow_directory = false, .follow_symlinks = false });
+        defer file.close(ctx.io);
+        const stat = try file.stat(ctx.io);
+        if (stat.size == 0 or stat.size > workspace_app.max_write) return error.InvalidStaticSite;
+        found = true;
+    }
+    if (!found) return error.InvalidStaticSite;
 }
 
 fn execute(ctx: *tools.Ctx, argv: []const []const u8) ![]u8 {
@@ -186,7 +235,8 @@ fn execute(ctx: *tools.Ctx, argv: []const []const u8) ![]u8 {
     defer readers.deinit();
     const stdout = readers.reader(0);
     const stderr = readers.reader(1);
-    const deadline = std.Io.Clock.Timestamp.fromNow(ctx.io, max_runtime);
+    const limit = if (std.mem.endsWith(u8, argv[0], "/wrangler")) publish_runtime else max_runtime;
+    const deadline = std.Io.Clock.Timestamp.fromNow(ctx.io, limit);
 
     while (true) {
         if (ctx.cancelled()) {
@@ -342,6 +392,34 @@ test "deny mode and allowlist misses fail closed" {
     const miss = try tools.call(&ctx, &.{run}, "shell", "{\"argv\":[\"env\"]}");
     defer testing.allocator.free(miss);
     try testing.expectEqualStrings("shell command is not allowlisted", miss);
+}
+
+test "temporary Wrangler deployment is exact and always asks" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var ctx = h.ctx(.ask);
+    try workspace_app.makeDir(h.threaded.io(), h.workspace_path, "reports/brief");
+    try workspace_app.write(h.threaded.io(), h.workspace_path, "reports/brief/index.html", "<h1>Brief</h1>");
+    const good = try tools.call(&ctx, &.{run}, "shell", "{\"argv\":[\"wrangler\",\"deploy\",\"reports/brief\",\"--name\",\"zoro-brief\",\"--temporary\",\"--compatibility-date\",\"2026-09-19\"]}");
+    defer testing.allocator.free(good);
+    try testing.expect(std.mem.indexOf(u8, good, "approval required") != null);
+
+    const bad = [_][]const u8{
+        "{\"argv\":[\"wrangler\",\"deploy\",\"../private\",\"--name\",\"zoro-brief\",\"--temporary\",\"--compatibility-date\",\"2026-09-19\"]}",
+        "{\"argv\":[\"wrangler\",\"deploy\",\"reports/brief\",\"--name\",\"Bad_Name\",\"--temporary\",\"--compatibility-date\",\"2026-09-19\"]}",
+        "{\"argv\":[\"wrangler\",\"deploy\",\"reports/brief\",\"--name\",\"zoro-brief\",\"--compatibility-date\",\"2026-09-19\",\"--temporary\"]}",
+    };
+    for (bad) |args| {
+        const out = try tools.call(&ctx, &.{run}, "shell", args);
+        defer testing.allocator.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "InvalidArgs") != null);
+    }
+
+    try workspace_app.write(h.threaded.io(), h.workspace_path, "reports/brief/private.txt", "no");
+    const extra = try tools.call(&ctx, &.{run}, "shell", "{\"argv\":[\"wrangler\",\"deploy\",\"reports/brief\",\"--name\",\"zoro-brief\",\"--temporary\",\"--compatibility-date\",\"2026-09-19\"]}");
+    defer testing.allocator.free(extra);
+    try testing.expect(std.mem.indexOf(u8, extra, "StaticSiteMustBeSingleIndex") != null);
 }
 
 test "shell bounds output and runtime" {

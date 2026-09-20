@@ -30,17 +30,21 @@ pub const Fact = struct {
     }
 };
 
-/// Writes a fact. An inferred value never overwrites an owner statement.
+/// Writes a fact. Conflicting inference never replaces existing memory.
 pub fn put(db: *Db, key: []const u8, value: []const u8, source: Source, now: i64, expires: ?i64) !void {
     var text_buf: [1024]u8 = undefined;
     try db.exec("BEGIN");
     errdefer db.exec("ROLLBACK") catch {};
 
-    var q = try db.prepare("SELECT source FROM facts WHERE key = ?");
+    var q = try db.prepare("SELECT value, source FROM facts WHERE key = ?");
     defer q.finalize();
     try q.bind(1, key);
     if (try q.step()) {
-        if (Source.parse(q.text(0)) == .owner and source == .inferred) {
+        if (Source.parse(q.text(1)) == .owner and source == .inferred) {
+            try db.exec("COMMIT");
+            return;
+        }
+        if (source == .inferred and !std.mem.eql(u8, q.text(0), value)) {
             try db.exec("COMMIT");
             return;
         }
@@ -636,6 +640,21 @@ test "an inferred fact does not overwrite an owner statement" {
     defer pet.deinit(testing.allocator);
     try testing.expectEqualStrings("a black cat", pet.value);
     try testing.expectEqual(Source.owner, pet.source);
+}
+
+test "a conflicting inference does not replace an existing fact" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
+    defer db.close();
+    try db.initSchema();
+
+    try put(&db, "coffee", "prefers oat milk", .inferred, 1000, null);
+    try put(&db, "coffee", "prefers black coffee", .inferred, 2000, null);
+    var fact = try get(&db, testing.allocator, "coffee", 2000) orelse return error.MissingFact;
+    defer fact.deinit(testing.allocator);
+    try testing.expectEqualStrings("prefers oat milk", fact.value);
 }
 
 test "forget removes a fact from lookup and search" {

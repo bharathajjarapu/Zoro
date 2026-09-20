@@ -17,6 +17,10 @@ Written in Zig 0.16 with exactly one vendored C dependency (SQLite).
 
 Nothing else. No package manager, no runtime downloads.
 
+Optional: an owner-installed Wrangler **4.102.0+** at
+`/usr/local/bin/wrangler` enables approved, unauthenticated temporary
+Cloudflare previews. Zoro never installs or updates it.
+
 ## Build
 
 ```sh
@@ -130,6 +134,20 @@ allowed-tools: fetch_url recall notify_owner
 
 Plain English instructions the agent follows when this runs.
 ```
+
+Four missing-only defaults are installed on startup; owner edits are never
+overwritten:
+
+- `weather-watch` — concise Open-Meteo forecasts every six hours;
+- `rss-watch` — meaningful changes from owner-selected RSS/Atom feeds;
+- `html-report` — minimal, responsive, self-contained HTML reports;
+- `publish-static` — approved Cloudflare `--temporary` preview deployment.
+
+HTML generation and public deployment remain separate skills. The report skill
+writes `reports/<name>/index.html`; the publishing skill inspects that folder,
+asks before making it public, and returns both the live URL and sensitive
+60-minute claim URL. Temporary publishing follows
+[Cloudflare Drop's agent instructions](https://www.cloudflare.com/drop/llms.txt).
 
 Only up to 32 skill names are always in context. Bodies load on demand and
 descriptions stay on disk. Tool schemas use short descriptions to reduce model

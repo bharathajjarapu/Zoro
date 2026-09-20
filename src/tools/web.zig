@@ -12,6 +12,10 @@ const search_url = "https://api.search.tinyfish.ai?query=";
 const fetch_endpoint = "https://api.fetch.tinyfish.ai";
 const url_param = [_]Param{.{ .name = "url", .description = "HTTPS URL" }};
 const query_param = [_]Param{.{ .name = "query", .description = "search query" }};
+const watch_params = [_]Param{
+    .{ .name = "url", .description = "public HTTPS URL" },
+    .{ .name = "key", .description = "stable lowercase watcher name" },
+};
 
 pub const fetch_url: Def = .{
     .name = "fetch_url",
@@ -27,8 +31,17 @@ pub const search: Def = .{
     .run = runSearch,
 };
 
+pub const watch_url: Def = .{
+    .name = "watch_url",
+    .description = "Fetch public text and report first, changed, or unchanged.",
+    .params = &watch_params,
+    .mutates = true,
+    .run = runWatch,
+};
+
 const UrlArgs = struct { url: []const u8 };
 const QueryArgs = struct { query: []const u8 };
+const WatchArgs = struct { url: []const u8, key: []const u8 };
 
 fn runFetch(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     const parsed = try std.json.parseFromSlice(UrlArgs, ctx.gpa, args, .{ .ignore_unknown_fields = true });
@@ -65,6 +78,44 @@ fn runSearch(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     try w.writeAll(search_url);
     try std.Uri.Component.percentEncode(&w, query, isUnreserved);
     return call(ctx, .GET, w.buffered(), null);
+}
+
+fn runWatch(ctx: *Ctx, args: []const u8) ![]u8 {
+    const parsed = try std.json.parseFromSlice(WatchArgs, ctx.gpa, args, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (!validWatchKey(parsed.value.key)) return error.InvalidWatchKey;
+    const get = ctx.fetch orelse return error.WebUnavailable;
+    const limiter = ctx.limiter orelse return error.WebUnavailable;
+    const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const body = try web.fetchCancellable(ctx.gpa, ctx.io, get, limiter, now, parsed.value.url, null, ctx.cancel, ctx.cancel_parent);
+    defer ctx.gpa.free(body);
+    if (!std.unicode.utf8ValidateSlice(body) or std.mem.indexOfScalar(u8, body, 0) != null)
+        return error.UnsupportedBinary;
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var key_buf: [72]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "watch:{s}", .{parsed.value.key});
+    var q = try ctx.db.prepare("SELECT value FROM kv WHERE key = ?");
+    defer q.finalize();
+    try q.bind(1, key);
+    const found = try q.step();
+    const same = found and std.mem.eql(u8, q.text(0), &hex);
+    if (same) return ctx.gpa.dupe(u8, "unchanged");
+
+    var upsert = try ctx.db.prepare("INSERT INTO kv(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    defer upsert.finalize();
+    try upsert.bind(1, key);
+    try upsert.bind(2, &hex);
+    _ = try upsert.step();
+    return std.fmt.allocPrint(ctx.gpa, "{s}\n{s}", .{ if (found) "changed" else "first", body });
+}
+
+fn validWatchKey(key: []const u8) bool {
+    if (key.len == 0 or key.len > 64 or !std.ascii.isLower(key[0])) return false;
+    for (key[1..]) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_' or c == '-')) return false;
+    return true;
 }
 
 fn call(ctx: *Ctx, method: std.http.Method, url: []const u8, body: ?[]const u8) ![]u8 {
@@ -134,6 +185,19 @@ const FakeApi = struct {
     }
 };
 
+const FakeGet = struct {
+    body: []const u8,
+
+    fn get(self: *FakeGet) web.Get {
+        return .{ .ptr = self, .request_fn = request };
+    }
+
+    fn request(ptr: *anyopaque, gpa: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: ?std.Io.net.IpAddress, _: usize) anyerror!web.Hop {
+        const self: *FakeGet = @ptrCast(@alignCast(ptr));
+        return .{ .status = 200, .body = try gpa.dupe(u8, self.body) };
+    }
+};
+
 fn ctxOf(db: *@import("../data/db.zig").Db, io: std.Io, fake: *FakeApi, limiter: *web.Limiter) Ctx {
     return .{
         .gpa = testing.allocator,
@@ -184,6 +248,37 @@ test "fetch_url returns TinyFish Markdown" {
     try testing.expect(fake.key_ok);
     try testing.expectEqualStrings(fetch_endpoint, fake.url[0..fake.url_len]);
     try testing.expectEqualStrings("{\"urls\":[\"https://8.8.8.8/a?x=1\"],\"format\":\"markdown\"}", fake.body[0..fake.body_len]);
+}
+
+test "watch_url reports first change and unchanged" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &path);
+    defer db.close();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var fake: FakeGet = .{ .body = "one" };
+    var limiter: web.Limiter = .{};
+    var ctx: Ctx = .{ .gpa = testing.allocator, .io = threaded.io(), .db = &db, .fetch = fake.get(), .limiter = &limiter };
+    const args = "{\"url\":\"https://8.8.8.8/feed\",\"key\":\"news\"}";
+
+    const first = try tools.call(&ctx, &.{watch_url}, "watch_url", args);
+    defer testing.allocator.free(first);
+    try testing.expectEqualStrings("first\none", first);
+
+    const same = try tools.call(&ctx, &.{watch_url}, "watch_url", args);
+    defer testing.allocator.free(same);
+    try testing.expectEqualStrings("unchanged", same);
+
+    fake.body = "two";
+    const changed = try tools.call(&ctx, &.{watch_url}, "watch_url", args);
+    defer testing.allocator.free(changed);
+    try testing.expectEqualStrings("changed\ntwo", changed);
+
+    const bad = try tools.call(&ctx, &.{watch_url}, "watch_url", "{\"url\":\"https://8.8.8.8/feed\",\"key\":\"../bad\"}");
+    defer testing.allocator.free(bad);
+    try testing.expect(std.mem.indexOf(u8, bad, "InvalidWatchKey") != null);
 }
 
 test "fetch_url rejects private hosts before TinyFish" {

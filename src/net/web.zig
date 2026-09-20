@@ -764,6 +764,7 @@ fn stdRequest(ptr: *anyopaque, gpa: std.mem.Allocator, url: []const u8, auth: ?[
         .redirect_behavior = .unhandled,
         .connection = connection,
         .headers = .{
+            .accept_encoding = .{ .override = "identity" },
             .user_agent = .{ .override = "zoro/0.0" },
             .authorization = if (auth_header) |h| .{ .override = h } else .omit,
         },

@@ -42,6 +42,34 @@ pub const Ctx = struct {
     }
 };
 
+pub fn requireOwnerEvidence(ctx: *Ctx, evidence: []const u8) !void {
+    const id = ctx.source_message orelse return error.UntrustedEvidence;
+    var q = try ctx.db.prepare("SELECT owner_text FROM messages WHERE id = ? AND role = 'user'");
+    defer q.finalize();
+    try q.bind(1, id);
+    if (!try q.step() or q.isNull(0) or evidence.len == 0 or std.mem.indexOf(u8, q.text(0), evidence) == null)
+        return error.UntrustedEvidence;
+}
+
+pub fn sensitiveMemory(text: []const u8) bool {
+    const words = [_][]const u8{ "password", "passcode", "pin", "secret", "token", "credential", "cvv", "ssn" };
+    const phrases = [_][]const u8{ "api key", "private key", "credit card", "card number", "social security", "door code", "seed phrase", "recovery phrase", "one-time password", "verification code" };
+    for (words) |word| if (containsWord(text, word)) return true;
+    for (phrases) |phrase| if (std.ascii.indexOfIgnoreCase(text, phrase) != null) return true;
+    return false;
+}
+
+fn containsWord(text: []const u8, word: []const u8) bool {
+    var at: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(text, at, word)) |i| {
+        const end = i + word.len;
+        if ((i == 0 or !std.ascii.isAlphanumeric(text[i - 1])) and
+            (end == text.len or !std.ascii.isAlphanumeric(text[end]))) return true;
+        at = i + 1;
+    }
+    return false;
+}
+
 pub const Def = struct {
     name: []const u8,
     description: []const u8,
@@ -150,6 +178,7 @@ pub const builtins = [_]Def{
     skills.save_skill,
     web_tools.fetch_url,
     web_tools.search,
+    web_tools.watch_url,
     workspace.read_file,
     workspace.write_file,
     workspace.edit_file,
