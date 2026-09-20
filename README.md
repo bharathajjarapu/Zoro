@@ -221,16 +221,19 @@ The running agent is non-root and its shell policy cannot invoke `apk`.
 File tools use workspace-relative paths, reject traversal and symlinks, cap
 reads and downloads, and replace writes atomically. Identity files
 (`SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`) have a separate approved
-update path. The shell accepts JSON argument arrays, uses pinned executables and
-a clean environment, and kills the process group on timeout or cancellation.
+update path. Workspace reads, writes, edits, downloads, and deletions run
+directly; paths outside the workspace remain unavailable. The shell accepts
+JSON argument arrays, uses pinned executables and a clean environment, and
+kills the process group on timeout or cancellation.
 
 Telegram uses long polling for one private owner chat. Accepted updates and
 outgoing messages are durable. Internal work and recovery state stays out of
 the chat. It shows typing during model work and the matching upload or sticker
 action during delivery. It supports `/stop`, conservative HTML, bounded message
-splitting, callbacks, replies, native media sends, guarded incoming files,
-locations, stickers, and BotFather commands. Successful tool-driven delivery
-suppresses a redundant companion message.
+splitting, replies, native media sends, guarded incoming files, locations,
+stickers, and BotFather commands. Permission requests are plain questions; the
+agent interprets the owner's reply and binds it to the referenced request.
+Successful tool-driven delivery suppresses a redundant companion message.
 
 The chat defaults to English and follows the owner's language or explicit
 request. Photos, image documents, static stickers, and available media previews

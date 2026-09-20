@@ -178,7 +178,7 @@ fn runChecked(ctx: *tools.Ctx, args: []const u8) ![]u8 {
     const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
     const id = try tasks.ask(ctx.db, "shell", bound.written(), command.argv[0], "run this workspace command", null, now);
     if (ctx.approval_out) |out| out.* = id;
-    return std.fmt.allocPrint(ctx.gpa, "pending #{d}: shell approval required", .{id});
+    return std.fmt.allocPrint(ctx.gpa, "May I run this workspace command {f}? (#{d})", .{ std.json.fmt(command.slice(), .{}), id });
 }
 
 fn runApproved(ctx: *tools.Ctx, args: []const u8) ![]u8 {
@@ -334,7 +334,8 @@ test "allowlisted commands run with a clean environment" {
     ctx.shell_mode = .ask;
     const pending = try tools.call(&ctx, &.{run}, "shell", "{\"argv\":[\"env\"]}");
     defer testing.allocator.free(pending);
-    try testing.expect(std.mem.indexOf(u8, pending, "approval required") != null);
+    try testing.expect(std.mem.indexOf(u8, pending, "May I run") != null);
+    try testing.expect(std.mem.indexOf(u8, pending, "[\"/usr/bin/env\"]") != null);
     var q = try h.db.prepare("SELECT args FROM approvals ORDER BY id DESC LIMIT 1");
     defer q.finalize();
     try testing.expect(try q.step());
@@ -403,7 +404,7 @@ test "temporary Wrangler deployment is exact and always asks" {
     try workspace_app.write(h.threaded.io(), h.workspace_path, "reports/brief/index.html", "<h1>Brief</h1>");
     const good = try tools.call(&ctx, &.{run}, "shell", "{\"argv\":[\"wrangler\",\"deploy\",\"reports/brief\",\"--name\",\"zoro-brief\",\"--temporary\",\"--compatibility-date\",\"2026-09-19\"]}");
     defer testing.allocator.free(good);
-    try testing.expect(std.mem.indexOf(u8, good, "approval required") != null);
+    try testing.expect(std.mem.indexOf(u8, good, "May I run") != null);
 
     const bad = [_][]const u8{
         "{\"argv\":[\"wrangler\",\"deploy\",\"../private\",\"--name\",\"zoro-brief\",\"--temporary\",\"--compatibility-date\",\"2026-09-19\"]}",

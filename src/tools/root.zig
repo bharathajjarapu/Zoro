@@ -30,6 +30,7 @@ pub const Ctx = struct {
     pool: ?*worker.Pool = null,
     shell_mode: ShellMode = .ask,
     source_message: ?i64 = null,
+    approval_tools: []const Def = &.{},
     approval_out: ?*?i64 = null,
     delivery_out: ?*bool = null,
     cancel: ?*const std.atomic.Value(bool) = null,
@@ -49,6 +50,18 @@ pub fn requireOwnerEvidence(ctx: *Ctx, evidence: []const u8) !void {
     try q.bind(1, id);
     if (!try q.step() or q.isNull(0) or evidence.len == 0 or std.mem.indexOf(u8, q.text(0), evidence) == null)
         return error.UntrustedEvidence;
+}
+
+fn requireOwnerReply(ctx: *Ctx, evidence: []const u8) !void {
+    const id = ctx.source_message orelse return error.UntrustedEvidence;
+    var q = try ctx.db.prepare("SELECT owner_text FROM messages WHERE id = ? AND role = 'user'");
+    defer q.finalize();
+    try q.bind(1, id);
+    if (!try q.step() or q.isNull(0) or !std.mem.eql(
+        u8,
+        std.mem.trim(u8, q.text(0), &std.ascii.whitespace),
+        std.mem.trim(u8, evidence, &std.ascii.whitespace),
+    )) return error.UntrustedEvidence;
 }
 
 pub fn sensitiveMemory(text: []const u8) bool {
@@ -147,7 +160,7 @@ const ask_params = [_]Param{
 
 pub const request_permission: Def = .{
     .name = "request_permission",
-    .description = "Ask approval for one action.",
+    .description = "Ask the owner directly for permission to perform one action.",
     .params = &ask_params,
     .mutates = true,
     .run = runAsk,
@@ -166,7 +179,50 @@ fn runAsk(ctx: *Ctx, args: []const u8) anyerror![]u8 {
     const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
     const id = try tasks.ask(ctx.db, parsed.value.tool, parsed.value.args, parsed.value.target, parsed.value.reason, null, now);
     if (ctx.approval_out) |out| out.* = id;
-    return try std.fmt.allocPrint(ctx.gpa, "pending #{d}: {s} — {s}", .{ id, parsed.value.tool, parsed.value.reason });
+    return try std.fmt.allocPrint(ctx.gpa, "May I {s}? (#{d}: {s})", .{ parsed.value.reason, id, parsed.value.tool });
+}
+
+const resolve_params = [_]Param{
+    .{ .name = "id", .description = "permission id from the question" },
+    .{ .name = "decision", .description = "approve or deny" },
+    .{ .name = "evidence", .description = "exact current owner words showing the decision" },
+};
+
+pub const resolve_permission: Def = .{
+    .name = "resolve_permission",
+    .description = "Resolve one pending permission from the current owner's clear reply.",
+    .params = &resolve_params,
+    .mutates = true,
+    .primary_only = true,
+    .run = runResolve,
+};
+
+fn runResolve(ctx: *Ctx, args: []const u8) anyerror![]u8 {
+    const Args = struct { id: []const u8, decision: []const u8, evidence: []const u8 };
+    const parsed = try std.json.parseFromSlice(Args, ctx.gpa, args, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try requireOwnerReply(ctx, parsed.value.evidence);
+    const id = try std.fmt.parseInt(i64, parsed.value.id, 10);
+    const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
+    var pending = (try tasks.pending(ctx.db, ctx.gpa, id)) orelse return error.NotPending;
+    defer pending.deinit(ctx.gpa);
+    if (std.mem.eql(u8, parsed.value.decision, "deny")) {
+        if (!try tasks.transitionApproval(ctx.db, id, "pending", "denied")) return error.NotPending;
+        return std.fmt.allocPrint(ctx.gpa, "cancelled {s}", .{pending.tool});
+    }
+    if (!std.mem.eql(u8, parsed.value.decision, "approve")) return error.InvalidDecision;
+    if (pending.expires <= now) {
+        _ = try tasks.transitionApproval(ctx.db, id, "pending", "expired");
+        return error.Expired;
+    }
+    try tasks.authorize(ctx.db, id, pending.tool, pending.args, now);
+    const raw = callApproved(ctx, ctx.approval_tools, pending.tool, pending.args) catch |err| {
+        _ = try tasks.transitionApproval(ctx.db, id, "executing", "uncertain");
+        return err;
+    };
+    errdefer ctx.gpa.free(raw);
+    if (!try tasks.transitionApproval(ctx.db, id, "executing", "approved")) return error.ApprovalStateLost;
+    return raw;
 }
 
 pub const builtins = [_]Def{
@@ -192,6 +248,7 @@ pub const builtins = [_]Def{
     learning.learning_propose,
     store_secret,
     request_permission,
+    resolve_permission,
     outbox.notify_owner,
     outbox.attach_file,
     outbox.send_sticker,
@@ -204,7 +261,6 @@ pub const builtins = [_]Def{
 pub const gated = [_]Def{
     routine.enable_routine,
     routine.run_routine,
-    workspace.delete_approved,
     shell.run_approved,
     learning.learning_apply,
     learning.learning_reject,
@@ -389,6 +445,37 @@ test "unknown tool is an error result" {
     const out = try call(&ctx, &.{}, "nope", "{}");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("unknown tool: nope", out);
+}
+
+test "permission resolution requires the whole current owner reply" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try Db.open(try testkit.tmpPath(&tmp, &buf, "zoro.db"));
+    defer db.close();
+    try db.initSchema();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const now = std.Io.Timestamp.now(threaded.io(), .real).toSeconds();
+    _ = try tasks.ask(&db, "echo", "{\"text\":\"x\"}", null, "test", null, now);
+    var insert = try db.prepare("INSERT INTO messages(role, content, owner_text, ref, created) VALUES ('user', ?, ?, 1, ?)");
+    defer insert.finalize();
+    try insert.bind(1, "Not yes");
+    try insert.bind(2, "Not yes");
+    try insert.bind(3, now);
+    _ = try insert.step();
+
+    const own = [_]Def{echo_def};
+    var ctx = ctxOf(&db, &threaded);
+    ctx.source_message = db.lastId();
+    ctx.approval_tools = &own;
+    const out = try call(&ctx, &.{resolve_permission}, "resolve_permission", "{\"id\":\"1\",\"decision\":\"approve\",\"evidence\":\"yes\"}");
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "UntrustedEvidence") != null);
+    var q = try db.prepare("SELECT status FROM approvals WHERE id = 1");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("pending", q.text(0));
 }
 
 test "schema lists required parameter names" {

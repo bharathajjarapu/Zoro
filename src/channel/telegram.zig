@@ -390,11 +390,6 @@ pub const Bot = struct {
         const id = std.fmt.parseInt(i64, data[2..], 10) catch return;
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
         switch (data[0]) {
-            'a', 'd' => {
-                const reply = try self.agent.resolveApprovalId(id, if (data[0] == 'a') .approve else .deny);
-                defer self.gpa.free(reply);
-                try outbox.pushReply(self.db, .text, null, reply, u.message_id, now);
-            },
             's' => {
                 const stopped = if (self.agent.pool) |pool| pool.cancel(id) else false;
                 if (stopped) tasks.setStatus(self.db, id, .cancelled) catch {};
@@ -623,13 +618,11 @@ pub const Bot = struct {
         };
         defer self.gpa.free(reply);
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
-        const approval_id = self.agent.last_approval;
-        var id_buf: [32]u8 = undefined;
-        if (approval_id) |pending_id| {
-            const id = try std.fmt.bufPrint(&id_buf, "{d}", .{pending_id});
-            try outbox.pushReply(self.db, .approval, id, reply, u.message_id, now);
-        } else if (reply.len != 0) {
-            try outbox.push(self.db, .text, null, reply, now);
+        if (reply.len != 0) {
+            if (self.agent.last_approval != null)
+                try outbox.pushReply(self.db, .text, null, reply, u.message_id, now)
+            else
+                try outbox.push(self.db, .text, null, reply, now);
         }
     }
 
@@ -656,8 +649,7 @@ pub const Bot = struct {
         if (items.len == 0) return 0;
         const item = items[0];
         const result = switch (item.kind) {
-            .text => self.send(item.text, item.reply_id, null),
-            .approval => self.send(item.text, item.reply_id, std.fmt.parseInt(i64, item.path.?, 10) catch return error.BadCallback),
+            .text => self.send(item.text, item.reply_id),
             .sticker => self.sendStickerAlias(item.path.?, item.reply_id),
             .photo, .document, .audio, .voice, .video, .animation => self.sendFile(item.kind, item.path.?, item.text, item.reply_id),
         };
@@ -764,7 +756,7 @@ pub const Bot = struct {
         try ensureOk(self.gpa, body);
     }
 
-    fn send(self: *Bot, text: []const u8, reply_id: ?i64, approval_id: ?i64) !void {
+    fn send(self: *Bot, text: []const u8, reply_id: ?i64) !void {
         const escaped = try escapeHtml(self.gpa, text);
         defer self.gpa.free(escaped);
         var remaining = escaped;
@@ -772,7 +764,7 @@ pub const Bot = struct {
         while (remaining.len > 0) {
             const end = chunkEnd(remaining, max_message);
             if (end == 0) return error.InvalidTelegramText;
-            const req = try buildSendMessage(self.gpa, self.chat_id, remaining[0..end], if (first) reply_id else null, if (first) approval_id else null);
+            const req = try buildSendMessage(self.gpa, self.chat_id, remaining[0..end], if (first) reply_id else null);
             defer self.gpa.free(req);
             const body = self.call("sendMessage", req) catch |err| return if (first) err else error.PartialDelivery;
             defer self.gpa.free(body);
@@ -1049,12 +1041,9 @@ const SendMessageRequest = struct {
     text: []const u8,
     parse_mode: []const u8 = "HTML",
     reply_parameters: ?ReplyParameters = null,
-    reply_markup: ?Markup = null,
 };
 
 const ReplyParameters = struct { message_id: i64 };
-const Button = struct { text: []const u8, callback_data: []const u8 };
-const Markup = struct { inline_keyboard: []const []const Button };
 
 fn jsonBody(gpa: std.mem.Allocator, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1067,19 +1056,11 @@ fn buildChatAction(gpa: std.mem.Allocator, chat_id: i64, action: []const u8) ![]
     return jsonBody(gpa, ChatActionRequest{ .chat_id = chat_id, .action = action });
 }
 
-fn buildSendMessage(gpa: std.mem.Allocator, chat_id: i64, text: []const u8, reply_id: ?i64, approval_id: ?i64) ![]u8 {
-    var approve_buf: [32]u8 = undefined;
-    var deny_buf: [32]u8 = undefined;
-    const buttons = [_]Button{
-        .{ .text = "Approve", .callback_data = if (approval_id) |id| try std.fmt.bufPrint(&approve_buf, "a:{d}", .{id}) else "" },
-        .{ .text = "Deny", .callback_data = if (approval_id) |id| try std.fmt.bufPrint(&deny_buf, "d:{d}", .{id}) else "" },
-    };
-    const rows = [_][]const Button{&buttons};
+fn buildSendMessage(gpa: std.mem.Allocator, chat_id: i64, text: []const u8, reply_id: ?i64) ![]u8 {
     return jsonBody(gpa, SendMessageRequest{
         .chat_id = chat_id,
         .text = text,
         .reply_parameters = if (reply_id) |id| .{ .message_id = id } else null,
-        .reply_markup = if (approval_id != null) .{ .inline_keyboard = &rows } else null,
     });
 }
 
@@ -1384,6 +1365,7 @@ test "pollOnce sends the reply via sendMessage" {
     try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"chat_id\":42") != null);
     try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "\"text\":\"hi\"") != null);
     try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "reply_parameters") == null);
+    try testing.expect(std.mem.indexOf(u8, h.tg.sent(), "inline_keyboard") == null);
 }
 
 test "pollOnce sends a typing indicator before the turn" {
@@ -1832,7 +1814,7 @@ test "an attachment pointing outside the workspace is refused" {
     try testing.expectError(error.BadPath, h.bot.sendFile(.document, "../../etc/passwd", "", null));
 }
 
-test "a failed approved action becomes uncertain" {
+test "an old approval callback cannot grant authority" {
     var h: Harness = undefined;
     try h.init(
         &.{
@@ -1846,13 +1828,13 @@ test "a failed approved action becomes uncertain" {
     defer h.deinit();
     _ = try tasks.ask(&h.db, "missing_tool", "{}", null, "test action", null, std.Io.Timestamp.now(h.threaded.io(), .real).toSeconds());
 
-    try testing.expectError(error.UnknownTool, h.bot.pollOnce());
+    try h.bot.pollOnce();
     try testing.expect(std.mem.endsWith(u8, h.tg.url(1), "/answerCallbackQuery"));
     try testing.expectEqual(@as(usize, 2), h.tg.i);
     var q = try h.db.prepare("SELECT status FROM approvals WHERE id = 1");
     defer q.finalize();
     try testing.expect(try q.step());
-    try testing.expectEqualStrings("uncertain", q.text(0));
+    try testing.expectEqualStrings("pending", q.text(0));
 }
 
 test "foreign callback is answered without granting authority" {

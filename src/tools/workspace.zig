@@ -1,7 +1,6 @@
 const std = @import("std");
 const tools = @import("root.zig");
 const web = @import("../net/web.zig");
-const tasks = @import("../data/tasks.zig");
 const workspace = @import("../app/workspace.zig");
 
 const max_path = workspace.max_path;
@@ -13,7 +12,6 @@ const read = workspace.read;
 const readText = workspace.readExact;
 const write = workspace.write;
 const delete = workspace.delete;
-const checkExisting = workspace.checkExisting;
 const openFile = workspace.openFile;
 const makeDir = workspace.makeDir;
 
@@ -68,16 +66,7 @@ pub const download_file: tools.Def = .{
 
 pub const delete_file: tools.Def = .{
     .name = "delete_file",
-    .description = "Request file deletion.",
-    .params = &path_param,
-    .mutates = true,
-    .primary_only = true,
-    .run = runRequestDelete,
-};
-
-pub const delete_approved: tools.Def = .{
-    .name = "delete_file",
-    .description = "Delete approved file.",
+    .description = "Delete a workspace file.",
     .params = &path_param,
     .mutates = true,
     .primary_only = true,
@@ -154,19 +143,6 @@ fn runDelete(ctx: *tools.Ctx, args: []const u8) ![]u8 {
     try allowMutation(parsed.value.path);
     try delete(ctx.io, ctx.workspace, parsed.value.path);
     return std.fmt.allocPrint(ctx.gpa, "deleted {s}", .{parsed.value.path});
-}
-
-fn runRequestDelete(ctx: *tools.Ctx, args: []const u8) ![]u8 {
-    if (args.len > max_path + 64) return error.InvalidArgs;
-    const Args = struct { path: []const u8 };
-    const parsed = try std.json.parseFromSlice(Args, ctx.gpa, args, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    try allowMutation(parsed.value.path);
-    try checkExisting(ctx.io, ctx.workspace, parsed.value.path);
-    const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
-    const id = try tasks.ask(ctx.db, "delete_file", args, parsed.value.path, "delete this workspace file", null, now);
-    if (ctx.approval_out) |out| out.* = id;
-    return std.fmt.allocPrint(ctx.gpa, "pending #{d}: delete approval required", .{id});
 }
 
 fn allowMutation(path: []const u8) !void {
@@ -328,19 +304,13 @@ test "edit refuses missing and repeated matches" {
     try testing.expect(std.mem.indexOf(u8, missing, "MatchNotFound") != null);
 }
 
-test "delete requires approval then removes one guarded file" {
+test "delete removes one guarded workspace file directly" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
     var ctx = h.ctx();
     try write(h.threaded.io(), h.workspace, "old.txt", "old");
-    const pending = try tools.call(&ctx, &.{delete_file}, "delete_file", "{\"path\":\"old.txt\"}");
-    defer testing.allocator.free(pending);
-    try testing.expect(std.mem.indexOf(u8, pending, "approval required") != null);
-    var still_there = try openFile(h.threaded.io(), h.workspace, "old.txt");
-    still_there.close(h.threaded.io());
-
-    const out = try tools.call(&ctx, &.{delete_approved}, "delete_file", "{\"path\":\"old.txt\"}");
+    const out = try tools.call(&ctx, &.{delete_file}, "delete_file", "{\"path\":\"old.txt\"}");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("deleted old.txt", out);
     try testing.expectError(error.FileNotFound, openFile(h.threaded.io(), h.workspace, "old.txt"));

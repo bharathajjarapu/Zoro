@@ -11,7 +11,7 @@ pub const max_text: usize = 8 * 1024;
 pub const max_drain: usize = 16;
 const max_attempts: i64 = 3;
 
-pub const Kind = enum { text, photo, document, audio, voice, video, animation, sticker, approval };
+pub const Kind = enum { text, photo, document, audio, voice, video, animation, sticker };
 
 pub const Status = enum { queued, claimed, retryable, uncertain, failed };
 
@@ -245,7 +245,7 @@ fn runAttach(ctx: *tools.Ctx, args: []const u8) anyerror![]u8 {
     defer parsed.deinit();
     const a = parsed.value;
     const kind: Kind = if (a.as) |s| std.meta.stringToEnum(Kind, s) orelse return error.BadMediaKind else .document;
-    if (kind == .text or kind == .approval or kind == .sticker) return error.BadMediaKind;
+    if (kind == .text or kind == .sticker) return error.BadMediaKind;
     try workspace.checkFile(ctx.io, ctx.workspace, a.path, workspace.max_transfer);
     const now = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
     push(ctx.db, kind, a.path, a.caption orelse "", now) catch |err|

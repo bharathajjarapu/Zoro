@@ -184,6 +184,27 @@ pub fn ask(
     task: ?i64,
     now: i64,
 ) !i64 {
+    try db.exec("BEGIN IMMEDIATE;");
+    errdefer db.exec("ROLLBACK;") catch {};
+    {
+        var expire = try db.prepare("UPDATE approvals SET status = 'expired', updated = ? WHERE status = 'pending' AND expires <= ?");
+        defer expire.finalize();
+        try expire.bind(1, now);
+        try expire.bind(2, now);
+        _ = try expire.step();
+    }
+    {
+        var existing = try db.prepare("SELECT id FROM approvals WHERE tool = ? AND args = ? AND target IS ? AND status = 'pending' ORDER BY id DESC LIMIT 1");
+        defer existing.finalize();
+        try existing.bind(1, tool);
+        try existing.bind(2, args);
+        try existing.bind(3, target);
+        if (try existing.step()) {
+            const id = existing.int(0);
+            try db.exec("COMMIT;");
+            return id;
+        }
+    }
     var q = try db.prepare(
         \\INSERT INTO approvals(task, tool, args, target, reason, status, created, expires)
         \\VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
@@ -197,7 +218,9 @@ pub fn ask(
     try q.bind(6, now);
     try q.bind(7, now + approval_ttl);
     _ = try q.step();
-    return db.lastId();
+    const id = db.lastId();
+    try db.exec("COMMIT;");
+    return id;
 }
 
 pub const AuthorizeError = error{ NotFound, Expired, WrongAction, Sqlite, OutOfMemory };
@@ -223,40 +246,11 @@ pub fn authorize(db: *Db, id: i64, tool: []const u8, args: []const u8, now: i64)
     return error.NotFound;
 }
 
-pub const Decision = enum { approve, deny, other };
-
-pub fn decide(text: []const u8) Decision {
-    const t = std.mem.trim(u8, text, &std.ascii.whitespace);
-    if (eqlIgnore(t, "yes") or eqlIgnore(t, "y") or eqlIgnore(t, "ok") or
-        eqlIgnore(t, "go ahead") or eqlIgnore(t, "proceed") or eqlIgnore(t, "do it"))
-        return .approve;
-    if (eqlIgnore(t, "no") or eqlIgnore(t, "n") or eqlIgnore(t, "nope") or
-        eqlIgnore(t, "cancel") or eqlIgnore(t, "don't") or eqlIgnore(t, "stop"))
-        return .deny;
-    return .other;
-}
-
 pub fn pendingCount(db: *Db) !usize {
     var q = try db.prepare("SELECT count(*) FROM approvals WHERE status = 'pending'");
     defer q.finalize();
     if (!try q.step()) return error.Sqlite;
     return @intCast(q.int(0));
-}
-
-pub fn latestPending(db: *Db, gpa: std.mem.Allocator) !?Approval {
-    var q = try db.prepare(
-        \\SELECT id, task, tool, args, target, reason, status, created, expires
-        \\FROM approvals WHERE status = 'pending' ORDER BY id DESC LIMIT 2
-    );
-    defer q.finalize();
-    if (!try q.step()) return null;
-    var first = try readApproval(gpa, &q);
-    errdefer first.deinit(gpa);
-    if (try q.step()) {
-        first.deinit(gpa);
-        return null; // more than one: caller must ask which
-    }
-    return first;
 }
 
 pub fn pending(db: *Db, gpa: std.mem.Allocator, id: i64) !?Approval {
@@ -302,8 +296,15 @@ fn changed(db: *Db) !bool {
     return q.int(0) == 1;
 }
 
-/// Formats pending approvals oldest first. Caller frees.
-pub fn pendingLines(db: *Db, gpa: std.mem.Allocator) ![]u8 {
+/// Formats unexpired pending approvals oldest first. Caller frees.
+pub fn pendingLines(db: *Db, gpa: std.mem.Allocator, now: i64) ![]u8 {
+    {
+        var expire = try db.prepare("UPDATE approvals SET status = 'expired', updated = ? WHERE status = 'pending' AND expires <= ?");
+        defer expire.finalize();
+        try expire.bind(1, now);
+        try expire.bind(2, now);
+        _ = try expire.step();
+    }
     var q = try db.prepare("SELECT id, tool, reason FROM approvals WHERE status = 'pending' ORDER BY id");
     defer q.finalize();
     var buf: std.Io.Writer.Allocating = .init(gpa);
@@ -385,14 +386,6 @@ fn legal(from: Status, to: Status) bool {
         .blocked => to == .queued or to == .running or to == .cancelled,
         .done, .failed, .cancelled => false,
     };
-}
-
-fn eqlIgnore(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
-    }
-    return true;
 }
 
 test "a task survives reopen and carries a success criterion" {
@@ -526,31 +519,40 @@ test "approvals survive reopen" {
     }
     var db = try Db.open(path);
     defer db.close();
-    var a = (try latestPending(&db, testing.allocator)).?;
+    var a = (try pending(&db, testing.allocator, 1)).?;
     defer a.deinit(testing.allocator);
     try testing.expectEqualStrings("pending", a.status);
     try testing.expectEqualStrings("fetch_url", a.tool);
 }
 
-test "yes maps to the single pending action; two pendings need clarification" {
-    try testing.expectEqual(.approve, decide("Yes"));
-    try testing.expectEqual(.approve, decide("go ahead"));
-    try testing.expectEqual(.deny, decide("no"));
-    try testing.expectEqual(.other, decide("book the vet"));
-
+test "repeated permission requests reuse the pending action" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [128]u8 = undefined;
     var db = try testkit.tmpDb(&tmp, &buf);
     defer db.close();
 
-    _ = try ask(&db, "a", "{}", null, "one", null, 0);
-    var one = (try latestPending(&db, testing.allocator)).?;
-    defer one.deinit(testing.allocator);
-    try testing.expectEqualStrings("a", one.tool);
+    const first = try ask(&db, "shell", "{\"argv\":[\"deploy\"]}", "deploy", "publish", null, 10);
+    const second = try ask(&db, "shell", "{\"argv\":[\"deploy\"]}", "deploy", "publish", null, 11);
+    try testing.expectEqual(first, second);
+    try testing.expectEqual(@as(usize, 1), try pendingCount(&db));
+}
 
-    _ = try ask(&db, "b", "{}", null, "two", null, 0);
-    try testing.expect(try latestPending(&db, testing.allocator) == null);
+test "pending context expires stale permissions" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    var db = try testkit.tmpDb(&tmp, &buf);
+    defer db.close();
+
+    _ = try ask(&db, "shell", "{}", null, "old", null, 0);
+    const lines = try pendingLines(&db, testing.allocator, approval_ttl + 1);
+    defer testing.allocator.free(lines);
+    try testing.expectEqual(@as(usize, 0), lines.len);
+    var q = try db.prepare("SELECT status FROM approvals WHERE id = 1");
+    defer q.finalize();
+    try testing.expect(try q.step());
+    try testing.expectEqualStrings("expired", q.text(0));
 }
 
 test "formatList indents child tasks" {

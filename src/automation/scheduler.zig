@@ -131,8 +131,10 @@ fn gate(db: *Db, gpa: std.mem.Allocator, name: []const u8, why: []const u8, tier
         .{ name, why },
     );
     defer gpa.free(reason);
-    _ = try tasks.ask(db, "enable_routine", args, name, reason, null, now);
-    try outbox.push(db, .text, null, reason, now);
+    const id = try tasks.ask(db, "enable_routine", args, name, reason, null, now);
+    const question = try std.fmt.allocPrint(gpa, "{s} (#{d})", .{ reason, id });
+    defer gpa.free(question);
+    try outbox.push(db, .text, null, question, now);
 }
 
 fn setEnabled(db: *Db, name: []const u8, on: bool) !void {
@@ -250,8 +252,10 @@ fn askFirst(a: *agent.Agent, name: []const u8, why: []const u8, now: i64, next: 
     defer a.gpa.free(args);
     const reason = try std.fmt.allocPrint(a.gpa, "{s} ({s}) is due. Run it?", .{ name, why });
     defer a.gpa.free(reason);
-    _ = try tasks.ask(a.db, "run_routine", args, name, reason, null, now);
-    try outbox.push(a.db, .text, null, reason, now);
+    const id = try tasks.ask(a.db, "run_routine", args, name, reason, null, now);
+    const question = try std.fmt.allocPrint(a.gpa, "{s} (#{d})", .{ reason, id });
+    defer a.gpa.free(question);
+    try outbox.push(a.db, .text, null, question, now);
     try record(a.db, name, now, next, "awaiting-approval");
 }
 
